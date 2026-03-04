@@ -1,0 +1,238 @@
+.TH HAFOD 1 "March 2026" "hafod 1.0" "User Commands"
+.SH NAME
+hafod \- Scheme shell (scsh on Chez Scheme)
+.SH SYNOPSIS
+.B hafod
+.br
+.B hafod \-\-
+.RI [ args... ]
+.br
+.B hafod
+.RB [ \-l
+.IR file ]...
+.B \-s
+.I script
+.RI [ args... ]
+.br
+.B hafod
+.RB [ \-l
+.IR file ]...
+.I script
+.RI [ args... ]
+.br
+.B hafod
+.RB [ \-l
+.IR file ]...
+.B \-c
+.I expression
+.RI [ args... ]
+.br
+.B hafod
+.RB [ \-l
+.IR file ]...
+.B \-e
+.I procedure
+.B \-s
+.I script
+.RI [ args... ]
+.SH DESCRIPTION
+.B hafod
+is a port of
+.BR scsh ,
+the Scheme Shell, to Chez Scheme (R6RS).
+It provides a complete POSIX programming environment within Scheme,
+including process notation for running Unix commands, pipelines,
+and redirections, along with comprehensive bindings for file operations,
+signals, regular expressions, field processing, and more.
+.PP
+When invoked without arguments or with
+.BR \-\- ,
+.B hafod
+starts an interactive REPL with the
+.B (hafod)
+library pre-imported, making all scsh functionality immediately available.
+.SH OPTIONS
+.TP
+.BI \-s " FILE"
+Load and run
+.I FILE
+as a hafod/scsh script.
+If the file starts with
+.B #!
+then the header (up to and including the
+.B !#
+line) is stripped before evaluation.
+Remaining arguments are available via
+.BR command\-line\-arguments .
+This is a terminating switch.
+.TP
+.BI \-c " EXPR"
+Evaluate the Scheme expression
+.I EXPR
+and exit.
+Remaining arguments are available via
+.BR command\-line\-arguments .
+Cannot be combined with
+.BR \-e .
+This is a terminating switch.
+.TP
+.BI \-e " PROC"
+After loading a script (via
+.B \-s
+or a bare filename), call
+.BI ( PROC " args" )
+where
+.I args
+is the list of remaining command-line arguments.
+This is a non-terminating switch that must precede a terminator.
+.TP
+.BI \-l " FILE"
+Load
+.I FILE
+before executing the main action.
+This switch is repeatable; files are loaded in the order given.
+Preload files are loaded after command-line parsing but before
+the script, expression, or REPL starts.
+This is a non-terminating switch.
+.TP
+.B \-\-
+Start an interactive REPL.
+Remaining arguments are available via
+.BR command\-line\-arguments .
+The
+.B (hafod)
+library is pre-imported into the interaction environment.
+This is a terminating switch.
+.TP
+.B \-\-help
+Show a usage summary and exit.
+.TP
+.B \-\-version
+Show the version string and exit.
+.SH REPL MODE
+When
+.B hafod
+is invoked with no arguments, or with the
+.B \-\-
+switch, it starts an interactive REPL (read-eval-print loop).
+The
+.B (hafod)
+library is automatically imported into the interaction environment,
+so all scsh procedures (such as
+.BR pid ,
+.BR run/string ,
+.BR fork ,
+.BR glob ,
+etc.) are available without an explicit
+.B import
+statement.
+.PP
+Any files specified with
+.B \-l
+are loaded before the REPL starts.
+.SH META-ARGUMENT PROCESSING
+.B hafod
+supports scsh-style meta-argument processing for shebang scripts.
+When a script is invoked via the operating system's exec mechanism,
+the kernel passes the interpreter path and a single argument.
+To support multiple switches,
+.B hafod
+uses a two-line header protocol:
+.PP
+.nf
+.RS
+#!/path/to/hafod \\\\
+-e main -s
+!#
+(define (main args) ...)
+.RE
+.fi
+.PP
+Line 1 ends with a backslash (the meta-argument marker).
+.B hafod
+reads line 2 of the script file, parses it into
+whitespace-separated arguments, and prepends them to the
+command-line argument list.
+The
+.B !#
+line terminates the header block; everything after it is the
+script body.
+.PP
+Backslash escape sequences are supported in meta-argument lines:
+.B \\\\n
+(newline),
+.B \\\\t
+(tab),
+.B \\\\r
+(return),
+.B \\\\\\\\
+(literal backslash),
+.B \\\\\fInnn\fR
+(octal character code).
+.SH ENVIRONMENT
+.TP
+.B HAFOD_LIB_DIRS
+Additional library search directories, colon-separated.
+These are prepended to the Chez Scheme library search path.
+.SH EXAMPLES
+Simple script with shebang:
+.PP
+.nf
+.RS
+#!/usr/bin/env hafod
+!#
+(import (hafod))
+(display (run/string (ls \-la)))
+.RE
+.fi
+.PP
+Using
+.B \-e
+entry point:
+.PP
+.nf
+.RS
+#!/path/to/hafod \\\\
+-e main -s
+!#
+(define (main args)
+  (for-each
+    (lambda (f)
+      (display (string-append "Processing: " f "\\n")))
+    args))
+.RE
+.fi
+.PP
+Using
+.B \-l
+to preload definitions:
+.PP
+.nf
+.RS
+$ cat prelude.ss
+(define greeting "Hello")
+
+$ cat script.ss
+(display (string-append greeting " world\\n"))
+
+$ hafod -l prelude.ss -s script.ss
+Hello world
+.RE
+.fi
+.PP
+Pipeline with run/string in a one-liner:
+.PP
+.nf
+.RS
+$ hafod -c '(display (run/string (pipe (ls) (grep "\\\\.ss$"))))'
+.RE
+.fi
+.SH SEE ALSO
+.BR scheme (1),
+.BR scsh (1)
+.SH AUTHORS
+.B scsh
+was written by Olin Shivers and Brian Carlstrom.
+.PP
+.B hafod
+is a port to Chez Scheme by Dominic Pearson.

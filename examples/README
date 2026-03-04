@@ -1,0 +1,62 @@
+hafod Example Scripts
+=====================
+
+These scripts demonstrate real-world usage of hafod (a scsh port for
+Chez Scheme). Each script exercises different subsystems and can be run
+safely -- they only read system state, create temp files in /tmp, and
+run common Unix commands.
+
+Running
+-------
+
+  From the project root:
+
+    scheme --libdirs src --script examples/<name>.ss
+
+  Or compile first for speed:
+
+    make compile
+    scheme --libdirs src --script examples/<name>.ss
+
+
+Scripts
+-------
+
+  01-system-info.ss        System information and process state
+  02-list-executables.ss   List all executables on PATH
+  03-pipeline-demo.ss      Process notation, pipelines, redirections
+  04-find-large-files.ss   Find large files using glob and file-info
+  05-word-frequency.ss     Word frequency count using AWK macro
+  06-log-analyzer.ss       Parse structured data with field splitters
+  07-csv-processor.ss      CSV processing with infix-splitter
+  08-regex-demo.ss         SRE regex matching, substitution, folding
+  09-directory-tree.ss     Recursive directory listing with file types
+  10-env-manager.ss        Environment variable manipulation
+  11-temp-file-demo.ss     Temp file creation and I/O channels
+  12-process-demo.ss       Fork, wait, signals, background processes
+  13-file-renamer.ss       Rename files using regex patterns (dry-run)
+  14-disk-usage.ss         Disk usage summary via pipelines
+  15-backup-script.ss      Backup files to a temp directory
+
+
+Features Exercised
+------------------
+
+  Process notation     run, &, exec-epf, ||, &&
+  Pipelines            pipe, run/string, run/strings, run/port
+  Redirections         <, >, >>, <<, =, -
+  Run collectors       run/collecting, run/file, run/sexp
+  File operations      file-info, directory-files, glob, create-temp-file
+  File names           split-file-name, file-name-extension, resolve-file-name
+  Environment          getenv, setenv, with-env, with-total-env, env->alist
+  Process state        cwd, with-cwd, umask, with-umask, pid, user-uid
+  Process mgmt         fork, wait, signal-process, process-sleep
+  Delimited I/O        read-line, read-delimited, read-paragraph
+  Field readers        field-splitter, infix-splitter, record-reader
+  AWK macro            awk with patterns, ranges, state variables
+  Regex (SRE)          rx, regexp-search, regexp-substitute/global
+  Time/date            time, date, format-date
+  User/group           user-info, group-info, home-directory
+  System info          uname, system-name
+  Temp files           create-temp-file, temp-file-channel
+  Port collectors      port->string, port->string-list, port-fold

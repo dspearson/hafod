@@ -1,0 +1,22 @@
+#!/bin/sh
+# hafod -- launcher script for hafod (scsh on Chez Scheme)
+# Finds the hafod library directory relative to this script and
+# invokes Chez Scheme with the correct --libdirs and --script.
+
+# Resolve symlinks and find the real script location
+SCRIPT="$0"
+while [ -L "$SCRIPT" ]; do
+  DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+  SCRIPT="$(readlink "$SCRIPT")"
+  case "$SCRIPT" in
+    /*) ;;
+    *) SCRIPT="$DIR/$SCRIPT" ;;
+  esac
+done
+BINDIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+HAFOD_ROOT="$(cd "$BINDIR/.." && pwd)"
+
+# Prefer petite (interpreter-only) for faster startup (~20ms saving).
+# Scripts don't need the compiler; fall back to scheme if petite unavailable.
+CHEZ="${HAFOD_SCHEME:-$(command -v petite 2>/dev/null || echo scheme)}"
+exec "$CHEZ" --libdirs "$HAFOD_ROOT/src" --script "$BINDIR/hafod.sps" "$@"

@@ -1,0 +1,19 @@
+# Compiled Chez Scheme libraries
+src/**/*.so
+src/*.so
+
+# Whole-program optimisation files
+src/**/*.wpo
+src/*.wpo
+
+# Build artefacts
+a.out
+tmpfile
+
+# Nix / direnv
+.direnv/
+result
+
+# Editor
+*~
+\#*\#

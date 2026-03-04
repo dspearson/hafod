@@ -1,0 +1,118 @@
+;;; (hafod internal posix-constants) -- POSIX numeric constants
+;;; Extracted from posix.ss during Phase 26 splitting.
+;;; Copyright (c) 2026, hafod contributors.
+
+(library (hafod internal posix-constants)
+  (export
+    ;; Open flags
+    O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK
+
+    ;; Signal constants
+    SIGHUP SIGINT SIGQUIT SIGILL SIGTRAP SIGABRT SIGBUS SIGFPE SIGKILL
+    SIGUSR1 SIGSEGV SIGUSR2 SIGPIPE SIGALRM SIGTERM SIGCHLD SIGCONT
+    SIGSTOP SIGTSTP SIGTTIN SIGTTOU
+    SIGURG SIGXCPU SIGXFSZ SIGVTALRM SIGPROF SIGWINCH SIGIO SIGPWR SIGSYS
+
+    ;; File mode bits
+    S_IFMT S_IFDIR S_IFREG S_IFLNK S_IFIFO S_IFSOCK S_IFBLK S_IFCHR
+    S_ISUID S_ISGID S_ISVTX
+    S_IRUSR S_IWUSR S_IXUSR S_IRGRP S_IWGRP S_IXGRP S_IROTH S_IWOTH S_IXOTH
+
+    ;; fcntl constants
+    F_GETFD F_SETFD FD_CLOEXEC F_GETFL F_SETFL
+
+    ;; Seek constants
+    SEEK_SET SEEK_CUR SEEK_END
+
+    ;; Access constants
+    R_OK W_OK X_OK F_OK)
+
+  (import (chezscheme))
+
+  ;; ======================================================================
+  ;; POSIX Constants
+  ;; ======================================================================
+
+  ;; Open flags (Linux x86_64)
+  (define O_RDONLY     0)
+  (define O_WRONLY     1)
+  (define O_RDWR       2)
+  (define O_CREAT     64)
+  (define O_EXCL     128)
+  (define O_TRUNC    512)
+  (define O_APPEND  1024)
+  (define O_NONBLOCK 2048)
+
+  ;; Signal constants (Linux)
+  (define SIGHUP     1)
+  (define SIGINT     2)
+  (define SIGQUIT    3)
+  (define SIGILL     4)
+  (define SIGTRAP    5)
+  (define SIGABRT    6)
+  (define SIGBUS     7)
+  (define SIGFPE     8)
+  (define SIGKILL    9)
+  (define SIGUSR1   10)
+  (define SIGSEGV   11)
+  (define SIGUSR2   12)
+  (define SIGPIPE   13)
+  (define SIGALRM   14)
+  (define SIGTERM   15)
+  (define SIGCHLD   17)
+  (define SIGCONT   18)
+  (define SIGSTOP   19)
+  (define SIGTSTP   20)
+  (define SIGTTIN   21)
+  (define SIGTTOU   22)
+  (define SIGURG    23)
+  (define SIGXCPU   24)
+  (define SIGXFSZ   25)
+  (define SIGVTALRM 26)
+  (define SIGPROF   27)
+  (define SIGWINCH  28)
+  (define SIGIO     29)
+  (define SIGPWR    30)
+  (define SIGSYS    31)
+
+  ;; File mode bits
+  (define S_IFMT   #xF000)
+  (define S_IFDIR  #x4000)
+  (define S_IFREG  #x8000)
+  (define S_IFLNK  #xA000)
+  (define S_IFIFO  #x1000)
+  (define S_IFSOCK #xC000)
+  (define S_IFBLK  #x6000)
+  (define S_IFCHR  #x2000)
+  (define S_ISUID  #o4000)
+  (define S_ISGID  #o2000)
+  (define S_ISVTX  #o1000)
+  (define S_IRUSR  #o0400)
+  (define S_IWUSR  #o0200)
+  (define S_IXUSR  #o0100)
+  (define S_IRGRP  #o0040)
+  (define S_IWGRP  #o0020)
+  (define S_IXGRP  #o0010)
+  (define S_IROTH  #o0004)
+  (define S_IWOTH  #o0002)
+  (define S_IXOTH  #o0001)
+
+  ;; fcntl constants
+  (define F_GETFD 1)
+  (define F_SETFD 2)
+  (define FD_CLOEXEC 1)
+  (define F_GETFL 3)
+  (define F_SETFL 4)
+
+  ;; Seek constants
+  (define SEEK_SET 0)
+  (define SEEK_CUR 1)
+  (define SEEK_END 2)
+
+  ;; Access constants
+  (define R_OK 4)
+  (define W_OK 2)
+  (define X_OK 1)
+  (define F_OK 0)
+
+  ) ; end library
