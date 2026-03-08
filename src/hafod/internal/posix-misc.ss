@@ -221,10 +221,10 @@
   ;; uname -- system identification
   ;; ======================================================================
 
-  ;; struct utsname: 5 fields of 65 bytes each (SYS_NMLN=65 on Linux).
+  ;; struct utsname: 5 fields of SYS_NMLN bytes each (65 on Linux, 256 on macOS).
   ;; Linux also has domainname (6th field), but we only need the first 5.
-  (define UTSNAME_FIELD_LEN 65)
-  (define UTSNAME_SIZE (* 6 UTSNAME_FIELD_LEN))  ;; 390 bytes (includes domainname)
+  (define UTSNAME_FIELD_LEN PLAT-UTSNAME-FIELD-LEN)
+  (define UTSNAME_SIZE (* 6 UTSNAME_FIELD_LEN))
 
   (define c-uname (foreign-procedure "uname" (u8*) int))
 

@@ -15,9 +15,8 @@
   (let ([s (uname:os-name (uname))])
     (and (string? s) (> (string-length s) 0))))
 
-(test-equal "uname:os-name is Linux on this system"
-  "Linux"
-  (uname:os-name (uname)))
+(test-assert "uname:os-name is a known OS name"
+  (member (uname:os-name (uname)) '("Linux" "Darwin" "FreeBSD")))
 
 (test-assert "uname:node-name returns a non-empty string"
   (let ([s (uname:node-name (uname))])

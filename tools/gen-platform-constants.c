@@ -27,6 +27,7 @@
 #include <spawn.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 
 #define EMIT(name, val) printf("  (define %s %d)\n", name, (int)(val))
 #define EMIT_OFFSET(name, type, field) \
@@ -118,6 +119,9 @@ int main(void) {
 
     /* ioctl */
     printf("    PLAT-TIOCSCTTY\n");
+
+    /* utsname */
+    printf("    PLAT-UTSNAME-FIELD-LEN\n");
 
     /* FNM flags */
     printf("    PLAT-FNM-NOESCAPE PLAT-FNM-PATHNAME PLAT-FNM-PERIOD\n");
@@ -366,6 +370,13 @@ int main(void) {
 
     printf("  ;; ioctl\n");
     EMIT("PLAT-TIOCSCTTY", TIOCSCTTY);
+    printf("\n");
+
+    printf("  ;; utsname\n");
+    {
+        struct utsname u;
+        EMIT("PLAT-UTSNAME-FIELD-LEN", sizeof(u.sysname));
+    }
     printf("\n");
 
     printf("  ;; fnmatch flags\n");
