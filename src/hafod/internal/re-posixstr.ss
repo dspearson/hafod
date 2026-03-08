@@ -7,7 +7,6 @@
   (export regexp->posix-string simplify-regexp)
   (import (hafod internal base)
           (hafod compat)
-          (hafod internal char-sets)
           (hafod internal re-records))
 
 

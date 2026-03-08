@@ -94,15 +94,15 @@
 (test-equal "hafod-major-version is 1"
   1 hafod-major-version)
 
-(test-equal "hafod-minor-version is 0"
-  0 hafod-minor-version)
+(test-equal "hafod-minor-version is 1"
+  1 hafod-minor-version)
 
 (test-equal "hafod-version-string is correct"
-  "hafod 1.0" hafod-version-string)
+  "hafod 1.1" hafod-version-string)
 
 ;; scsh-compatible version aliases
 (test-equal "scsh-major-version alias" 1 scsh-major-version)
-(test-equal "scsh-minor-version alias" 0 scsh-minor-version)
-(test-equal "scsh-version-string alias" "hafod 1.0" scsh-version-string)
+(test-equal "scsh-minor-version alias" 1 scsh-minor-version)
+(test-equal "scsh-version-string alias" "hafod 1.1" scsh-version-string)
 
 (test-end)

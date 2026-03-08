@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-user) -- User/group database operations
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-user)
@@ -9,9 +8,8 @@
     passwd-info-gid passwd-info-gecos passwd-info-dir passwd-info-shell
     group-info? group-info-name group-info-passwd group-info-gid group-info-members)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; Struct extraction macros
@@ -38,12 +36,11 @@
   ;; User/group database
   ;; ======================================================================
 
-  ;; struct group offsets (x86_64 Linux)
-  (define GR_NAME    0)   ;; char*
-  (define GR_PASSWD  8)   ;; char*
-  (define GR_GID    16)   ;; gid_t (unsigned-32)
-  ;; 4 bytes padding at 20
-  (define GR_MEM    24)   ;; char**
+  ;; struct group offsets from platform-constants
+  (define GR_NAME    GR-NAME)
+  (define GR_PASSWD  GR-PASSWD)
+  (define GR_GID     GR-GID)
+  (define GR_MEM     GR-MEM)
 
   (define c-getpwnam (foreign-procedure "getpwnam" (string) void*))
   (define c-getpwuid (foreign-procedure "getpwuid" (unsigned-32) void*))
@@ -60,13 +57,13 @@
 
   ;; Extract passwd-info from a struct passwd pointer (macro-generated).
   (define-struct-extractor extract-passwd-info make-passwd-info ptr
-    (string  0)    ;; pw_name
-    (string  8)    ;; pw_passwd
-    (u32    16)    ;; pw_uid
-    (u32    20)    ;; pw_gid
-    (string 24)    ;; pw_gecos
-    (string 32)    ;; pw_dir
-    (string 40))   ;; pw_shell
+    (string PW-NAME)
+    (string PW-PASSWD)
+    (u32    PW-UID)
+    (u32    PW-GID)
+    (string PW-GECOS)
+    (string PW-DIR)
+    (string PW-SHELL))
 
   ;; Extract group member list from gr_mem (char** array).
   (define (extract-group-members grp-ptr)

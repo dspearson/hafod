@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-core) -- Wait-status macros, helpers, and process syscalls
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-core)
@@ -19,9 +18,8 @@
     ;; posix_spawn fast path
     posix-spawnp posix-spawnp/pipe)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants))
 
   ;; ======================================================================
   ;; Wait status macros (ported from scsh/scheme/waitcodes.scm)
@@ -234,9 +232,7 @@
   ;; posix_spawn fast path
   ;; ======================================================================
 
-  ;; Size of posix_spawn_file_actions_t — 80 bytes covers Linux x86_64 (actual 76).
-  ;; May need adjustment for other architectures.
-  (define FILEACT-SIZE 80)
+  (define FILEACT-SIZE SIZEOF-SPAWN-FA)
 
   ;; posix-spawnp: spawn a process without fork().
   ;; program: string, argv: list of strings.
@@ -256,28 +252,34 @@
           [c-envp (if env-list (strings->c-argv env-list) 0)]
           [nenv (if env-list (length env-list) 0)])
       (let ([fa (if actions (foreign-alloc FILEACT-SIZE) 0)])
-        (when actions
-          (c-spawn-fa-init fa)
-          (for-each (lambda (act)
-                      (case (car act)
-                        [(dup2)  (c-spawn-fa-adddup2 fa (cadr act) (caddr act))]
-                        [(close) (c-spawn-fa-addclose fa (cadr act))]
-                        [(open)  (c-spawn-fa-addopen fa (cadr act) (caddr act)
-                                   (cadddr act) (car (cddddr act)))]))
-                    actions))
-        (let ([rc (c-posix-spawnp pid-buf program fa 0 c-argv c-envp)])
+        (guard (e [#t
+                   (when actions (c-spawn-fa-destroy fa) (foreign-free fa))
+                   (free-c-argv c-argv nargv)
+                   (when env-list (free-c-argv c-envp nenv))
+                   (foreign-free pid-buf)
+                   (raise e)])
           (when actions
-            (c-spawn-fa-destroy fa)
-            (foreign-free fa))
-          (free-c-argv c-argv nargv)
-          (when env-list (free-c-argv c-envp nenv))
-          (if (zero? rc)
-              (let ([pid (foreign-ref 'int pid-buf 0)])
-                (foreign-free pid-buf)
-                pid)
-              (begin
-                (foreign-free pid-buf)
-                (raise-posix-error 'posix-spawnp rc)))))))
+            (c-spawn-fa-init fa)
+            (for-each (lambda (act)
+                        (case (car act)
+                          [(dup2)  (c-spawn-fa-adddup2 fa (cadr act) (caddr act))]
+                          [(close) (c-spawn-fa-addclose fa (cadr act))]
+                          [(open)  (c-spawn-fa-addopen fa (cadr act) (caddr act)
+                                     (cadddr act) (car (cddddr act)))]))
+                      actions))
+          (let ([rc (c-posix-spawnp pid-buf program fa 0 c-argv c-envp)])
+            (when actions
+              (c-spawn-fa-destroy fa)
+              (foreign-free fa))
+            (free-c-argv c-argv nargv)
+            (when env-list (free-c-argv c-envp nenv))
+            (if (zero? rc)
+                (let ([pid (foreign-ref 'int pid-buf 0)])
+                  (foreign-free pid-buf)
+                  pid)
+                (begin
+                  (foreign-free pid-buf)
+                  (raise-posix-error 'posix-spawnp rc))))))))
 
   ;; posix-spawnp/pipe: spawn with stdout piped back to parent.
   ;; Optional rest args: extra-actions, env-list.

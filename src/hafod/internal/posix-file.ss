@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-file) -- Stat and filesystem operations
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-file)
@@ -15,30 +14,12 @@
     posix-mkdir posix-rmdir
     posix-access posix-lseek posix-umask)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
-  ;; Stat -- struct stat handling (x86_64 Linux)
+  ;; Stat -- struct stat handling
   ;; ======================================================================
-
-  ;; struct stat offsets for x86_64 Linux (glibc)
-  (define SIZEOF_STAT 144)
-  (define STAT_DEV      0)   ;; unsigned-64
-  (define STAT_INO      8)   ;; unsigned-64
-  (define STAT_NLINK   16)   ;; unsigned-64
-  (define STAT_MODE    24)   ;; unsigned-32
-  (define STAT_UID     28)   ;; unsigned-32
-  (define STAT_GID     32)   ;; unsigned-32
-  ;; 4 bytes padding at 36
-  (define STAT_RDEV    40)   ;; unsigned-64
-  (define STAT_SIZE    48)   ;; integer-64
-  (define STAT_BLKSIZE 56)   ;; integer-64
-  (define STAT_BLOCKS  64)   ;; integer-64
-  (define STAT_ATIM    72)   ;; timespec (tv_sec at +0, tv_nsec at +8)
-  (define STAT_MTIM    88)   ;; timespec
-  (define STAT_CTIM   104)   ;; timespec
 
   ;; stat-info record type
   (define-record-type stat-info
@@ -65,36 +46,36 @@
   ;; Extract stat-info from a filled stat buffer.
   (define (extract-stat-info buf)
     (make-stat-info
-      (mode->type (foreign-ref 'unsigned-32 buf STAT_MODE))
-      (foreign-ref 'unsigned-64 buf STAT_DEV)
-      (foreign-ref 'unsigned-64 buf STAT_INO)
-      (foreign-ref 'unsigned-32 buf STAT_MODE)
-      (foreign-ref 'unsigned-64 buf STAT_NLINK)
-      (foreign-ref 'unsigned-32 buf STAT_UID)
-      (foreign-ref 'unsigned-32 buf STAT_GID)
-      (foreign-ref 'unsigned-64 buf STAT_RDEV)
-      (foreign-ref 'integer-64 buf STAT_SIZE)
-      (foreign-ref 'integer-64 buf STAT_BLKSIZE)
-      (foreign-ref 'integer-64 buf STAT_BLOCKS)
-      (foreign-ref 'unsigned-64 buf STAT_ATIM)
-      (foreign-ref 'unsigned-64 buf STAT_MTIM)
-      (foreign-ref 'unsigned-64 buf STAT_CTIM)))
+      (mode->type (foreign-ref 'unsigned-32 buf STAT-ST-MODE))
+      (foreign-ref 'unsigned-64 buf STAT-ST-DEV)
+      (foreign-ref 'unsigned-64 buf STAT-ST-INO)
+      (foreign-ref 'unsigned-32 buf STAT-ST-MODE)
+      (foreign-ref 'unsigned-64 buf STAT-ST-NLINK)
+      (foreign-ref 'unsigned-32 buf STAT-ST-UID)
+      (foreign-ref 'unsigned-32 buf STAT-ST-GID)
+      (foreign-ref 'unsigned-64 buf STAT-ST-RDEV)
+      (foreign-ref 'integer-64 buf STAT-ST-SIZE)
+      (foreign-ref 'integer-64 buf STAT-ST-BLKSIZE)
+      (foreign-ref 'integer-64 buf STAT-ST-BLOCKS)
+      (foreign-ref 'unsigned-64 buf STAT-ST-ATIM)
+      (foreign-ref 'unsigned-64 buf STAT-ST-MTIM)
+      (foreign-ref 'unsigned-64 buf STAT-ST-CTIM)))
 
   ;; stat: get file status by path (follows symlinks).
   (define (posix-stat path)
-    (with-foreign-buffer ([buf SIZEOF_STAT])
+    (with-foreign-buffer ([buf SIZEOF-STAT])
       (posix-call stat (c-stat path buf))
       (extract-stat-info buf)))
 
   ;; lstat: get file status by path (does not follow symlinks).
   (define (posix-lstat path)
-    (with-foreign-buffer ([buf SIZEOF_STAT])
+    (with-foreign-buffer ([buf SIZEOF-STAT])
       (posix-call lstat (c-lstat path buf))
       (extract-stat-info buf)))
 
   ;; fstat: get file status by file descriptor.
   (define (posix-fstat fd)
-    (with-foreign-buffer ([buf SIZEOF_STAT])
+    (with-foreign-buffer ([buf SIZEOF-STAT])
       (posix-call fstat (c-fstat fd buf))
       (extract-stat-info buf)))
 

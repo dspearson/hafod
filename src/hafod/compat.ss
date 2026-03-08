@@ -29,7 +29,7 @@
           char-set-difference char-set-fold char-set-size char-set->list
           char-set= char-set-empty? char-set-full?
           char-set-copy char-set-adjoin char-set-adjoin! char-set-delete
-          string->char-set)
+          string->char-set x->char-set)
   (import (hafod internal base)
           (hafod internal char-sets))
 

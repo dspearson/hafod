@@ -7,13 +7,20 @@
           raise-posix-error posix-call with-foreign-buffer __errno_location c-strerror)
   (import (chezscheme))
 
-  ;; Load libc -- wrapped in a define to ensure it runs in definition context
-  ;; before the foreign-procedure bindings that depend on it.
-  (define load-libc (load-shared-object "libc.so.6"))
+  ;; Load libc symbols from the current process.  Using #f instead of a
+  ;; library name works on every platform because libc is always linked
+  ;; into the Chez Scheme executable.
+  (define load-libc (load-shared-object #f))
 
-  ;; Thread-safe errno access: __errno_location returns a pointer to
-  ;; the thread-local errno variable.
-  (define __errno_location (foreign-procedure "__errno_location" () uptr))
+  ;; Thread-safe errno access: returns a pointer to the thread-local
+  ;; errno variable.  The function name differs across platforms:
+  ;; glibc/musl use __errno_location, macOS uses __error.
+  (define __errno_location
+    (foreign-procedure
+      (case (machine-type)
+        [(ta6osx tarm64osx ti3osx a6osx arm64osx i3osx) "__error"]
+        [else "__errno_location"])
+      () uptr))
   (define c-strerror (foreign-procedure "strerror" (int) string))
 
   ;; R6RS condition type for POSIX errors.

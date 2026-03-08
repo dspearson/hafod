@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-constants) -- POSIX numeric constants
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-constants)
@@ -27,53 +26,55 @@
     ;; Access constants
     R_OK W_OK X_OK F_OK)
 
-  (import (chezscheme))
+  (import (chezscheme) (hafod internal platform-constants))
 
   ;; ======================================================================
   ;; POSIX Constants
   ;; ======================================================================
 
-  ;; Open flags (Linux x86_64)
+  ;; Open flags — O_RDONLY/O_WRONLY/O_RDWR are universal;
+  ;; the rest come from platform-constants.
   (define O_RDONLY     0)
   (define O_WRONLY     1)
   (define O_RDWR       2)
-  (define O_CREAT     64)
-  (define O_EXCL     128)
-  (define O_TRUNC    512)
-  (define O_APPEND  1024)
-  (define O_NONBLOCK 2048)
+  (define O_CREAT     PLAT-O-CREAT)
+  (define O_EXCL      PLAT-O-EXCL)
+  (define O_TRUNC     PLAT-O-TRUNC)
+  (define O_APPEND    PLAT-O-APPEND)
+  (define O_NONBLOCK  PLAT-O-NONBLOCK)
 
-  ;; Signal constants (Linux)
+  ;; Signal constants — SIGHUP..SIGTERM (1-15) are universal on all
+  ;; POSIX systems; signals >= 16 vary between Linux and macOS/BSD.
   (define SIGHUP     1)
   (define SIGINT     2)
   (define SIGQUIT    3)
   (define SIGILL     4)
   (define SIGTRAP    5)
   (define SIGABRT    6)
-  (define SIGBUS     7)
+  (define SIGBUS     PLAT-SIGBUS)
   (define SIGFPE     8)
   (define SIGKILL    9)
-  (define SIGUSR1   10)
+  (define SIGUSR1    PLAT-SIGUSR1)
   (define SIGSEGV   11)
-  (define SIGUSR2   12)
+  (define SIGUSR2    PLAT-SIGUSR2)
   (define SIGPIPE   13)
   (define SIGALRM   14)
   (define SIGTERM   15)
-  (define SIGCHLD   17)
-  (define SIGCONT   18)
-  (define SIGSTOP   19)
-  (define SIGTSTP   20)
-  (define SIGTTIN   21)
-  (define SIGTTOU   22)
-  (define SIGURG    23)
-  (define SIGXCPU   24)
-  (define SIGXFSZ   25)
-  (define SIGVTALRM 26)
-  (define SIGPROF   27)
-  (define SIGWINCH  28)
-  (define SIGIO     29)
+  (define SIGCHLD    PLAT-SIGCHLD)
+  (define SIGCONT    PLAT-SIGCONT)
+  (define SIGSTOP    PLAT-SIGSTOP)
+  (define SIGTSTP    PLAT-SIGTSTP)
+  (define SIGTTIN    PLAT-SIGTTIN)
+  (define SIGTTOU    PLAT-SIGTTOU)
+  (define SIGURG     PLAT-SIGURG)
+  (define SIGXCPU    PLAT-SIGXCPU)
+  (define SIGXFSZ    PLAT-SIGXFSZ)
+  (define SIGVTALRM  PLAT-SIGVTALRM)
+  (define SIGPROF    PLAT-SIGPROF)
+  (define SIGWINCH   PLAT-SIGWINCH)
+  (define SIGIO      PLAT-SIGIO)
   (define SIGPWR    30)
-  (define SIGSYS    31)
+  (define SIGSYS     PLAT-SIGSYS)
 
   ;; File mode bits
   (define S_IFMT   #xF000)
@@ -98,11 +99,11 @@
   (define S_IXOTH  #o0001)
 
   ;; fcntl constants
-  (define F_GETFD 1)
-  (define F_SETFD 2)
-  (define FD_CLOEXEC 1)
-  (define F_GETFL 3)
-  (define F_SETFL 4)
+  (define F_GETFD PLAT-F-GETFD)
+  (define F_SETFD PLAT-F-SETFD)
+  (define FD_CLOEXEC PLAT-FD-CLOEXEC)
+  (define F_GETFL PLAT-F-GETFL)
+  (define F_SETFL PLAT-F-SETFL)
 
   ;; Seek constants
   (define SEEK_SET 0)

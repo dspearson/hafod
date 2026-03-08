@@ -9,7 +9,6 @@
           read-paragraph skip-char-set)
   (import (hafod internal base)
           (hafod compat)
-          (hafod internal char-sets)
           (hafod internal strings))
 
   ;;; ========== %read-delimited! (core primitive) ==========

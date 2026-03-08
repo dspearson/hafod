@@ -6,13 +6,27 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/hafod
 
+# Chez Scheme library directory (for native build).
+# Auto-detected from the scheme binary; override with: make CHEZ_LIBDIR=/path/to/...
+CHEZ_LIBDIR ?= $(shell p=$$(dirname $$(dirname $$(readlink -f $$(which $(SCHEME))))); \
+	v=$$(echo '(let ([v (scheme-version)]) (let f ([i (- (string-length v) 1)]) (if (char=? (string-ref v i) (integer->char 32)) (display (substring v (+ i 1) (string-length v))) (f (- i 1)))))' | $(SCHEME) -q); \
+	m=$$(echo '(display (machine-type))' | $(SCHEME) -q); \
+	echo "$$p/lib/csv$$v/$$m")
+
 # Auto-discover Scheme test files
 TEST_SCRIPTS := $(wildcard test/test-*.ss)
 TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
 
-.PHONY: all compile compile-wpo test clean install uninstall test-launcher verify-umbrella $(TEST_TARGETS)
+.PHONY: all compile compile-wpo native standalone test clean install uninstall test-launcher verify-umbrella platform-constants $(TEST_TARGETS)
 
-all: compile-wpo
+all: native
+
+# Regenerate platform-specific struct offsets and constants.
+# The committed default covers x86_64-linux (glibc), so this target is
+# only needed when building on a different OS or architecture.
+platform-constants: tools/gen-platform-constants.c
+	$(CC) -o tools/gen-platform-constants tools/gen-platform-constants.c
+	tools/gen-platform-constants > src/hafod/internal/platform-constants.ss
 
 compile:
 	@rm -f src/hafod.so src/hafod.wpo
@@ -20,6 +34,24 @@ compile:
 
 compile-wpo: compile
 	$(SCHEME) $(LIBDIRS) --script tools/compile-wpo.ss
+	$(SCHEME) $(LIBDIRS) --script tools/compile-launcher.ss
+
+# Native binary: links against Chez's libkernel.a for direct startup
+# without going through a shell wrapper.  Requires a C compiler and
+# the Chez Scheme development files (scheme.h, libkernel.a, petite.boot).
+native: compile-wpo
+	$(CC) -O2 -o bin/hafod-native tools/hafod.c \
+		$(CHEZ_LIBDIR)/libkernel.a -I$(CHEZ_LIBDIR) \
+		-DLIBDIR=\"$(LIBDIR)\" \
+		$(LDFLAGS) -ldl -lm -llz4 -lz -lncurses -lpthread -m64 \
+		-Wno-format-truncation
+
+# Self-contained binary with boot file, libraries, and program embedded.
+# No external files needed at runtime (only system shared libs).
+# Uses make-boot-file to bake all hafod libraries into the Chez heap,
+# then compiles the launcher program separately.
+standalone: compile-wpo
+	$(SCHEME) $(LIBDIRS) --script tools/build-standalone.ss
 
 # Static pattern rule: test-X runs test/test-X.ss for all discovered test files.
 # We use a static pattern rule (not an implicit pattern rule) because GNU Make
@@ -43,16 +75,30 @@ clean:
 	find src -name '*.so' -delete 2>/dev/null || true
 	find src -name '*.wpo' -delete 2>/dev/null || true
 	find test -name '*.so' -delete 2>/dev/null || true
-	rm -f tools/wpo-boot.so tools/wpo-boot.wpo
+	rm -f tools/wpo-boot.so tools/wpo-boot.wpo tools/hafod.boot
+	rm -f tools/petite-vfasl.boot tools/hafod-vfasl.boot
+	rm -f tools/boot_data.c tools/hafod_boot_data.c tools/prog_data.c
+	rm -f tools/hafod-lib-merged.wpo
+	rm -rf lib/
+	rm -f bin/hafod.so bin/hafod.wpo bin/hafod-native bin/hafod-standalone
+	rm -f tools/gen-platform-constants
 
-install: compile-wpo
+install: native
 	install -d $(DESTDIR)$(BINDIR)
 	install -d $(DESTDIR)$(LIBDIR)/src
 	cp -r src/hafod src/hafod.ss src/hafod.so $(DESTDIR)$(LIBDIR)/src/
-	sed 's|HAFOD_ROOT="$$(cd "$$BINDIR/.." \&\& pwd)"|HAFOD_ROOT="$(LIBDIR)"|' \
-		bin/hafod > $(DESTDIR)$(BINDIR)/hafod
-	chmod +x $(DESTDIR)$(BINDIR)/hafod
-	install -m 644 bin/hafod.sps $(DESTDIR)$(BINDIR)/hafod.sps
+	install -m 644 bin/hafod.sps $(DESTDIR)$(LIBDIR)/hafod.sps
+	install -m 644 bin/hafod.so $(DESTDIR)$(LIBDIR)/hafod.so
+	ln -sf $(CHEZ_LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/petite.boot
+	@if [ -f bin/hafod-native ]; then \
+		install -m 755 bin/hafod-native $(DESTDIR)$(BINDIR)/hafod; \
+	elif [ -f bin/hafod-standalone ]; then \
+		install -m 755 bin/hafod-standalone $(DESTDIR)$(BINDIR)/hafod; \
+	else \
+		sed 's|HAFOD_ROOT="$$(cd "$$BINDIR/.." \&\& pwd)"|HAFOD_ROOT="$(LIBDIR)"|' \
+			bin/hafod > $(DESTDIR)$(BINDIR)/hafod; \
+		chmod +x $(DESTDIR)$(BINDIR)/hafod; \
+	fi
 	install -d $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 644 doc/hafod.1 $(DESTDIR)$(PREFIX)/share/man/man1/hafod.1
 	@if command -v scsh >/dev/null 2>&1; then \
@@ -63,7 +109,7 @@ install: compile-wpo
 	fi
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/hafod $(DESTDIR)$(BINDIR)/hafod.sps
+	rm -f $(DESTDIR)$(BINDIR)/hafod
 	@if [ -L $(DESTDIR)$(BINDIR)/scsh ] && [ "$$(readlink $(DESTDIR)$(BINDIR)/scsh)" = "hafod" ]; then \
 		rm -f $(DESTDIR)$(BINDIR)/scsh; \
 	fi

@@ -16,14 +16,22 @@
       packages = forAllSystems ({ pkgs }: {
         default = pkgs.stdenv.mkDerivation {
           pname = "hafod";
-          version = "2.1.0";
+          version = "1.1.0";
 
           src = ./.;
 
           nativeBuildInputs = [ pkgs.chez pkgs.makeWrapper ];
+          buildInputs = [ pkgs.lz4 pkgs.zlib pkgs.ncurses ];
+
+          LDFLAGS = builtins.concatStringsSep " " (map (p: "-L${p}/lib") [
+            pkgs.lz4 pkgs.zlib pkgs.ncurses
+          ]);
+          CFLAGS = builtins.concatStringsSep " " (map (p: "-I${p}/include") [
+            pkgs.lz4 pkgs.zlib pkgs.ncurses
+          ]);
 
           buildPhase = ''
-            make compile SCHEME=${pkgs.chez}/bin/scheme
+            make compile-wpo SCHEME=${pkgs.chez}/bin/scheme
           '';
 
           installPhase = ''
@@ -31,7 +39,6 @@
 
             # Copy library sources and compiled files
             cp -r src/hafod src/hafod.ss $out/lib/hafod/src/
-            cp -r src/hafod.so $out/lib/hafod/src/ 2>/dev/null || true
             find src -name '*.so' -exec sh -c '
               for f; do
                 dir="$out/lib/hafod/$(dirname "$f")"
@@ -40,13 +47,16 @@
               done
             ' _ {} +
 
-            # Install launcher script
-            install -m 644 bin/hafod.sps $out/bin/hafod.sps
+            # Install pre-compiled launcher program
+            install -m 644 bin/hafod.so $out/lib/hafod/hafod.so
 
-            # Create wrapper
+            # Symlink petite.boot from Chez
+            ln -s ${pkgs.chez}/lib/csv*/*/petite.boot $out/lib/hafod/petite.boot
+
+            # Create wrapper that uses --program with the compiled .so
             cat > $out/bin/hafod << 'WRAPPER'
             #!/bin/sh
-            exec @chez@/bin/scheme --libdirs @out@/lib/hafod/src --script @out@/bin/hafod.sps "$@"
+            exec @chez@/bin/scheme --libdirs @out@/lib/hafod/src --program @out@/lib/hafod/hafod.so "$@"
             WRAPPER
             substituteInPlace $out/bin/hafod \
               --replace-fail '@chez@' '${pkgs.chez}' \
@@ -59,7 +69,7 @@
 
           meta = with pkgs.lib; {
             description = "Chez Scheme port of scsh (the Scheme Shell)";
-            license = licenses.bsd3;
+            license = licenses.isc;
             platforms = platforms.unix;
             mainProgram = "hafod";
           };
@@ -70,6 +80,9 @@
         default = pkgs.mkShell {
           packages = with pkgs; [
             chez
+            lz4
+            zlib
+            ncurses
           ];
         };
       });

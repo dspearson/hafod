@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-identity) -- Environment, CWD, and process identity syscalls
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-identity)
@@ -10,8 +9,6 @@
     posix-setuid posix-setgid posix-seteuid posix-setegid)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
 
   ;; ======================================================================
   ;; Environment / working directory

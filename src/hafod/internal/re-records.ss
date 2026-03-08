@@ -42,9 +42,7 @@
     ;; Predicates
     re-char-class? static-char-class?)
   (import (hafod internal base)
-          (hafod compat)
-          (hafod internal char-sets))
-
+          (hafod compat))
 
   ;; ======================================================================
   ;; re-string

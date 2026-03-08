@@ -6,13 +6,32 @@ use File::Basename;
 use File::Spec;
 use Cwd qw(abs_path);
 use Time::HiRes qw(time);
+use Getopt::Long;
+use POSIX qw(strftime);
 
 my $BENCHDIR = abs_path(dirname(__FILE__));
 my $PROJDIR  = abs_path("$BENCHDIR/..");
-my $HAFOD    = "$PROJDIR/bin/hafod";
+my $SRCDIR   = "$PROJDIR/src";
 my $SCSH_DIR = "/tmp/scsh-master";
 my $SCSH     = "$SCSH_DIR/go";
 my $ITERATIONS = 7;
+
+my $save_results = 0;
+GetOptions('save' => \$save_results);
+
+my $RESULTS_CSV = "$BENCHDIR/results/benchmarks.csv";
+
+# Use compiled native program directly, bypassing shell wrapper.
+# Override with HAFOD env var to test a specific binary (e.g. hafod-standalone).
+my $HAFOD_SO = "$PROJDIR/bin/hafod.so";
+my $CHEZ = $ENV{HAFOD_SCHEME}
+    // (grep { -x $_ } map { "$_/petite" } split(/:/, $ENV{PATH} // ''))[0]
+    // 'scheme';
+my $have_native = -f $HAFOD_SO;
+my $HAFOD = $ENV{HAFOD}
+    // ($have_native
+        ? qq{$CHEZ --libdirs "$SRCDIR" --program "$HAFOD_SO"}
+        : qq{"$PROJDIR/bin/hafod"});
 
 my $have_scsh = -x $SCSH;
 my $is_tty = -t STDERR;
@@ -24,6 +43,9 @@ my %thread_desc = (
     '11-thread-preempt' => '100 threads x 10k work',
     '12-thread-ring'    => '50-thread ring x 5k passes',
 );
+
+# Collected results for --save
+my @saved_rows;
 
 sub run_timed {
     my ($cmd, $n) = @_;
@@ -67,6 +89,17 @@ sub ratio_bar {
 sub fmt_time {
     my ($t) = @_;
     return sprintf("%6.3f s", $t);
+}
+
+sub save_row {
+    my ($name, $best, $median, $mode) = @_;
+    return unless $save_results;
+    push @saved_rows, {
+        name   => $name,
+        best   => $best,
+        median => $median,
+        mode   => $mode,
+    };
 }
 
 # Gather benchmarks
@@ -116,11 +149,13 @@ if (@compare_benches) {
         my $scsh_script  = "$BENCHDIR/${name}-scsh.scm";
 
         progress($name);
-        my ($h_best, $h_med) = run_timed(qq{"$HAFOD" -s "$hafod_script"}, $ITERATIONS);
+        my ($h_best, $h_med) = run_timed(qq{$HAFOD -s "$hafod_script"}, $ITERATIONS);
+        save_row($name, $h_best, $h_med, 'hafod');
 
         if ($have_scsh) {
             my ($s_best, $s_med) = run_timed(qq{cd "$SCSH_DIR" && "$SCSH" -s "$scsh_script"}, $ITERATIONS);
             clear_progress();
+            save_row($name, $s_best, $s_med, 'scsh');
 
             my $ratio = ($s_best > 0) ? $h_best / $s_best : 0;
             push @ratios, $ratio if $ratio > 0;
@@ -163,13 +198,31 @@ if (@thread_benches) {
         my $desc = $thread_desc{$name} // '';
 
         progress($name);
-        my ($best, $med) = run_timed(qq{"$HAFOD" -s "$script"}, $ITERATIONS);
+        my ($best, $med) = run_timed(qq{$HAFOD -s "$script"}, $ITERATIONS);
         clear_progress();
+        save_row($name, $best, $med, 'hafod');
 
         printf "  %-22s  %9s  %9s   %s\n",
             $name, fmt_time($best), fmt_time($med), $desc;
     }
     print "\n";
+}
+
+# Save results to CSV if --save
+if ($save_results && @saved_rows) {
+    my $date = strftime('%Y-%m-%d', localtime);
+    my $need_header = ! -f $RESULTS_CSV;
+
+    open(my $fh, '>>', $RESULTS_CSV) or die "Cannot open $RESULTS_CSV: $!";
+    if ($need_header) {
+        print $fh "date,benchmark,best_s,median_s,mode\n";
+    }
+    for my $row (@saved_rows) {
+        printf $fh "%s,%s,%.3f,%.3f,%s\n",
+            $date, $row->{name}, $row->{best}, $row->{median}, $row->{mode};
+    }
+    close $fh;
+    print "  Results saved to bench/results/benchmarks.csv\n";
 }
 
 print "  Done. ($ITERATIONS iterations per benchmark)\n\n";

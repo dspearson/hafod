@@ -1,10 +1,13 @@
 ;; compile-all.ss -- Import all hafod libraries to trigger compilation
 ;; Also generates .wpo files for whole-program optimisation.
+;; Use minimal compression for faster startup (less decompression overhead).
+(compress-level 'minimum)
 (generate-wpo-files #t)
 (import (hafod internal base) (hafod compat) (hafod internal strings) (hafod internal char-sets) (hafod internal sre-compile)
         (hafod internal re-records) (hafod internal re-posixstr)
         (hafod fname) (hafod rdelim) (hafod command-line)
         (hafod internal errno)
+        (hafod internal platform-constants)
         (hafod internal posix-constants) (hafod internal posix-core)
         (hafod internal posix-file) (hafod internal posix-identity)
         (hafod internal posix-user) (hafod internal posix-time)

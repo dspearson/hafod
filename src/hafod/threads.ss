@@ -22,29 +22,35 @@
           (only (chezscheme) sleep)
           (hafod exit-hooks))
 
-  ;;; ---- FIFO Queue (pair-of-lists) ----
+  ;;; ---- FIFO Queue (vector: front, back, count) ----
+  ;;; O(1) queue-count, O(1) amortised enqueue!/dequeue!
 
-  (define (make-queue) (cons '() '()))
-  (define (queue-empty? q) (and (null? (car q)) (null? (cdr q))))
-  (define (queue-length q) (+ (length (car q)) (length (cdr q))))
+  (define (make-queue) (vector '() '() 0))
+  (define (queue-empty? q) (fx=? (vector-ref q 2) 0))
+  (define (queue-count q) (vector-ref q 2))
 
   (define (enqueue! q x)
-    (set-cdr! q (cons x (cdr q))))
+    (vector-set! q 1 (cons x (vector-ref q 1)))
+    (vector-set! q 2 (fx+ (vector-ref q 2) 1)))
 
   (define (dequeue! q)
-    (when (null? (car q))
-      (set-car! q (reverse (cdr q)))
-      (set-cdr! q '()))
-    (let ([v (caar q)])
-      (set-car! q (cdar q))
+    (when (null? (vector-ref q 0))
+      (vector-set! q 0 (reverse (vector-ref q 1)))
+      (vector-set! q 1 '()))
+    (let ([v (car (vector-ref q 0))])
+      (vector-set! q 0 (cdr (vector-ref q 0)))
+      (vector-set! q 2 (fx- (vector-ref q 2) 1))
       v))
 
   (define (queue-remove! q pred)
-    (set-car! q (remp pred (car q)))
-    (set-cdr! q (remp pred (cdr q))))
+    (let ([front (remp pred (vector-ref q 0))]
+          [back (remp pred (vector-ref q 1))])
+      (vector-set! q 0 front)
+      (vector-set! q 1 back)
+      (vector-set! q 2 (fx+ (length front) (length back)))))
 
   (define (queue->list q)
-    (append (car q) (reverse (cdr q))))
+    (append (vector-ref q 0) (reverse (vector-ref q 1))))
 
   ;;; ---- Thread Record ----
 
@@ -174,8 +180,8 @@
     (protocol
       (lambda (new)
         (case-lambda
-          [() (new (make-queue) 0 #f '() '())]
-          [(cap) (new (make-queue) cap #f '() '())]))))
+          [() (new (make-queue) 0 #f (make-queue) (make-queue))]
+          [(cap) (new (make-queue) cap #f (make-queue) (make-queue))]))))
 
   (define (channel-close ch)
     (channel-closed?-set! ch #t)
@@ -183,35 +189,33 @@
                 (gthread-result-set! t (void))
                 (gthread-state-set! t 'ready)
                 (enqueue! *run-queue* t))
-              (channel-receivers ch))
-    (channel-receivers-set! ch '())
+              (queue->list (channel-receivers ch)))
+    (channel-receivers-set! ch (make-queue))
     (for-each (lambda (pair)
                 (gthread-state-set! (car pair) 'ready)
                 (enqueue! *run-queue* (car pair)))
-              (channel-senders ch))
-    (channel-senders-set! ch '()))
+              (queue->list (channel-senders ch)))
+    (channel-senders-set! ch (make-queue)))
 
   (define (channel-send ch value)
     (when (channel-closed? ch)
       (error 'channel-send "channel is closed"))
     (cond
-      ;; Waiting receiver — hand off directly
-      [(pair? (channel-receivers ch))
-       (let ([receiver (car (channel-receivers ch))])
-         (channel-receivers-set! ch (cdr (channel-receivers ch)))
+      ;; Waiting receiver -- hand off directly
+      [(not (queue-empty? (channel-receivers ch)))
+       (let ([receiver (dequeue! (channel-receivers ch))])
          (gthread-result-set! receiver value)
          (gthread-state-set! receiver 'ready)
          (enqueue! *run-queue* receiver))]
       ;; Buffer has room
-      [(< (queue-length (channel-buffer ch)) (channel-capacity ch))
+      [(< (queue-count (channel-buffer ch)) (channel-capacity ch))
        (enqueue! (channel-buffer ch) value)]
       ;; Must block
       [else
        (unless *current*
          (error 'channel-send "cannot block outside scheduler"))
        (gthread-state-set! *current* 'blocked)
-       (channel-senders-set! ch
-         (append (channel-senders ch) (list (cons *current* value))))
+       (enqueue! (channel-senders ch) (cons *current* value))
        (engine-block)]))
 
   (define (channel-receive ch)
@@ -220,21 +224,19 @@
       [(not (queue-empty? (channel-buffer ch)))
        (let ([value (dequeue! (channel-buffer ch))])
          ;; Wake a blocked sender if any
-         (when (pair? (channel-senders ch))
-           (let* ([sp (car (channel-senders ch))]
+         (when (not (queue-empty? (channel-senders ch)))
+           (let* ([sp (dequeue! (channel-senders ch))]
                   [sender (car sp)]
                   [send-val (cdr sp)])
-             (channel-senders-set! ch (cdr (channel-senders ch)))
              (enqueue! (channel-buffer ch) send-val)
              (gthread-state-set! sender 'ready)
              (enqueue! *run-queue* sender)))
          value)]
-      ;; Blocked sender — synchronous handoff
-      [(pair? (channel-senders ch))
-       (let* ([sp (car (channel-senders ch))]
+      ;; Blocked sender -- synchronous handoff
+      [(not (queue-empty? (channel-senders ch)))
+       (let* ([sp (dequeue! (channel-senders ch))]
               [sender (car sp)]
               [value (cdr sp)])
-         (channel-senders-set! ch (cdr (channel-senders ch)))
          (gthread-state-set! sender 'ready)
          (enqueue! *run-queue* sender)
          value)]
@@ -246,17 +248,16 @@
        (unless *current*
          (error 'channel-receive "cannot block outside scheduler"))
        (gthread-state-set! *current* 'blocked)
-       (channel-receivers-set! ch
-         (append (channel-receivers ch) (list *current*)))
+       (enqueue! (channel-receivers ch) *current*)
        (engine-block)
        (gthread-result *current*)]))
 
   (define (channel-try-send ch value)
     (cond
       [(channel-closed? ch) #f]
-      [(pair? (channel-receivers ch))
+      [(not (queue-empty? (channel-receivers ch)))
        (channel-send ch value) #t]
-      [(< (queue-length (channel-buffer ch)) (channel-capacity ch))
+      [(< (queue-count (channel-buffer ch)) (channel-capacity ch))
        (enqueue! (channel-buffer ch) value) #t]
       [else #f]))
 
@@ -264,7 +265,7 @@
     (cond
       [(not (queue-empty? (channel-buffer ch)))
        (values (channel-receive ch) #t)]
-      [(pair? (channel-senders ch))
+      [(not (queue-empty? (channel-senders ch)))
        (values (channel-receive ch) #t)]
       [else (values #f #f)]))
 

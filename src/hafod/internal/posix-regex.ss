@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-regex) -- POSIX regex operations
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-regex)
@@ -8,29 +7,26 @@
     REG_EXTENDED REG_ICASE REG_NOSUB REG_NEWLINE
     REG_NOTBOL REG_NOTEOL REG_NOMATCH)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; POSIX Regex (regcomp / regexec / regfree / regerror)
   ;; ======================================================================
 
   ;; Constants
-  (define REG_EXTENDED 1)
-  (define REG_ICASE    2)
-  (define REG_NOSUB    4)
-  (define REG_NEWLINE  8)
-  (define REG_NOTBOL   1)
-  (define REG_NOTEOL   2)
-  (define REG_NOMATCH  1)
+  (define REG_EXTENDED PLAT-REG-EXTENDED)
+  (define REG_ICASE    PLAT-REG-ICASE)
+  (define REG_NOSUB    PLAT-REG-NOSUB)
+  (define REG_NEWLINE  PLAT-REG-NEWLINE)
+  (define REG_NOTBOL   PLAT-REG-NOTBOL)
+  (define REG_NOTEOL   PLAT-REG-NOTEOL)
+  (define REG_NOMATCH  PLAT-REG-NOMATCH)
 
-  ;; Struct sizes (Linux x86_64 / glibc)
-  ;; regex_t is 64 bytes on glibc x86_64, but we over-allocate for safety.
-  (define *regex-t-size* 256)
-  ;; regmatch_t on glibc: regoff_t is int (4 bytes), so sizeof(regmatch_t) = 8
-  (define *regmatch-size* 8)
-  (define *regoff-size* 4)
+  ;; Struct sizes from platform-constants
+  (define *regex-t-size* SIZEOF-REGEX-T)
+  (define *regmatch-size* SIZEOF-REGMATCH-T)
+  (define *regoff-size* SIZEOF-REGOFF-T)
 
   ;; FFI declarations
   (define c-regcomp  (foreign-procedure "regcomp"  (u8* string int) int))

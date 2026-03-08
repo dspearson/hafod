@@ -76,6 +76,27 @@ If `scheme` is not on your PATH or is named differently:
 make SCHEME=/path/to/chez-scheme
 ```
 
+### Build modes
+
+hafod supports three build modes:
+
+| Mode | Command | Output | Size | Startup | Runtime dependencies |
+|------|---------|--------|------|---------|---------------------|
+| Library | `make` | `bin/hafod` | n/a | ~87ms | `scheme` on PATH |
+| Native | `make native` | `bin/hafod-native` | ~50KB | ~85ms | petite.boot, compiled libs |
+| Standalone | `make standalone` | `bin/hafod-standalone` | ~5.1MB | ~62ms | none |
+
+**Library** (default) compiles all libraries and produces a shell wrapper
+that invokes `scheme`.  No C compiler needed.
+
+**Native** links against Chez's `libkernel.a` for a small native binary
+that still requires `petite.boot` and the compiled `.so` libraries at
+runtime.  Useful for installed deployments where Chez is available.
+
+**Standalone** embeds LZ4-compressed vfasl boot files and the launcher
+program into a single self-contained binary.  No external files needed
+at runtime — recommended for distribution.
+
 ### Nix
 
 A `flake.nix` is provided for development:
@@ -87,16 +108,25 @@ make && make test
 
 ## Installation
 
+For a self-contained binary with no runtime dependencies, use the
+standalone build:
+
 ```sh
+make standalone
 make install                          # installs to /usr/local
+```
+
+Other install options:
+
+```sh
 make install PREFIX=/opt/hafod        # custom prefix
 make install DESTDIR=/tmp/staging     # staged install for packaging
 ```
 
-This installs:
-- `bin/hafod` -- launcher script
-- `bin/hafod.sps` -- Chez Scheme entry point
-- `lib/hafod/src/` -- compiled libraries
+`make install` automatically picks the best available binary: standalone
+if built, then native, then the shell wrapper.  It also installs:
+- `lib/hafod/src/` -- compiled libraries (for use as an R6RS library)
+- `share/man/man1/hafod.1` -- man page
 
 If no existing `scsh` binary is found on PATH, a `scsh -> hafod` symlink
 is created in the bin directory for compatibility.

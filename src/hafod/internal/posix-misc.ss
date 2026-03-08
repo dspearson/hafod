@@ -1,6 +1,5 @@
 ;;; (hafod internal posix-misc) -- Directory iteration, fcntl, groups, environ, mkstemp,
 ;;; utimes, fnmatch, mkfifo/fsync/sync, uname
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-misc)
@@ -16,20 +15,12 @@
     posix-mkfifo posix-fsync posix-sync
     posix-uname)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; Directory iteration
   ;; ======================================================================
-
-  ;; struct dirent offsets (x86_64 Linux)
-  (define DIRENT_D_INO     0)
-  (define DIRENT_D_OFF     8)
-  (define DIRENT_D_RECLEN 16)
-  (define DIRENT_D_TYPE   18)
-  (define DIRENT_D_NAME   19)
 
   (define c-opendir (foreign-procedure "opendir" (string) void*))
   (define c-readdir (foreign-procedure "readdir" (void*) void*))
@@ -50,12 +41,7 @@
     (let ([ent (c-readdir dirp)])
       (cond
         [(not (= ent 0))
-         ;; Extract d_name (null-terminated string at offset DIRENT_D_NAME)
-         (let loop ([i 0] [chars '()])
-           (let ([byte (foreign-ref 'unsigned-8 ent (+ DIRENT_D_NAME i))])
-             (if (= byte 0)
-                 (list->string (reverse chars))
-                 (loop (+ i 1) (cons (integer->char byte) chars)))))]
+         (ptr->string (+ ent DIRENT-D-NAME))]
         [else
          ;; ent is NULL: check errno
          (let ([err (foreign-ref 'int (__errno_location) 0)])
@@ -177,9 +163,9 @@
 
   (define c-fnmatch (foreign-procedure "fnmatch" (string string int) int))
 
-  (define FNM_NOESCAPE 1)
-  (define FNM_PATHNAME 2)
-  (define FNM_PERIOD 4)
+  (define FNM_NOESCAPE PLAT-FNM-NOESCAPE)
+  (define FNM_PATHNAME PLAT-FNM-PATHNAME)
+  (define FNM_PERIOD PLAT-FNM-PERIOD)
 
   ;; posix-fnmatch: match a glob pattern against a string.
   ;; Returns 0 on match, FNM_NOMATCH (1) on no match.
@@ -193,25 +179,19 @@
   (define c-glob (foreign-procedure "glob" (string int void* void*) int))
   (define c-globfree (foreign-procedure "globfree" (void*) void))
 
-  ;; glob_t on Linux x86_64:
-  ;;   size_t gl_pathc  offset 0  (8 bytes)
-  ;;   char **gl_pathv  offset 8  (8 bytes)
-  ;;   size_t gl_offs   offset 16 (8 bytes)
-  ;; Total struct is larger but we only need these fields.
-  ;; 80 bytes covers Linux x86_64; may need adjustment for other architectures.
-  (define GLOB_T_SIZE 80)
+  ;; glob_t — struct size and offsets from platform-constants
 
   ;; posix-glob-fast: call C glob(3) directly.
   ;; Returns a list of matching path strings, or '() on no match.
   (define (posix-glob-fast pattern)
-    (let ([buf (foreign-alloc GLOB_T_SIZE)])
+    (let ([buf (foreign-alloc SIZEOF-GLOB-T)])
       ;; Zero out buffer
-      (do ([i 0 (+ i 1)]) ((= i GLOB_T_SIZE))
+      (do ([i 0 (+ i 1)]) ((= i SIZEOF-GLOB-T))
         (foreign-set! 'unsigned-8 buf i 0))
       (let ([rc (c-glob pattern 0 0 buf)])
         (if (zero? rc)
-            (let* ([pathc (foreign-ref 'uptr buf 0)]
-                   [pathv (foreign-ref 'uptr buf 8)]
+            (let* ([pathc (foreign-ref 'uptr buf GLOB-GL-PATHC)]
+                   [pathv (foreign-ref 'uptr buf GLOB-GL-PATHV)]
                    [results (let loop ([i 0] [acc '()])
                               (if (= i pathc) (reverse acc)
                                   (let ([ptr (foreign-ref 'uptr pathv (* i 8))])
