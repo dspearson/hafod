@@ -1,5 +1,4 @@
 ;;; (hafod internal tty-constants) -- TTY flag constants
-;;; Extracted from tty.ss during Phase 26 splitting.
 ;;; Pure definitions -- no FFI, no dependencies beyond (chezscheme).
 ;;; Copyright (c) 1993 Olin Shivers. R6RS adaptation (c) 2026, hafod contributors.
 
@@ -61,60 +60,60 @@
     ;; Baud rate operations
     encode-baud-rate decode-baud-rate baud-rates)
 
-  (import (chezscheme))
+  (import (chezscheme) (hafod internal platform-constants))
 
   ;; ======================================================================
-  ;; Control Character Constants (Linux x86_64 POSIX indices)
+  ;; Control Character Constants (POSIX cc indices from platform-constants)
   ;; ======================================================================
 
-  (define ttychar/interrupt      0)   ; VINTR
-  (define ttychar/quit           1)   ; VQUIT
-  (define ttychar/delete-char    2)   ; VERASE
-  (define ttychar/delete-line    3)   ; VKILL
-  (define ttychar/eof            4)   ; VEOF
-  (define ttychar/time           5)   ; VTIME
-  (define ttychar/min            6)   ; VMIN
-  (define ttychar/start          8)   ; VSTART
-  (define ttychar/stop           9)   ; VSTOP
-  (define ttychar/suspend       10)   ; VSUSP
-  (define ttychar/eol           11)   ; VEOL
-  (define ttychar/reprint       12)   ; VREPRINT
-  (define ttychar/discard       13)   ; VDISCARD
-  (define ttychar/delete-word   14)   ; VWERASE
-  (define ttychar/literal-next  15)   ; VLNEXT
-  (define ttychar/eol2          16)   ; VEOL2
+  (define ttychar/interrupt      PLAT-VINTR)
+  (define ttychar/quit           PLAT-VQUIT)
+  (define ttychar/delete-char    PLAT-VERASE)
+  (define ttychar/delete-line    PLAT-VKILL)
+  (define ttychar/eof            PLAT-VEOF)
+  (define ttychar/time           PLAT-VTIME)
+  (define ttychar/min            PLAT-VMIN)
+  (define ttychar/start          PLAT-VSTART)
+  (define ttychar/stop           PLAT-VSTOP)
+  (define ttychar/suspend        PLAT-VSUSP)
+  (define ttychar/eol            PLAT-VEOL)
+  (define ttychar/reprint        PLAT-VREPRINT)
+  (define ttychar/discard        PLAT-VDISCARD)
+  (define ttychar/delete-word    PLAT-VWERASE)
+  (define ttychar/literal-next   PLAT-VLNEXT)
+  (define ttychar/eol2           PLAT-VEOL2)
   (define ttychar/delayed-suspend #f) ; VDSUSP (not available on Linux)
   (define ttychar/status #f)          ; VSTATUS (BSD only, not available on Linux)
 
-  (define num-ttychars 32)            ; NCCS on Linux
+  (define num-ttychars PLAT-NCCS)
   (define disable-tty-char (integer->char 0))  ; _POSIX_VDISABLE
 
   ;; ======================================================================
   ;; Input Flag Constants
   ;; ======================================================================
 
-  (define ttyin/ignore-break            #x0001) ; IGNBRK
-  (define ttyin/interrupt-on-break      #x0002) ; BRKINT
-  (define ttyin/ignore-bad-parity-chars #x0004) ; IGNPAR
-  (define ttyin/mark-parity-errors      #x0008) ; PARMRK
-  (define ttyin/check-parity            #x0010) ; INPCK
-  (define ttyin/7bits                   #x0020) ; ISTRIP
-  (define ttyin/nl->cr                  #x0040) ; INLCR
-  (define ttyin/ignore-cr               #x0080) ; IGNCR
-  (define ttyin/cr->nl                  #x0100) ; ICRNL
-  (define ttyin/lowercase               #x0200) ; IUCLC
-  (define ttyin/output-flow-ctl         #x0400) ; IXON
-  (define ttyin/xon-any                 #x0800) ; IXANY
-  (define ttyin/input-flow-ctl          #x1000) ; IXOFF
+  (define ttyin/ignore-break            PLAT-IGNBRK)
+  (define ttyin/interrupt-on-break      PLAT-BRKINT)
+  (define ttyin/ignore-bad-parity-chars PLAT-IGNPAR)
+  (define ttyin/mark-parity-errors      PLAT-PARMRK)
+  (define ttyin/check-parity            PLAT-INPCK)
+  (define ttyin/7bits                   PLAT-ISTRIP)
+  (define ttyin/nl->cr                  PLAT-INLCR)
+  (define ttyin/ignore-cr               PLAT-IGNCR)
+  (define ttyin/cr->nl                  PLAT-ICRNL)
+  (define ttyin/lowercase               #x0200) ; IUCLC (Linux-specific)
+  (define ttyin/output-flow-ctl         PLAT-IXON)
+  (define ttyin/xon-any                 PLAT-IXANY)
+  (define ttyin/input-flow-ctl          PLAT-IXOFF)
   (define ttyin/beep-on-overflow        #x2000) ; IMAXBEL
 
   ;; ======================================================================
   ;; Output Flag Constants
   ;; ======================================================================
 
-  (define ttyout/enable            #x0001) ; OPOST
-  (define ttyout/uppercase         #x0002) ; OLCUC
-  (define ttyout/nl->crnl          #x0004) ; ONLCR
+  (define ttyout/enable            PLAT-OPOST)
+  (define ttyout/uppercase         #x0002) ; OLCUC (Linux-specific)
+  (define ttyout/nl->crnl          PLAT-ONLCR)
   (define ttyout/cr->nl            #x0008) ; OCRNL
   (define ttyout/no-col0-cr        #x0010) ; ONOCR
   (define ttyout/nl-does-cr        #x0020) ; ONLRET
@@ -156,17 +155,17 @@
   ;; Control Flag Constants
   ;; ======================================================================
 
-  (define ttyc/char-size           #x0030) ; CSIZE
-  (define ttyc/char-size5          #x0000) ; CS5
-  (define ttyc/char-size6          #x0010) ; CS6
-  (define ttyc/char-size7          #x0020) ; CS7
-  (define ttyc/char-size8          #x0030) ; CS8
-  (define ttyc/2-stop-bits         #x0040) ; CSTOPB
-  (define ttyc/enable-read         #x0080) ; CREAD
-  (define ttyc/enable-parity       #x0100) ; PARENB
-  (define ttyc/odd-parity          #x0200) ; PARODD
-  (define ttyc/hup-on-close        #x0400) ; HUPCL
-  (define ttyc/no-modem-sync       #x0800) ; CLOCAL
+  (define ttyc/char-size           PLAT-CSIZE)
+  (define ttyc/char-size5          PLAT-CS5)
+  (define ttyc/char-size6          PLAT-CS6)
+  (define ttyc/char-size7          PLAT-CS7)
+  (define ttyc/char-size8          PLAT-CS8)
+  (define ttyc/2-stop-bits         PLAT-CSTOPB)
+  (define ttyc/enable-read         PLAT-CREAD)
+  (define ttyc/enable-parity       PLAT-PARENB)
+  (define ttyc/odd-parity          PLAT-PARODD)
+  (define ttyc/hup-on-close        PLAT-HUPCL)
+  (define ttyc/no-modem-sync       PLAT-CLOCAL)
   (define ttyc/ignore-flags        #f)     ; CIGNORE (not on Linux)
   (define ttyc/CTS-output-flow-ctl #x80000000) ; CRTSCTS
   (define ttyc/RTS-input-flow-ctl  #f)     ; not separately available on Linux
@@ -176,21 +175,21 @@
   ;; Local Flag Constants
   ;; ======================================================================
 
-  (define ttyl/enable-signals        #x0001) ; ISIG
-  (define ttyl/canonical             #x0002) ; ICANON
-  (define ttyl/case-map              #x0004) ; XCASE
-  (define ttyl/echo                  #x0008) ; ECHO
-  (define ttyl/visual-delete         #x0010) ; ECHOE
-  (define ttyl/echo-delete-line      #x0020) ; ECHOK
-  (define ttyl/echo-nl               #x0040) ; ECHONL
-  (define ttyl/no-flush-on-interrupt #x0080) ; NOFLSH
-  (define ttyl/ttou-signal           #x0100) ; TOSTOP
-  (define ttyl/echo-ctl              #x0200) ; ECHOCTL
-  (define ttyl/hardcopy-delete       #x0400) ; ECHOPRT
-  (define ttyl/visual-delete-line    #x0800) ; ECHOKE
-  (define ttyl/flush-output          #x1000) ; FLUSHO
-  (define ttyl/reprint-unread-chars  #x4000) ; PENDIN
-  (define ttyl/extended              #x8000) ; IEXTEN
+  (define ttyl/enable-signals        PLAT-ISIG)
+  (define ttyl/canonical             PLAT-ICANON)
+  (define ttyl/case-map              #x0004) ; XCASE (Linux-specific)
+  (define ttyl/echo                  PLAT-ECHO)
+  (define ttyl/visual-delete         PLAT-ECHOE)
+  (define ttyl/echo-delete-line      PLAT-ECHOK)
+  (define ttyl/echo-nl               PLAT-ECHONL)
+  (define ttyl/no-flush-on-interrupt PLAT-NOFLSH)
+  (define ttyl/ttou-signal           PLAT-TOSTOP)
+  (define ttyl/echo-ctl              #x0200) ; ECHOCTL (Linux-specific)
+  (define ttyl/hardcopy-delete       #x0400) ; ECHOPRT (Linux-specific)
+  (define ttyl/visual-delete-line    #x0800) ; ECHOKE (Linux-specific)
+  (define ttyl/flush-output          #x1000) ; FLUSHO (Linux-specific)
+  (define ttyl/reprint-unread-chars  #x4000) ; PENDIN (Linux-specific)
+  (define ttyl/extended              PLAT-IEXTEN)
   (define ttyl/alt-delete-word       #f)     ; ALTWERASE (not on Linux)
   (define ttyl/no-kernel-status      #f)     ; NOKERNINFO (not on Linux)
 

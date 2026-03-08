@@ -453,11 +453,14 @@
     #f))
 
 (test-assert "file-option constants"
-  (and (= open/read 0)
-       (= open/write 1)
-       (= open/read+write 2)
-       (= open/create 64)
-       (= open/truncate 512)))
+  (and (integer? open/read)
+       (integer? open/write)
+       (integer? open/read+write)
+       (integer? open/create)
+       (integer? open/truncate)
+       (= open/read O_RDONLY)
+       (= open/write O_WRONLY)
+       (= open/read+write O_RDWR)))
 
 ;; ======================================================================
 ;; Port rebinding

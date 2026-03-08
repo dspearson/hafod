@@ -21,6 +21,9 @@
     ;; Internal (for process.ss)
     obituary mark-proc-waited!
 
+    ;; Background job count
+    background-job-count
+
     ;; Re-export wait flags and status decoders for convenience
     wait/poll wait/stopped-children
     status:exit-val status:term-sig status:stop-sig)
@@ -174,6 +177,24 @@
                (obituary p status)
                (proc-zombie?-set! p #t))
              (loop)])))))
+
+  ;; ======================================================================
+  ;; Background job count
+  ;; ======================================================================
+
+  ;; (background-job-count) => integer
+  ;; Count the number of unfinished (still running) processes in the process table.
+  ;; Calls reap-zombies first to update the table.
+  (define (background-job-count)
+    (reap-zombies)
+    (let ([count 0])
+      (let-values ([(keys vals) (hashtable-entries *process-table*)])
+        (vector-for-each
+          (lambda (p)
+            (unless (proc:finished? p)
+              (set! count (+ count 1))))
+          vals))
+      count))
 
   ;; ======================================================================
   ;; Custom printer (expression — must be after all definitions)

@@ -9,8 +9,7 @@
   (import (hafod internal base)
           (hafod compat)
           (hafod re)
-          (hafod rdelim)
-          (hafod internal char-sets))
+          (hafod rdelim))
 
   ;; ======================================================================
   ;; Delimiter matcher coercion

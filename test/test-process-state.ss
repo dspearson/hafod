@@ -1,5 +1,5 @@
 (library-directories '(("src" . "src") ("." . ".")))
-(import (test runner) (hafod process-state) (hafod environment) (hafod posix) (hafod user-group))
+(import (test runner) (hafod process-state) (hafod environment) (hafod posix) (hafod user-group) (hafod tty))
 
 (test-begin "process-state")
 
@@ -11,17 +11,17 @@
   (posix-getcwd)
   (cwd))
 
-;; chdir to /tmp and back
+;; chdir to / and back
 (let ([orig (cwd)])
-  (test-assert "chdir to /tmp"
-    (begin (chdir "/tmp")
-           (string=? "/tmp" (cwd))))
+  (test-assert "chdir to /"
+    (begin (chdir "/")
+           (string=? "/" (cwd))))
   (chdir orig))
 
 ;; with-cwd scoping
 (let ([orig (cwd)])
-  (test-equal "with-cwd /tmp returns /tmp" "/tmp"
-    (with-cwd "/tmp" (cwd)))
+  (test-equal "with-cwd / returns /" "/"
+    (with-cwd "/" (cwd)))
   (test-equal "with-cwd restores" orig (cwd)))
 
 ;; chdir no args goes home
@@ -62,6 +62,29 @@
 ;; ---- Process Group ----
 (test-equal "process-group matches posix-getpgrp"
   (posix-getpgrp) (process-group))
+
+;; set-process-group two-arg form (no-op: set own pid to current pgid)
+(test-assert "set-process-group two-arg no-op completes"
+  (begin (set-process-group (pid) (process-group)) #t))
+
+;; set-process-group one-arg form (create own group + restore)
+(let ([orig (process-group)])
+  (set-process-group (pid))
+  (test-equal "set-process-group one-arg creates own group"
+    (pid) (process-group))
+  (set-process-group (pid) orig))
+
+;; become-session-leader -- only check it's a procedure (calling it detaches terminal)
+(test-assert "become-session-leader is a procedure"
+  (procedure? become-session-leader))
+
+;; TTY-guarded tests
+(when (tty? 0)
+  (test-assert "tty-process-group returns positive integer"
+    (let ([pgid (tty-process-group 0)])
+      (and (integer? pgid) (> pgid 0))))
+  (test-assert "set-tty-process-group is a procedure"
+    (procedure? set-tty-process-group)))
 
 ;; ---- UID/GID ----
 (test-equal "user-uid matches posix-getuid"

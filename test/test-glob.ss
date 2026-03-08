@@ -135,4 +135,61 @@
 (test-assert "glob with absolute path works"
   (pair? (glob "/tmp/*")))
 
+;; Test: character class patterns [abc], [a-z], [^abc], [!abc]
+(let ([dir "/tmp/hafod-glob-charclass"])
+  (guard (e [#t #f])
+    (for-each (lambda (f) (posix-unlink (string-append dir "/" f)))
+              '("a.txt" "b.txt" "c.txt" "d.txt" "1.txt"))
+    (posix-rmdir dir))
+
+  (posix-mkdir dir #o755)
+  (for-each (lambda (name)
+              (let ([path (string-append dir "/" name)])
+                (receive (tmp-path fd) (posix-mkstemp (string-append dir "/tmp-XXXXXX"))
+                  (posix-close fd)
+                  (posix-rename tmp-path path))))
+            '("a.txt" "b.txt" "c.txt" "d.txt" "1.txt"))
+
+  ;; [abc].txt matches a, b, c but not d or 1
+  (let ([results (glob (string-append dir "/[abc].txt"))])
+    (test-assert "[abc] matches a.txt"
+      (exists (lambda (f) (string-suffix? "a.txt" f)) results))
+    (test-assert "[abc] matches b.txt"
+      (exists (lambda (f) (string-suffix? "b.txt" f)) results))
+    (test-assert "[abc] matches c.txt"
+      (exists (lambda (f) (string-suffix? "c.txt" f)) results))
+    (test-assert "[abc] does not match d.txt"
+      (not (exists (lambda (f) (string-suffix? "d.txt" f)) results)))
+    (test-assert "[abc] does not match 1.txt"
+      (not (exists (lambda (f) (string-suffix? "1.txt" f)) results))))
+
+  ;; [a-c].txt matches a, b, c but not d
+  (let ([results (glob (string-append dir "/[a-c].txt"))])
+    (test-assert "[a-c] matches a.txt"
+      (exists (lambda (f) (string-suffix? "a.txt" f)) results))
+    (test-assert "[a-c] matches c.txt"
+      (exists (lambda (f) (string-suffix? "c.txt" f)) results))
+    (test-assert "[a-c] does not match d.txt"
+      (not (exists (lambda (f) (string-suffix? "d.txt" f)) results))))
+
+  ;; [^abc].txt / [!abc].txt matches d and 1 but not a, b, c
+  (let ([results (glob (string-append dir "/[^abc].txt"))])
+    (test-assert "[^abc] matches d.txt"
+      (exists (lambda (f) (string-suffix? "d.txt" f)) results))
+    (test-assert "[^abc] matches 1.txt"
+      (exists (lambda (f) (string-suffix? "1.txt" f)) results))
+    (test-assert "[^abc] does not match a.txt"
+      (not (exists (lambda (f) (string-suffix? "a.txt" f)) results))))
+
+  (let ([results (glob (string-append dir "/[!abc].txt"))])
+    (test-assert "[!abc] matches d.txt"
+      (exists (lambda (f) (string-suffix? "d.txt" f)) results))
+    (test-assert "[!abc] does not match b.txt"
+      (not (exists (lambda (f) (string-suffix? "b.txt" f)) results))))
+
+  ;; Cleanup
+  (for-each (lambda (name) (posix-unlink (string-append dir "/" name)))
+            '("a.txt" "b.txt" "c.txt" "d.txt" "1.txt"))
+  (posix-rmdir dir))
+
 (test-end)

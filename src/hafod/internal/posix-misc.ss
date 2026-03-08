@@ -1,6 +1,5 @@
 ;;; (hafod internal posix-misc) -- Directory iteration, fcntl, groups, environ, mkstemp,
 ;;; utimes, fnmatch, mkfifo/fsync/sync, uname
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-misc)
@@ -16,20 +15,12 @@
     posix-mkfifo posix-fsync posix-sync
     posix-uname)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; Directory iteration
   ;; ======================================================================
-
-  ;; struct dirent offsets (x86_64 Linux)
-  (define DIRENT_D_INO     0)
-  (define DIRENT_D_OFF     8)
-  (define DIRENT_D_RECLEN 16)
-  (define DIRENT_D_TYPE   18)
-  (define DIRENT_D_NAME   19)
 
   (define c-opendir (foreign-procedure "opendir" (string) void*))
   (define c-readdir (foreign-procedure "readdir" (void*) void*))
@@ -50,12 +41,7 @@
     (let ([ent (c-readdir dirp)])
       (cond
         [(not (= ent 0))
-         ;; Extract d_name (null-terminated string at offset DIRENT_D_NAME)
-         (let loop ([i 0] [chars '()])
-           (let ([byte (foreign-ref 'unsigned-8 ent (+ DIRENT_D_NAME i))])
-             (if (= byte 0)
-                 (list->string (reverse chars))
-                 (loop (+ i 1) (cons (integer->char byte) chars)))))]
+         (ptr->string (+ ent DIRENT-D-NAME))]
         [else
          ;; ent is NULL: check errno
          (let ([err (foreign-ref 'int (__errno_location) 0)])
@@ -71,15 +57,16 @@
   ;; fcntl
   ;; ======================================================================
 
-  ;; Use the 3-arg form always, passing 0 for the third arg when not needed.
-  (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
+  ;; Non-variadic wrappers for fcntl (variadic in C).
+  (define c-fcntl-void (foreign-procedure "hafod_fcntl_void" (int int) int))
+  (define c-fcntl-int (foreign-procedure "hafod_fcntl_int" (int int int) int))
 
   ;; posix-fcntl: file descriptor control.
   ;; (posix-fcntl fd cmd) or (posix-fcntl fd cmd arg)
   (define (posix-fcntl fd cmd . args)
     (if (null? args)
-        (posix-call fcntl (c-fcntl fd cmd 0))
-        (posix-call fcntl (c-fcntl fd cmd (car args)))))
+        (posix-call fcntl (c-fcntl-void fd cmd))
+        (posix-call fcntl (c-fcntl-int fd cmd (car args)))))
 
   ;; ======================================================================
   ;; Supplementary groups
@@ -95,13 +82,14 @@
         (let ([err (foreign-ref 'int (__errno_location) 0)])
           (raise-posix-error 'getgroups err)))
       (if (= n 0) '()
-          (with-foreign-buffer ([buf (* n 4)])
-            (posix-call getgroups (c-getgroups n buf))
-            (let loop ([i 0] [gids '()])
-              (if (= i n)
-                  (reverse gids)
-                  (loop (+ i 1)
-                        (cons (foreign-ref 'unsigned-32 buf (* i 4)) gids))))))))
+          (let ([gid-size (foreign-sizeof 'unsigned-int)])
+            (with-foreign-buffer ([buf (* n gid-size)])
+              (posix-call getgroups (c-getgroups n buf))
+              (let loop ([i 0] [gids '()])
+                (if (= i n)
+                    (reverse gids)
+                    (loop (+ i 1)
+                          (cons (foreign-ref 'unsigned-32 buf (* i gid-size)) gids)))))))))
 
   ;; ======================================================================
   ;; Environment reading (full environ iteration)
@@ -112,7 +100,7 @@
   (define (read-environ)
     (let ([envp (foreign-ref 'uptr (foreign-entry "environ") 0)])
       (let loop ([i 0] [alist '()])
-        (let ([ptr (foreign-ref 'uptr envp (* i 8))])
+        (let ([ptr (foreign-ref 'uptr envp (* i (foreign-sizeof 'void*)))])
           (if (= ptr 0)
               (reverse alist)
               (let* ([str (ptr->string ptr)]
@@ -151,8 +139,9 @@
   ;; utimes -- set file access and modification times
   ;; ======================================================================
 
-  ;; struct timeval { long tv_sec; long tv_usec; } -- 16 bytes each, 32 bytes total
+  ;; struct timeval { long tv_sec; long tv_usec; }
   (define c-utimes (foreign-procedure "utimes" (string void*) int))
+  (define sizeof-timeval (* 2 (foreign-sizeof 'long)))
 
   ;; posix-utimes: set atime and mtime on a file.
   ;; atime and mtime are epoch seconds (integers).
@@ -161,15 +150,16 @@
     (if (and (not atime) (not mtime))
         ;; NULL pointer = set to current time
         (posix-call utimes (c-utimes path 0))
-        ;; Allocate two struct timevals (32 bytes total)
-        (with-foreign-buffer ([buf 32])
-          ;; atime: tv_sec at offset 0, tv_usec at offset 8
-          (foreign-set! 'long buf 0 (or atime 0))
-          (foreign-set! 'long buf 8 0)
-          ;; mtime: tv_sec at offset 16, tv_usec at offset 24
-          (foreign-set! 'long buf 16 (or mtime 0))
-          (foreign-set! 'long buf 24 0)
-          (posix-call utimes (c-utimes path buf)))))
+        ;; Allocate two struct timevals
+        (let ([sl (foreign-sizeof 'long)])
+          (with-foreign-buffer ([buf (* 2 sizeof-timeval)])
+            ;; atime
+            (foreign-set! 'long buf 0 (or atime 0))
+            (foreign-set! 'long buf sl 0)
+            ;; mtime
+            (foreign-set! 'long buf sizeof-timeval (or mtime 0))
+            (foreign-set! 'long buf (+ sizeof-timeval sl) 0)
+            (posix-call utimes (c-utimes path buf))))))
 
   ;; ======================================================================
   ;; fnmatch -- glob pattern matching
@@ -177,9 +167,9 @@
 
   (define c-fnmatch (foreign-procedure "fnmatch" (string string int) int))
 
-  (define FNM_NOESCAPE 1)
-  (define FNM_PATHNAME 2)
-  (define FNM_PERIOD 4)
+  (define FNM_NOESCAPE PLAT-FNM-NOESCAPE)
+  (define FNM_PATHNAME PLAT-FNM-PATHNAME)
+  (define FNM_PERIOD PLAT-FNM-PERIOD)
 
   ;; posix-fnmatch: match a glob pattern against a string.
   ;; Returns 0 on match, FNM_NOMATCH (1) on no match.
@@ -193,28 +183,22 @@
   (define c-glob (foreign-procedure "glob" (string int void* void*) int))
   (define c-globfree (foreign-procedure "globfree" (void*) void))
 
-  ;; glob_t on Linux x86_64:
-  ;;   size_t gl_pathc  offset 0  (8 bytes)
-  ;;   char **gl_pathv  offset 8  (8 bytes)
-  ;;   size_t gl_offs   offset 16 (8 bytes)
-  ;; Total struct is larger but we only need these fields.
-  ;; 80 bytes covers Linux x86_64; may need adjustment for other architectures.
-  (define GLOB_T_SIZE 80)
+  ;; glob_t — struct size and offsets from platform-constants
 
   ;; posix-glob-fast: call C glob(3) directly.
   ;; Returns a list of matching path strings, or '() on no match.
   (define (posix-glob-fast pattern)
-    (let ([buf (foreign-alloc GLOB_T_SIZE)])
+    (let ([buf (foreign-alloc SIZEOF-GLOB-T)])
       ;; Zero out buffer
-      (do ([i 0 (+ i 1)]) ((= i GLOB_T_SIZE))
+      (do ([i 0 (+ i 1)]) ((= i SIZEOF-GLOB-T))
         (foreign-set! 'unsigned-8 buf i 0))
       (let ([rc (c-glob pattern 0 0 buf)])
         (if (zero? rc)
-            (let* ([pathc (foreign-ref 'uptr buf 0)]
-                   [pathv (foreign-ref 'uptr buf 8)]
+            (let* ([pathc (foreign-ref 'uptr buf GLOB-GL-PATHC)]
+                   [pathv (foreign-ref 'uptr buf GLOB-GL-PATHV)]
                    [results (let loop ([i 0] [acc '()])
                               (if (= i pathc) (reverse acc)
-                                  (let ([ptr (foreign-ref 'uptr pathv (* i 8))])
+                                  (let ([ptr (foreign-ref 'uptr pathv (* i (foreign-sizeof 'void*)))])
                                     (loop (+ i 1) (cons (ptr->string ptr) acc)))))])
               (c-globfree buf)
               (foreign-free buf)
@@ -240,12 +224,22 @@
   ;; uname -- system identification
   ;; ======================================================================
 
-  ;; struct utsname: 5 fields of 65 bytes each (SYS_NMLN=65 on Linux).
+  ;; struct utsname: 5 fields of SYS_NMLN bytes each (65 on Linux, 256 on macOS/FreeBSD).
   ;; Linux also has domainname (6th field), but we only need the first 5.
-  (define UTSNAME_FIELD_LEN 65)
-  (define UTSNAME_SIZE (* 6 UTSNAME_FIELD_LEN))  ;; 390 bytes (includes domainname)
+  ;;
+  ;; FreeBSD quirk: libc's uname() symbol uses the kernel ABI (SYS_NMLN=32),
+  ;; not the userland value (256).  The inline uname() in <sys/utsname.h>
+  ;; calls __xuname(SYS_NMLN, buf) with the correct size.  We must do the same.
+  (define UTSNAME_FIELD_LEN PLAT-UTSNAME-FIELD-LEN)
+  (define UTSNAME_SIZE (* 6 UTSNAME_FIELD_LEN))
 
-  (define c-uname (foreign-procedure "uname" (u8*) int))
+  (define c-uname
+    (case (machine-type)
+      [(ta6fb tarm64fb ti3fb a6fb arm64fb i3fb)
+       ;; FreeBSD: call __xuname(field_len, buf)
+       (let ([xuname (foreign-procedure "__xuname" (int u8*) int)])
+         (lambda (buf) (xuname UTSNAME_FIELD_LEN buf)))]
+      [else (foreign-procedure "uname" (u8*) int)]))
 
   ;; posix-uname: returns 5 values (sysname nodename release version machine).
   (define (posix-uname)

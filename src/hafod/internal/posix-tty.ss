@@ -1,5 +1,4 @@
 ;;; (hafod internal posix-tty) -- TTY/termios operations and constants
-;;; Extracted from posix.ss during Phase 26 splitting.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal posix-tty)
@@ -12,41 +11,30 @@
     posix-tcsendbreak posix-tcdrain posix-tcflush posix-tcflow
     posix-tcsetpgrp posix-tcgetpgrp)
 
-  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants) (hafod internal posix-core))
-
-  (define load-libc (load-shared-object "libc.so.6"))
+  (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
+          (hafod internal platform-constants) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; TTY / termios
   ;; ======================================================================
 
   ;; termios action constants
-  (define TCSANOW   0)
-  (define TCSADRAIN 1)
-  (define TCSAFLUSH 2)
+  (define TCSANOW   PLAT-TCSANOW)
+  (define TCSADRAIN PLAT-TCSADRAIN)
+  (define TCSAFLUSH PLAT-TCSAFLUSH)
 
   ;; tcflush queue selectors
-  (define TCIFLUSH  0)
-  (define TCOFLUSH  1)
-  (define TCIOFLUSH 2)
+  (define TCIFLUSH  PLAT-TCIFLUSH)
+  (define TCOFLUSH  PLAT-TCOFLUSH)
+  (define TCIOFLUSH PLAT-TCIOFLUSH)
 
   ;; tcflow action constants
-  (define TCOOFF 0)
-  (define TCOON  1)
-  (define TCIOFF 2)
-  (define TCION  3)
+  (define TCOOFF PLAT-TCOOFF)
+  (define TCOON  PLAT-TCOON)
+  (define TCIOFF PLAT-TCIOFF)
+  (define TCION  PLAT-TCION)
 
-  ;; struct termios layout on Linux x86_64:
-  ;;   c_iflag:  u32 at offset 0
-  ;;   c_oflag:  u32 at offset 4
-  ;;   c_cflag:  u32 at offset 8
-  ;;   c_lflag:  u32 at offset 12
-  ;;   c_line:   u8  at offset 16
-  ;;   c_cc[32]: 32 bytes at offset 17
-  ;;   c_ispeed: u32 at offset 52
-  ;;   c_ospeed: u32 at offset 56
-  ;;   total: 60 bytes
-  (define *termios-size* 60)
+  (define *termios-size* SIZEOF-TERMIOS)
 
   (define c-tcgetattr  (foreign-procedure "tcgetattr"  (int u8*) int))
   (define c-tcsetattr  (foreign-procedure "tcsetattr"  (int int u8*) int))
@@ -65,27 +53,27 @@
   (define (posix-tcgetattr fd)
     (let ([buf (make-bytevector *termios-size* 0)])
       (posix-call tcgetattr (c-tcgetattr fd buf))
-      (let ([iflag  (bytevector-u32-native-ref buf 0)]
-            [oflag  (bytevector-u32-native-ref buf 4)]
-            [cflag  (bytevector-u32-native-ref buf 8)]
-            [lflag  (bytevector-u32-native-ref buf 12)]
-            [cc     (let ([v (make-bytevector 32)])
-                      (bytevector-copy! buf 17 v 0 32)
+      (let ([iflag  (bytevector-u32-native-ref buf TERMIOS-C-IFLAG)]
+            [oflag  (bytevector-u32-native-ref buf TERMIOS-C-OFLAG)]
+            [cflag  (bytevector-u32-native-ref buf TERMIOS-C-CFLAG)]
+            [lflag  (bytevector-u32-native-ref buf TERMIOS-C-LFLAG)]
+            [cc     (let ([v (make-bytevector PLAT-NCCS)])
+                      (bytevector-copy! buf TERMIOS-C-CC v 0 PLAT-NCCS)
                       v)]
-            [ispeed (bytevector-u32-native-ref buf 52)]
-            [ospeed (bytevector-u32-native-ref buf 56)])
+            [ispeed (bytevector-u32-native-ref buf TERMIOS-C-ISPEED)]
+            [ospeed (bytevector-u32-native-ref buf TERMIOS-C-OSPEED)])
         (values iflag oflag cflag lflag cc ispeed ospeed))))
 
   ;; posix-tcsetattr: apply terminal attributes.
   (define (posix-tcsetattr fd option iflag oflag cflag lflag cc ispeed ospeed)
     (let ([buf (make-bytevector *termios-size* 0)])
-      (bytevector-u32-native-set! buf 0 iflag)
-      (bytevector-u32-native-set! buf 4 oflag)
-      (bytevector-u32-native-set! buf 8 cflag)
-      (bytevector-u32-native-set! buf 12 lflag)
-      (bytevector-copy! cc 0 buf 17 (fxmin (bytevector-length cc) 32))
-      (bytevector-u32-native-set! buf 52 ispeed)
-      (bytevector-u32-native-set! buf 56 ospeed)
+      (bytevector-u32-native-set! buf TERMIOS-C-IFLAG iflag)
+      (bytevector-u32-native-set! buf TERMIOS-C-OFLAG oflag)
+      (bytevector-u32-native-set! buf TERMIOS-C-CFLAG cflag)
+      (bytevector-u32-native-set! buf TERMIOS-C-LFLAG lflag)
+      (bytevector-copy! cc 0 buf TERMIOS-C-CC (fxmin (bytevector-length cc) PLAT-NCCS))
+      (bytevector-u32-native-set! buf TERMIOS-C-ISPEED ispeed)
+      (bytevector-u32-native-set! buf TERMIOS-C-OSPEED ospeed)
       (posix-call tcsetattr (c-tcsetattr fd option buf))))
 
   ;; posix-isatty: test if fd is a terminal.

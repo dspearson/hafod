@@ -244,6 +244,121 @@ out=$("$HAFOD" -s "$TMPDIR/bangbang-midline.ss" 2>&1)
 assert_eq "!# mid-line does not end header" "midline-ok" "$out"
 
 # ======================================================================
+section "Header-arg parsing (env-compatible shebang)"
+# ======================================================================
+
+# Bare filename with -e in header
+cat > "$TMPDIR/hdr-entry.ss" << 'EOF'
+#!/usr/bin/env hafod
+-e main -s
+!#
+(define (main args) (display "hdr-entry-ok"))
+EOF
+out=$("$HAFOD" "$TMPDIR/hdr-entry.ss" 2>&1)
+assert_eq "header -e sets entry point" "hdr-entry-ok" "$out"
+
+# Bare filename with -e in header, passing args
+cat > "$TMPDIR/hdr-entry-args.ss" << 'EOF'
+#!/usr/bin/env hafod
+-e main -s
+!#
+(define (main args)
+  (for-each (lambda (a) (display a) (display " ")) args))
+EOF
+out=$("$HAFOD" "$TMPDIR/hdr-entry-args.ss" x y z 2>&1)
+assert_eq "header -e passes args" "x y z " "$out"
+
+# Bare filename with -l in header
+cat > "$TMPDIR/hdr-prelude.ss" << 'EOF'
+(define hdr-preloaded 99)
+EOF
+
+cat > "$TMPDIR/hdr-use-prelude.ss" << 'EOF'
+#!/usr/bin/env hafod
+-l PRELUDE -s
+!#
+(display hdr-preloaded)
+EOF
+# Substitute the actual path (can't use variable in heredoc)
+sed "s|PRELUDE|$TMPDIR/hdr-prelude.ss|" "$TMPDIR/hdr-use-prelude.ss" > "$TMPDIR/hdr-use-prelude.ss.tmp" && mv "$TMPDIR/hdr-use-prelude.ss.tmp" "$TMPDIR/hdr-use-prelude.ss"
+out=$("$HAFOD" "$TMPDIR/hdr-use-prelude.ss" 2>&1)
+assert_eq "header -l preloads file" "99" "$out"
+
+# Command-line -e overrides header -e
+cat > "$TMPDIR/hdr-override.ss" << 'EOF'
+#!/usr/bin/env hafod
+-e header-entry -s
+!#
+(define (header-entry args) (display "header"))
+(define (cli-entry args) (display "cli"))
+EOF
+out=$("$HAFOD" -e cli-entry "$TMPDIR/hdr-override.ss" 2>&1)
+assert_eq "CLI -e overrides header -e" "cli" "$out"
+
+# Header with -s only (no -e) — just runs the script body
+cat > "$TMPDIR/hdr-s-only.ss" << 'EOF'
+#!/usr/bin/env hafod
+-s
+!#
+(display "s-only-ok")
+EOF
+out=$("$HAFOD" "$TMPDIR/hdr-s-only.ss" 2>&1)
+assert_eq "header with -s only" "s-only-ok" "$out"
+
+# No header — bare file still works
+out=$("$HAFOD" "$TMPDIR/no-header.ss" 2>&1)
+assert_eq "bare filename without header" "no-header-ok" "$out"
+
+# ======================================================================
+section "Actual shebang execution"
+# ======================================================================
+
+# Only run if hafod is on PATH (or we can symlink it)
+HAFOD_BIN_DIR=$(dirname "$HAFOD")
+if command -v "$HAFOD" >/dev/null 2>&1 || [ -x "$HAFOD" ]; then
+    # Create a temp bin dir with hafod on PATH
+    mkdir -p "$TMPDIR/bin"
+    ln -sf "$HAFOD" "$TMPDIR/bin/hafod"
+    ORIG_PATH="$PATH"
+    export PATH="$TMPDIR/bin:$PATH"
+
+    # Simple shebang script
+    cat > "$TMPDIR/shebang-exec.ss" << 'SCRIPT'
+#!/usr/bin/env hafod
+!#
+(display "shebang-exec-ok")
+SCRIPT
+    chmod +x "$TMPDIR/shebang-exec.ss"
+    out=$("$TMPDIR/shebang-exec.ss" 2>&1)
+    assert_eq "shebang execution works" "shebang-exec-ok" "$out"
+
+    # Shebang with -e entry in header
+    cat > "$TMPDIR/shebang-entry-exec.ss" << 'SCRIPT'
+#!/usr/bin/env hafod
+-e main -s
+!#
+(define (main args) (display "shebang-entry-exec-ok"))
+SCRIPT
+    chmod +x "$TMPDIR/shebang-entry-exec.ss"
+    out=$("$TMPDIR/shebang-entry-exec.ss" 2>&1)
+    assert_eq "shebang with -e entry works" "shebang-entry-exec-ok" "$out"
+
+    # Shebang with args
+    cat > "$TMPDIR/shebang-args-exec.ss" << 'SCRIPT'
+#!/usr/bin/env hafod
+-e main -s
+!#
+(define (main args)
+  (for-each (lambda (a) (display a) (display " ")) args))
+SCRIPT
+    chmod +x "$TMPDIR/shebang-args-exec.ss"
+    out=$("$TMPDIR/shebang-args-exec.ss" hello world 2>&1)
+    assert_eq "shebang passes args to entry" "hello world " "$out"
+
+    export PATH="$ORIG_PATH"
+fi
+
+# ======================================================================
 section "Meta-argument processing"
 # ======================================================================
 
@@ -308,6 +423,18 @@ assert_contains "-- starts REPL" "repl-ok" "$out"
 # -- with remaining args
 out=$(echo '(display (command-line-arguments))' | "$HAFOD" -- foo bar 2>&1)
 assert_contains "-- passes remaining args" "(foo bar)" "$out"
+
+# -- REPL has last-status (interactive-repl feature, not available in new-cafe)
+out=$(echo '(last-status)' | "$HAFOD" -- 2>&1)
+assert_contains "-- REPL has last-status" "0" "$out"
+
+# no-args REPL has last-status
+out=$(echo '(last-status)' | "$HAFOD" 2>&1)
+assert_contains "no-args REPL has last-status" "0" "$out"
+
+# -c mode unaffected (regression guard)
+out=$("$HAFOD" -c '(display 42)' 2>&1)
+assert_eq "-c mode unaffected" "42" "$out"
 
 # ======================================================================
 section "Quasiquote in process forms (scsh compat)"
@@ -521,6 +648,143 @@ assert_eq "-l preloads before -e -s" "42" "$out"
 # --help mentions -l
 out=$("$HAFOD" --help 2>&1)
 assert_contains "--help mentions -l" "-l FILE" "$out"
+
+# ======================================================================
+section "RC file loading"
+# ======================================================================
+
+# Set HOME to a temp directory for RC tests
+RC_HOME="$TMPDIR/rc-home"
+mkdir -p "$RC_HOME"
+
+# ~/.hafodrc is loaded in interactive mode
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-loaded* #t)
+EOF
+
+out=$(echo '(display *rc-loaded*)' | HOME="$RC_HOME" "$HAFOD" 2>&1)
+assert_contains ".hafodrc loaded in interactive mode" "#t" "$out"
+
+# ~/.hafodrc side effects are visible
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-marker* "hello-from-rc")
+EOF
+
+out=$(echo '(display *rc-marker*)' | HOME="$RC_HOME" "$HAFOD" 2>&1)
+assert_contains ".hafodrc definitions available in REPL" "hello-from-rc" "$out"
+
+# --norc skips RC loading
+out=$(echo '(display (top-level-bound? (quote *rc-marker*)))' | HOME="$RC_HOME" "$HAFOD" --norc 2>&1)
+assert_contains "--norc skips .hafodrc" "#f" "$out"
+
+# ~/.hafod_profile loaded only for login shells
+cat > "$RC_HOME/.hafod_profile" << 'EOF'
+(define *profile-loaded* #t)
+EOF
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-loaded* #t)
+EOF
+
+# Non-login: profile NOT loaded, rc IS loaded
+out=$(echo '(display (top-level-bound? (quote *profile-loaded*)))' | HOME="$RC_HOME" "$HAFOD" 2>&1)
+assert_contains ".hafod_profile NOT loaded for non-login shell" "#f" "$out"
+
+# --login: both profile and rc loaded
+out=$(echo '(display *profile-loaded*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
+assert_contains ".hafod_profile loaded with --login" "#t" "$out"
+
+out=$(echo '(display *rc-loaded*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
+assert_contains ".hafodrc also loaded with --login" "#t" "$out"
+
+# Profile loads before rc (profile can set values rc uses)
+cat > "$RC_HOME/.hafod_profile" << 'EOF'
+(define *load-order* '(profile))
+EOF
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(set! *load-order* (append *load-order* '(rc)))
+EOF
+
+out=$(echo '(display *load-order*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
+assert_contains "profile loads before rc" "(profile rc)" "$out"
+
+# RC error does not prevent REPL startup
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(error 'test "intentional rc error")
+EOF
+
+out=$(echo '(display "repl-ok")' | HOME="$RC_HOME" "$HAFOD" 2>&1)
+assert_contains "RC error does not prevent REPL" "repl-ok" "$out"
+
+# Missing RC file is silently skipped (no error)
+rm -f "$RC_HOME/.hafodrc" "$RC_HOME/.hafod_profile"
+out=$(echo '(display "works")' | HOME="$RC_HOME" "$HAFOD" 2>&1)
+assert_contains "missing RC files silently skipped" "works" "$out"
+
+# RC not loaded for -c mode
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-loaded* #t)
+EOF
+
+out=$(HOME="$RC_HOME" "$HAFOD" -c '(display (top-level-bound? (quote *rc-loaded*)))' 2>&1)
+assert_eq "RC not loaded for -c mode" "#f" "$out"
+
+# RC not loaded for -s mode
+cat > "$TMPDIR/rc-script-test.ss" << 'EOF'
+(display (top-level-bound? (quote *rc-loaded*)))
+EOF
+
+out=$(HOME="$RC_HOME" "$HAFOD" -s "$TMPDIR/rc-script-test.ss" 2>&1)
+assert_eq "RC not loaded for -s mode" "#f" "$out"
+
+# --norc with --login skips everything
+cat > "$RC_HOME/.hafod_profile" << 'EOF'
+(define *profile-loaded* #t)
+EOF
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-loaded* #t)
+EOF
+
+out=$(echo '(display (top-level-bound? (quote *profile-loaded*)))' | HOME="$RC_HOME" "$HAFOD" --login --norc 2>&1)
+assert_contains "--norc --login skips profile" "#f" "$out"
+
+# -- terminator also loads RC
+rm -f "$RC_HOME/.hafod_profile"
+cat > "$RC_HOME/.hafodrc" << 'EOF'
+(define *rc-via-dash-dash* #t)
+EOF
+
+out=$(echo '(display *rc-via-dash-dash*)' | HOME="$RC_HOME" "$HAFOD" -- 2>&1)
+assert_contains "-- terminator loads RC" "#t" "$out"
+
+# --help mentions --login and --norc
+out=$("$HAFOD" --help 2>&1)
+assert_contains "--help mentions --login" "--login" "$out"
+assert_contains "--help mentions --norc" "--norc" "$out"
+assert_contains "--help mentions .hafodrc" ".hafodrc" "$out"
+
+# Clean up RC test directory
+rm -rf "$RC_HOME"
+
+# ======================================================================
+section "INTG-02: Piped input fallback (no raw mode)"
+# ======================================================================
+
+# Piped input uses bare read, produces correct output
+out=$(echo '(display (+ 1 2))' | "$HAFOD" 2>/dev/null)
+assert_contains "piped input produces correct output" "3" "$out"
+
+# Piped eval with pretty-printed output
+out=$(echo '(+ 40 2)' | "$HAFOD" 2>/dev/null)
+assert_contains "piped eval output" "42" "$out"
+
+# Multiple piped expressions -- each display produces output interspersed with prompts
+out=$(printf '(display 1)\n(display 2)\n' | "$HAFOD" 2>/dev/null)
+# Verify both values appear in the output (prompts may appear between them)
+echo "$out" | grep -q "1" && echo "$out" | grep -q "2" && pass "multiple piped expressions" || fail "multiple piped expressions"
+
+# Piped input with define + reference
+out=$(printf '(define x 99)\n(display x)\n' | "$HAFOD" 2>/dev/null)
+assert_contains "piped define and reference" "99" "$out"
 
 # ======================================================================
 # Summary

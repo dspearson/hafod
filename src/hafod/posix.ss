@@ -19,7 +19,11 @@
     wait/poll wait/stopped-children
 
     ;; POSIX constants -- open flags
-    O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK
+    O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK O_NOCTTY
+
+    ;; ioctl constants
+    TIOCSCTTY
+    TIOCGWINSZ
 
     ;; Signal constants
     SIGHUP SIGINT SIGQUIT SIGILL SIGTRAP SIGABRT SIGBUS SIGFPE SIGKILL

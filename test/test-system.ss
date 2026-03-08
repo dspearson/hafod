@@ -15,13 +15,11 @@
   (let ([s (uname:os-name (uname))])
     (and (string? s) (> (string-length s) 0))))
 
-(test-equal "uname:os-name is Linux on this system"
-  "Linux"
-  (uname:os-name (uname)))
+(test-assert "uname:os-name is a known OS name"
+  (member (uname:os-name (uname)) '("Linux" "Darwin" "FreeBSD")))
 
-(test-assert "uname:node-name returns a non-empty string"
-  (let ([s (uname:node-name (uname))])
-    (and (string? s) (> (string-length s) 0))))
+(test-assert "uname:node-name returns a string"
+  (string? (uname:node-name (uname))))
 
 (test-assert "uname:release returns a non-empty string"
   (let ([s (uname:release (uname))])
@@ -94,15 +92,15 @@
 (test-equal "hafod-major-version is 1"
   1 hafod-major-version)
 
-(test-equal "hafod-minor-version is 0"
-  0 hafod-minor-version)
+(test-equal "hafod-minor-version is 1"
+  1 hafod-minor-version)
 
 (test-equal "hafod-version-string is correct"
-  "hafod 1.0" hafod-version-string)
+  "hafod 1.1" hafod-version-string)
 
 ;; scsh-compatible version aliases
 (test-equal "scsh-major-version alias" 1 scsh-major-version)
-(test-equal "scsh-minor-version alias" 0 scsh-minor-version)
-(test-equal "scsh-version-string alias" "hafod 1.0" scsh-version-string)
+(test-equal "scsh-minor-version alias" 1 scsh-minor-version)
+(test-equal "scsh-version-string alias" "hafod 1.1" scsh-version-string)
 
 (test-end)

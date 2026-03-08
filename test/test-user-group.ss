@@ -23,17 +23,19 @@
 ;; user-info nonexistent
 (test-error "user-info nonexistent" (user-info "hafod_no_such_user_99999"))
 
-;; group-info by name
-(test-assert "group-info root by name"
-  (let ([gi (group-info "root")])
+;; group-info by name -- GID 0 is "root" on Linux, "wheel" on macOS
+(define gid0-name (group-info-name (group-info 0)))
+
+(test-assert "group-info gid0 by name"
+  (let ([gi (group-info gid0-name)])
     (and (group-info? gi)
          (= 0 (group-info-gid gi)))))
 
 ;; group-info by gid
-(test-assert "group-info root by gid"
+(test-assert "group-info gid0 by gid"
   (let ([gi (group-info 0)])
     (and (group-info? gi)
-         (string=? "root" (group-info-name gi)))))
+         (string=? gid0-name (group-info-name gi)))))
 
 ;; group-info bad type
 (test-error "group-info bad type" (group-info 3.14))
@@ -50,12 +52,12 @@
 (test-equal "->username root" "root" (->username "root"))
 
 ;; ->gid
-(test-equal "->gid root" 0 (->gid "root"))
+(test-equal "->gid gid0-name" 0 (->gid gid0-name))
 (test-equal "->gid 0" 0 (->gid 0))
 
 ;; ->groupname
-(test-equal "->groupname 0" "root" (->groupname 0))
-(test-equal "->groupname root" "root" (->groupname "root"))
+(test-equal "->groupname 0" gid0-name (->groupname 0))
+(test-equal "->groupname roundtrip" gid0-name (->groupname gid0-name))
 
 ;; home-directory
 (test-assert "home-directory returns non-empty string"

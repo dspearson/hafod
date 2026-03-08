@@ -9,29 +9,69 @@
 ;;;   hafod                           Start interactive REPL
 ;;;   hafod --help                    Show usage
 ;;;
-;;; Shebang usage (meta-arg style):
+;;; Shebang usage:
+;;;   #!/usr/bin/env hafod
+;;;   !#
+;;;   (display "Hello\n")
+;;;
+;;;   #!/usr/bin/env hafod
+;;;   -e main -s
+;;;   !#
+;;;   (define (main args) (display "Hello\n"))
+;;;
+;;; Meta-arg style (hardcoded path, scsh-compatible):
 ;;;   #!/usr/local/bin/hafod \
 ;;;   -e main -s
 ;;;   !#
 ;;;   (define (main args) (display "Hello\n"))
 ;;;
-;;; Single-line shebang:
-;;;   #!/usr/bin/env hafod
-;;;   !#
-;;;   (display "Hello\n")
-;;;
 ;;; Copyright (c) 1995 Olin Shivers. R6RS adaptation (c) 2026 Dominic Pearson.
 
-(import (except (chezscheme) exit vector-append open-input-file open-output-file getenv command-line-arguments)
-        (only (rename (chezscheme) (command-line-arguments chez:command-line-arguments))
-              chez:command-line-arguments)
-        (hafod))
+;; Import (hafod) at compile time so compile-whole-program can merge all
+;; library code into bin/hafod.so, eliminating per-file library loading.
+;; The 57 symbols that conflict between (chezscheme) and (hafod) are excluded
+;; from (chezscheme); (hafod) provides its own versions of those.
+(import
+  (except (chezscheme)
+    ;; 57 symbols that conflict with (hafod) -- exclude from (chezscheme)
+    bitwise-and bitwise-ior bitwise-not bitwise-xor
+    call-with-input-file call-with-output-file call-with-string-output-port
+    char->integer char-alphabetic? char-lower-case? char-numeric? char-ready?
+    char-upper-case? char-whitespace? command-line command-line-arguments
+    current-error-port date? delete-directory delete-file display error exit
+    file-directory? file-exists? file-options file-regular? format getenv
+    input-port? integer->char list->string make-date newline number->string
+    open-input-file open-output-file output-port? read-char record-reader
+    rename-file string->list string->number string-append string-copy
+    string-downcase string-upcase substring thread-join thread? time
+    truncate-file vector-append with-input-from-file with-output-to-file
+    write write-char)
+  ;; Import Chez's command-line/command-line-arguments under prefixed names
+  ;; so we can set them as parameters (hafod's versions are read-only).
+  (only (rename (chezscheme)
+                (command-line chez:command-line)
+                (command-line-arguments chez:command-line-arguments))
+    chez:command-line chez:command-line-arguments)
+  (hafod))
 
-;; Set both hafod's command-line box AND Chez's parameter so that
-;; eval in the interaction-environment and new-cafe see correct args.
+;; port->string is now provided by (hafod) via (hafod port-collect).
+
+;; Import (hafod) into the interaction-environment so user scripts, -c exprs,
+;; and the REPL can use hafod symbols.  This is the main startup cost (~22ms).
+;; Guarded: only imports once, subsequent calls are no-ops.
+(define %hafod-imported? #f)
+(define (ensure-hafod-interaction-environment!)
+  (unless %hafod-imported?
+    (eval '(import (hafod)) (interaction-environment))
+    (set! %hafod-imported? #t)))
+
+;; Set both the Chez command-line parameters AND the hafod command-line state.
+;; chez:command-line / chez:command-line-arguments are the Chez parameters
+;; (renamed to avoid conflict); set-command-line-args! sets hafod's internal state.
 (define (set-command-line! args)
-  (set-command-line-args! args)
-  (chez:command-line-arguments (if (pair? args) (cdr args) '())))
+  (chez:command-line args)
+  (chez:command-line-arguments (if (pair? args) (cdr args) '()))
+  (set-command-line-args! args))
 
 ;; ======================================================================
 ;; Meta-argument processing
@@ -114,7 +154,7 @@
         args)))
 
 ;; ======================================================================
-;; Source preprocessor: | → pipe, |+ → pipe+
+;; Source preprocessor: | -> pipe, |+ -> pipe+
 ;; Transforms lone | and |+ symbols before the Chez reader sees them.
 ;; This is needed because Chez Scheme's reader treats | as a symbol
 ;; escape character, making (| (ls) (grep "foo")) unparseable.
@@ -135,7 +175,7 @@
           (list->string (reverse out))
           (let ([c (string-ref src i)])
             (cond
-              ;; String literal — skip to closing "
+              ;; String literal -- skip to closing "
               [(char=? c #\")
                (let sloop ([j (+ i 1)] [acc (cons c out)])
                  (cond
@@ -149,7 +189,7 @@
                     (loop (+ j 1) (cons #\" acc))]
                    [else
                     (sloop (+ j 1) (cons (string-ref src j) acc))]))]
-              ;; Line comment — skip to newline
+              ;; Line comment -- skip to newline
               [(char=? c #\;)
                (let cloop ([j i] [acc out])
                  (if (or (>= j len) (char=? (string-ref src j) #\newline))
@@ -180,24 +220,24 @@
                     (char=? (string-ref src (+ i 1)) #\\)
                     (char=? (string-ref src (+ i 2)) #\|))
                (loop (+ i 3) (cons #\| (cons #\\ (cons #\# out))))]
-              ;; Symbol escape |...| — pass through unchanged
+              ;; Symbol escape |...| -- pass through unchanged
               [(char=? c #\|)
                (let ([next (if (< (+ i 1) len) (string-ref src (+ i 1)) #\space)])
                  (cond
-                   ;; || — empty symbol (scsh's OR combinator) — pass through
+                   ;; || -- empty symbol (scsh's OR combinator) -- pass through
                    [(char=? next #\|)
                     (loop (+ i 2) (cons #\| (cons #\| out)))]
-                   ;; |+ followed by delimiter → pipe+
+                   ;; |+ followed by delimiter -> pipe+
                    [(and (char=? next #\+)
                          (let ([after (if (< (+ i 2) len) (string-ref src (+ i 2)) #\space)])
                            (delimiter? after)))
                     (loop (+ i 2)
                           (append (reverse (string->list "pipe+")) out))]
-                   ;; | followed by delimiter → pipe
+                   ;; | followed by delimiter -> pipe
                    [(delimiter? next)
                     (loop (+ i 1)
                           (append (reverse (string->list "pipe")) out))]
-                   ;; |symbol| escape sequence — pass through to closing |
+                   ;; |symbol| escape sequence -- pass through to closing |
                    [else
                     (let eloop ([j (+ i 1)] [acc (cons c out)])
                       (cond
@@ -206,7 +246,7 @@
                          (loop (+ j 1) (cons #\| acc))]
                         [else
                          (eloop (+ j 1) (cons (string-ref src j) acc))]))]))]
-              ;; Everything else — pass through
+              ;; Everything else -- pass through
               [else
                (loop (+ i 1) (cons c out))]))))))
 
@@ -225,24 +265,84 @@
         (let ([line (get-line port)])
           (cond
             [(eof-object? line)
-             ;; No !# found — return empty string (degenerate case)
+             ;; No !# found -- return empty string (degenerate case)
              ""]
             [(and (>= (string-length line) 2)
                   (char=? (string-ref line 0) #\!)
                   (char=? (string-ref line 1) #\#))
-             ;; Found !# — rest of port is the script body
+             ;; Found !# -- rest of port is the script body
              (port->string port)]
             [else (skip)]))))))
 
+;; ======================================================================
+;; Header argument extraction
+;; ======================================================================
+
+;; Extract meta-arguments from a script's #!...!# header.
+;; Reads lines between the shebang line and the !# terminator, parsing
+;; each line using the scsh secondary-arg reader (with backslash escapes).
+;; Returns a flat list of argument strings, or '() if no header.
+(define (extract-script-header-args fname)
+  (call-with-input-file fname
+    (lambda (port)
+      ;; N.B. let* is essential: Chez evaluates let init-exprs right-to-left,
+      ;; so (let ([c1 (read-char p)] [c2 (read-char p)]) ...) reads c2 first.
+      (let* ([c1 (read-char port)]
+             [c2 (read-char port)])
+        (if (and (eqv? c1 #\#) (eqv? c2 #\!))
+            (begin
+              ;; Skip rest of line 1 (the shebang line)
+              (let skip ()
+                (let ([c (read-char port)])
+                  (unless (or (eof-object? c) (char=? c #\newline))
+                    (skip))))
+              ;; Read arg lines until !# or EOF
+              (let loop ([all-args '()])
+                (let ([line (get-line port)])
+                  (cond
+                    [(eof-object? line) (reverse all-args)]
+                    [(and (>= (string-length line) 2)
+                          (char=? (string-ref line 0) #\!)
+                          (char=? (string-ref line 1) #\#))
+                     (reverse all-args)]
+                    [else
+                     (let* ([args (read-secondary-args
+                                   (open-input-string line))]
+                            [non-empty (filter
+                                         (lambda (s) (> (string-length s) 0))
+                                         args)])
+                       (loop (append (reverse non-empty) all-args)))]))))
+            '())))))
+
+;; Parse header flags: extract -e and -l from a header arg list.
+;; -s is accepted and ignored (implicit for bare filename invocation).
+;; Returns (values entry-symbol-or-#f preload-list).
+(define (parse-header-flags args)
+  (let loop ([args args] [entry #f] [preloads '()])
+    (if (null? args)
+        (values entry (reverse preloads))
+        (let ([arg (car args)] [rest (cdr args)])
+          (cond
+            [(string=? arg "-s") (loop rest entry preloads)]
+            [(string=? arg "-e")
+             (if (null? rest)
+                 (values entry (reverse preloads))
+                 (loop (cdr rest) (string->symbol (car rest)) preloads))]
+            [(string=? arg "-l")
+             (if (null? rest)
+                 (values entry (reverse preloads))
+                 (loop (cdr rest) entry (cons (car rest) preloads)))]
+            [else (loop rest entry preloads)])))))
+
 ;; Load a script file, stripping !# header if present.
 ;; Auto-imports (hafod) into the interaction environment before eval.
-;; Preprocesses | → pipe for scsh compatibility.
+;; Preprocesses | -> pipe for scsh compatibility.
 (define (load-script-file fname)
   (unless (file-exists? fname)
     (display (string-append "hafod: " fname ": No such file\n") (current-error-port))
-    (%exit 1))
+    (exit 1))
   ;; Ensure (hafod) is available in the interaction environment
-  (eval '(import (hafod)) (interaction-environment))
+  (ensure-hafod-interaction-environment!)
   (let ([has-header?
           (call-with-input-file fname
             (lambda (port)
@@ -274,6 +374,8 @@
       "Switches:\n"
       "  -e PROC    After loading script, call (PROC args) as entry point\n"
       "  -l FILE    Load FILE before executing main action (repeatable)\n"
+      "  --login    Start as a login shell (loads ~/.hafod_profile)\n"
+      "  --norc     Skip loading RC files (~/.hafodrc, ~/.hafod_profile)\n"
       "\n"
       "Terminators (at most one):\n"
       "  -s FILE    Load and run FILE as a hafod/scsh script\n"
@@ -285,6 +387,13 @@
       "\n"
       "With no arguments, starts an interactive REPL with (hafod) imported.\n"
       "\n"
+      "Startup files (interactive mode only):\n"
+      "  ~/.hafod_profile  Loaded for login shells (before ~/.hafodrc)\n"
+      "  ~/.hafodrc        Loaded for all interactive shells\n"
+      "\n"
+      "Login shell detection: automatic when argv[0] starts with \"-\"\n"
+      "(e.g., when set as login shell in /etc/passwd), or via --login.\n"
+      "\n"
       "Shebang (meta-arg) usage:\n"
       "  #!/path/to/hafod \\\n"
       "  -e main -s\n"
@@ -292,7 +401,31 @@
       "  (define (main args) ...)\n")))
 
 (define (show-version)
-  (display "hafod 1.0 (scsh on Chez Scheme)\n"))
+  (display "hafod 1.1 (scsh on Chez Scheme)\n"))
+
+;; ======================================================================
+;; RC file loading
+;; ======================================================================
+
+;; Load an RC file if it exists. Silently skips if missing.
+;; Errors during loading are reported but do not prevent REPL startup.
+(define (load-rc-file path)
+  (when (file-exists? path)
+    (guard (exn
+             [#t
+              (display (string-append "hafod: error loading " path ": ") (current-error-port))
+              (display-condition exn (current-error-port))
+              (newline (current-error-port))])
+      (load-script-file path))))
+
+;; Load startup files for an interactive session.
+;; Login shells load ~/.hafod_profile then ~/.hafodrc.
+;; Non-login interactive shells load ~/.hafodrc only.
+(define (load-rc-files login?)
+  (let ([home (home-directory)])
+    (when login?
+      (load-rc-file (string-append (file-name-as-directory home) ".hafod_profile")))
+    (load-rc-file (string-append (file-name-as-directory home) ".hafodrc"))))
 
 ;; ======================================================================
 ;; Argument parsing (scsh-compatible)
@@ -305,37 +438,48 @@
   (let ([args (meta-arg-process-arglist raw-args)])
     (let loop ([args args]
                [entry #f]       ;; -e <entry-point>
-               [preloads '()])  ;; -l files (in reverse order)
+               [preloads '()]   ;; -l files (in reverse order)
+               [login? #f]      ;; --login flag
+               [norc? #f])      ;; --norc flag
       (if (null? args)
-          ;; No terminator — interactive REPL
+          ;; No terminator -- interactive REPL
           (begin
             (set-command-line! '("hafod"))
             (load-preload-files preloads)
-            (eval '(import (hafod)) (interaction-environment))
-            (new-cafe))
+            (ensure-hafod-interaction-environment!)
+            (unless norc? (load-rc-files login?))
+            (interactive-repl))
 
           (let ([arg (car args)]
                 [rest (cdr args)])
             (cond
-              ;; -l FILE — preload a file (non-terminating, accumulates)
+              ;; -l FILE -- preload a file (non-terminating, accumulates)
               [(string=? arg "-l")
                (when (null? rest)
                  (display "hafod: -l requires a filename\n" (current-error-port))
-                 (%exit 1))
-               (loop (cdr rest) entry (cons (car rest) preloads))]
+                 (exit 1))
+               (loop (cdr rest) entry (cons (car rest) preloads) login? norc?)]
 
-              ;; -e ENTRY — set entry point
+              ;; -e ENTRY -- set entry point
               [(string=? arg "-e")
                (when (null? rest)
                  (display "hafod: -e requires a procedure name\n" (current-error-port))
-                 (%exit 1))
-               (loop (cdr rest) (string->symbol (car rest)) preloads)]
+                 (exit 1))
+               (loop (cdr rest) (string->symbol (car rest)) preloads login? norc?)]
 
-              ;; -s FILE — script mode (terminating)
+              ;; --login -- mark as login shell
+              [(string=? arg "--login")
+               (loop rest entry preloads #t norc?)]
+
+              ;; --norc -- skip RC file loading
+              [(string=? arg "--norc")
+               (loop rest entry preloads login? #t)]
+
+              ;; -s FILE -- script mode (terminating)
               [(string=? arg "-s")
                (when (null? rest)
                  (display "hafod: -s requires a filename\n" (current-error-port))
-                 (%exit 1))
+                 (exit 1))
                (let ([script (car rest)]
                      [script-args (cdr rest)])
                  (set-command-line! (cons script script-args))
@@ -345,25 +489,27 @@
                    (let ([proc (eval entry (interaction-environment))])
                      (proc script-args))))]
 
-              ;; -c EXPR — expression mode (terminating)
+              ;; -c EXPR -- expression mode (terminating)
               [(string=? arg "-c")
                (when entry
                  (display "hafod: -c cannot be combined with -e\n" (current-error-port))
-                 (%exit 1))
+                 (exit 1))
                (when (null? rest)
                  (display "hafod: -c requires an expression\n" (current-error-port))
-                 (%exit 1))
+                 (exit 1))
                (set-command-line! (cons "hafod" (cdr rest)))
                (load-preload-files preloads)
-               (eval (read (open-input-string (car rest)))
-                     (interaction-environment))]
+               (ensure-hafod-interaction-environment!)
+               (let ([expr (read (open-input-string (car rest)))])
+                 (eval expr (interaction-environment)))]
 
               ;; -- explicit REPL (terminating)
               [(string=? arg "--")
                (set-command-line! (cons "hafod" rest))
                (load-preload-files preloads)
-               (eval '(import (hafod)) (interaction-environment))
-               (new-cafe)]
+               (ensure-hafod-interaction-environment!)
+               (unless norc? (load-rc-files login?))
+               (interactive-repl)]
 
               ;; --help
               [(string=? arg "--help")
@@ -379,19 +525,34 @@
                (display (string-append "hafod: unknown switch: " arg "\n")
                         (current-error-port))
                (show-usage)
-               (%exit 1)]
+               (exit 1)]
 
-              ;; Bare filename — treat as script (like -s)
+              ;; Bare filename -- treat as script (like -s).
+              ;; If the script has a #!...!# header, parse inner lines
+              ;; for -e/-l/-s flags (extends scsh for #!/usr/bin/env usage).
               [else
                (set-command-line! (cons arg rest))
                (load-preload-files preloads)
-               (load-script-file arg)
-               (when entry
-                 (let ([proc (eval entry (interaction-environment))])
-                   (proc rest)))]))))))
+               (let-values ([(hdr-entry hdr-preloads)
+                             (parse-header-flags
+                               (extract-script-header-args arg))])
+                 (for-each load-script-file hdr-preloads)
+                 (load-script-file arg)
+                 (let ([effective-entry (or entry hdr-entry)])
+                   (when effective-entry
+                     (let ([proc (eval effective-entry
+                                      (interaction-environment))])
+                       (proc rest)))))]))))))
 
 ;; ======================================================================
 ;; Main
 ;; ======================================================================
 
-(parse-and-execute (command-line-arguments))
+;; Detect login shell invocation: argv[0] starts with "-" (e.g., "-hafod").
+;; This is the standard Unix convention used by login(1) and getty(8).
+(let ([argv0 (car (chez:command-line))]
+      [args (command-line-arguments)])
+  (if (and (> (string-length argv0) 0)
+           (char=? (string-ref argv0 0) #\-))
+      (parse-and-execute (cons "--login" args))
+      (parse-and-execute args)))

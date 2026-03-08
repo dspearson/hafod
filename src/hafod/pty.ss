@@ -33,9 +33,7 @@
   (define c-unlockpt     (foreign-procedure "unlockpt" (int) int))
   (define c-ptsname      (foreign-procedure "ptsname" (int) void*))
 
-  ;; O_NOCTTY is not exported from (hafod posix), define locally.
-  ;; Linux value: 0x100 (256)
-  (define O_NOCTTY #x100)
+  ;; O_NOCTTY is now exported from (hafod posix) via platform-constants.
 
   ;; ======================================================================
   ;; open-pty -- Allocate a PTY master/slave pair

@@ -40,21 +40,31 @@
   ;; Single-stream collectors
   ;; ======================================================================
 
+  ;; Helper: read from port using f, close port, wait on child, return result.
+  ;; Unlike close-after, this properly reaps the child process to prevent
+  ;; zombie accumulation in *process-table*.
+  (define (collect-and-wait thunk f)
+    (receive (port proc) (run/port+proc* thunk)
+      (let ([result (f port)])
+        (close port)
+        (wait proc)
+        result)))
+
   ;; run/string*: capture child stdout as string
   (define (run/string* thunk)
-    (close-after (run/port* thunk) port->string))
+    (collect-and-wait thunk port->string))
 
   ;; run/strings*: capture child stdout as list of lines
   (define (run/strings* thunk)
-    (close-after (run/port* thunk) port->string-list))
+    (collect-and-wait thunk port->string-list))
 
   ;; run/sexp*: read one S-expression from child stdout
   (define (run/sexp* thunk)
-    (close-after (run/port* thunk) read))
+    (collect-and-wait thunk read))
 
   ;; run/sexps*: read all S-expressions from child stdout
   (define (run/sexps* thunk)
-    (close-after (run/port* thunk) port->sexp-list))
+    (collect-and-wait thunk port->sexp-list))
 
   ;; ======================================================================
   ;; run/file*: run with stdout to temp file, return filename

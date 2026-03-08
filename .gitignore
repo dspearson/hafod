@@ -6,6 +6,22 @@ src/*.so
 src/**/*.wpo
 src/*.wpo
 
+# Compiled launcher
+bin/hafod.so
+bin/hafod.wpo
+bin/hafod-native
+bin/hafod-standalone
+
+# Standalone build intermediates
+tools/*.boot
+tools/*_data.c
+lib/
+
+# Generated binaries/libraries
+tools/gen-platform-constants
+src/hafod-ffi-helpers.so
+src/hafod-ffi-helpers.dylib
+
 # Build artefacts
 a.out
 tmpfile

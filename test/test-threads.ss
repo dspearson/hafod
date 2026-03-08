@@ -294,6 +294,98 @@
                   threads))))
   (test "50 threads all complete" count 50))
 
+;;; ---- Channel close ----
+
+(format #t "~%=== Channel Close ===~%")
+
+;; channel-closed? returns #f on new channel
+(let ([closed #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (set! closed (channel-closed? ch)))))
+  (test "new channel not closed" closed #f))
+
+;; channel-closed? returns #t after close
+(let ([closed #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (channel-close ch)
+        (set! closed (channel-closed? ch)))))
+  (test "closed channel is closed" closed #t))
+
+;; channel-send on closed channel raises error
+(let ([caught #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (channel-close ch)
+        (guard (e [#t (set! caught #t)])
+          (channel-send ch 42)))))
+  (test-true "send on closed raises error" caught))
+
+;; channel-receive on closed-and-empty channel raises error
+(let ([caught #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (channel-close ch)
+        (guard (e [#t (set! caught #t)])
+          (channel-receive ch)))))
+  (test-true "receive on closed+empty raises error" caught))
+
+;; channel-try-send on closed channel returns #f
+(let ([result #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (channel-close ch)
+        (set! result (channel-try-send ch 42)))))
+  (test "try-send on closed returns #f" result #f))
+
+;; channel-try-receive on closed+empty channel returns #f
+(let ([val #f] [ok #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 1)])
+        (channel-close ch)
+        (let-values ([(v o) (channel-try-receive ch)])
+          (set! val v)
+          (set! ok o)))))
+  (test "try-receive on closed val" val #f)
+  (test "try-receive on closed ok" ok #f))
+
+;; Buffered data drains before error
+(let ([v1 #f] [v2 #f] [caught #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel 3)])
+        (channel-send ch 'a)
+        (channel-send ch 'b)
+        (channel-close ch)
+        (set! v1 (channel-receive ch))
+        (set! v2 (channel-receive ch))
+        (guard (e [#t (set! caught #t)])
+          (channel-receive ch)))))
+  (test "drain buffered v1" v1 'a)
+  (test "drain buffered v2" v2 'b)
+  (test-true "error after drain" caught))
+
+;; Blocked receivers are woken on close
+(let ([woke #f] [val #f])
+  (run-threads
+    (lambda ()
+      (let ([ch (make-channel)])
+        (spawn (lambda ()
+                 (set! val (channel-receive ch))
+                 (set! woke #t)))
+        (yield) ; let receiver block
+        (channel-close ch)
+        (yield) (yield)))) ; let receiver wake
+  (test-true "blocked receiver woken on close" woke)
+  (test "woken receiver gets void" val (void)))
+
 ;;; ---- Summary ----
 
 (format #t "~%=== Results: ~a passed, ~a failed ===~%~%" *pass* *fail*)

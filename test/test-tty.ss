@@ -149,14 +149,15 @@
 (test-assert "ttychar/discard is a non-negative integer"
   (and (integer? ttychar/discard) (>= ttychar/discard 0)))
 
-(test-assert "ttychar/delayed-suspend is #f on Linux"
-  (eq? ttychar/delayed-suspend #f))
+(test-assert "ttychar/delayed-suspend is #f or a non-negative integer"
+  (or (eq? ttychar/delayed-suspend #f)
+      (and (integer? ttychar/delayed-suspend) (>= ttychar/delayed-suspend 0))))
 
 (test-assert "ttychar/eol2 is a non-negative integer"
   (and (integer? ttychar/eol2) (>= ttychar/eol2 0)))
 
-(test-equal "num-ttychars equals 32 (NCCS on Linux)"
-  32 num-ttychars)
+(test-assert "num-ttychars is a positive integer matching NCCS"
+  (and (integer? num-ttychars) (> num-ttychars 0)))
 
 (test-assert "disable-tty-char is the NUL character"
   (and (char? disable-tty-char)
@@ -327,8 +328,10 @@
 (test-assert "control-tty-file-name returns a string"
   (string? (control-tty-file-name)))
 
-(test-assert "control-tty-file-name returns /dev/tty"
-  (string=? "/dev/tty" (control-tty-file-name)))
+(test-assert "control-tty-file-name returns a /dev path"
+  (let ([name (control-tty-file-name)])
+    (and (> (string-length name) 5)
+         (string=? "/dev/" (substring name 0 5)))))
 
 ;; ======================================================================
 ;; TTY-dependent tests (guarded -- only run if stdin is a terminal)

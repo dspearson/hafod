@@ -7,13 +7,42 @@
           raise-posix-error posix-call with-foreign-buffer __errno_location c-strerror)
   (import (chezscheme))
 
-  ;; Load libc -- wrapped in a define to ensure it runs in definition context
-  ;; before the foreign-procedure bindings that depend on it.
-  (define load-libc (load-shared-object "libc.so.6"))
+  ;; Load libc symbols from the current process.  Using #f instead of a
+  ;; library name works on every platform because libc is always linked
+  ;; into the Chez Scheme executable.
+  (define load-libc (load-shared-object #f))
 
-  ;; Thread-safe errno access: __errno_location returns a pointer to
-  ;; the thread-local errno variable.
-  (define __errno_location (foreign-procedure "__errno_location" () uptr))
+  ;; Load hafod FFI helper library.  These are non-variadic C wrappers
+  ;; for variadic POSIX functions (open, fcntl, ioctl) — required on
+  ;; ARM64 macOS where variadic args use a different calling convention.
+  (define load-ffi-helpers
+    (let ([ext (case (machine-type)
+                 [(ta6osx tarm64osx ti3osx a6osx arm64osx i3osx) ".dylib"]
+                 [else ".so"])])
+      (let ([name (string-append "hafod-ffi-helpers" ext)]
+            [try (lambda (path)
+                   (and (file-exists? path)
+                        (guard (e [#t #f]) (load-shared-object path) #t)))])
+        ;; Search: ./src/, ./, library-directories source paths, then dlopen default
+        (or (try (string-append "./src/" name))
+            (try (string-append "./" name))
+            (let loop ([dirs (library-directories)])
+              (and (not (null? dirs))
+                   (or (try (string-append (caar dirs) "/" name))
+                       (loop (cdr dirs)))))
+            (guard (e [#t #f]) (load-shared-object name))))))
+
+  ;; Thread-safe errno access: returns a pointer to the thread-local
+  ;; errno variable.  The function name differs across platforms:
+  ;; glibc/musl use __errno_location, macOS/FreeBSD use __error.
+  (define __errno_location
+    (foreign-procedure
+      (case (machine-type)
+        [(ta6osx tarm64osx ti3osx a6osx arm64osx i3osx   ;; macOS
+          ta6fb  tarm64fb  ti3fb  a6fb  arm64fb  i3fb)   ;; FreeBSD
+         "__error"]
+        [else "__errno_location"])
+      () uptr))
   (define c-strerror (foreign-procedure "strerror" (int) string))
 
   ;; R6RS condition type for POSIX errors.

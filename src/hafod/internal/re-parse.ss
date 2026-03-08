@@ -6,7 +6,6 @@
   (export sre->regexp regexp->sre posix-string->regexp)
   (import (hafod internal base)
           (hafod compat)
-          (hafod internal char-sets)
           (except (hafod internal re-records) regexp?)
           (rename (only (hafod internal re-records) regexp?)
                   (regexp? re-adt?)))

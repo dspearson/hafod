@@ -26,46 +26,45 @@
     csv7:record-type-field-decls csv7:record-type-descriptor set-cdr! make-boot-file if
     annotation-options expression-editor bignum? print-record bytevector-u32-ref
     &i/o-filename transcoded-port-buffer-size get-datum make-polar condition-signal
-    set-sstats-gc-real! foreign-entry? ftype-scheme-object-pointer? pair? hashtable-cell
-    box-immobile current-output-port fx<= source-object-sfd current-input-port
-    r6rs:string=? vector-set-fixnum! time=? heap-reserve-ratio immutable-string?
-    set-port-input-index! procedure? standard-output-port source-condition?
-    stencil-vector-length lookahead-char read letrec enum-set-member? flfloor
-    profile-clear foreign-procedure get-initial-thread scheme-script thread-join assv
-    cdddar date-zone-name path-parent mutable-bytevector? r6rs:standard-error-port
-    stencil-vector-ref eq-hashtable-weak? case isqrt &assertion fl>?
-    binary-port-output-count make-i/o-read-error textual-port-output-size char-ci<?
-    bytevector-ieee-single-set! bytevector-u48-ref fixnum-width string-normalize-nfkd
-    ftype-sizeof string->uninterned-symbol box eval-when flnonnegative? truncate-port
-    flvector-fill! $primitive bytevector-s64-native-ref time>=? engine-return
-    condition-message fxvector-fill! bitwise-bit-count truncate port-input-buffer
-    make-custom-textual-input/output-port top-level-bound? null-environment
-    call-with-bytevector-output-port lambda fasl-compressed fxif null? get-source-table!
-    equal-hash source-object-line hashtable-weak? statistics cost-center-time
-    char-foldcase unget-char logbit1 source-file-descriptor keep-live fxvector
-    flvector-ref sort verify-loadability putenv continuation-marks-first
-    make-source-condition record-type-name make-continuation-condition load-program
-    time-difference! r6rs:fx+ library-timestamp-mode exact-integer-sqrt
-    set-textual-port-output-index! date-second port-position append serious-condition?
-    stencil-vector nonpositive? &no-infinities pretty-format syntax-object->datum fx*
-    imag-part char-numeric? fxsll source-table? define-values load-shared-object fx>=?
-    immutable-vector-copy errorf make-record-constructor-descriptor bytevector-s24-set!
-    latin-1-codec path-last logtest bytevector-u32-native-set! concatenate-object-files
-    scheme cfl* merge! flvector fxpopcount16 parent-rtd bytevector-s16-ref
-    set-textual-port-input-buffer! condition-who r6rs:current-input-port remprop
-    get-string-some! assertion-violation? cd make-error record-type-descriptor positive?
-    subtract-duration! continuation-next-marks subst! command-line r6rs:char-ci<?
-    port-has-port-nonblocking?? string? define-record hashtable-update! printf
-    bitwise-rotate-bit-field compute-size-increments stencil-vector-mask-width
-    csv7:record-type-name file-change-time pretty-maximum-lines logior top-level-program
-    cp0-outer-unroll-limit library-search-handler make-immobile-vector flexp fxlogxor not
-    cdar fold-right &who r6rs:<= datum->syntax scheme-program cddr fxnegative? export ieee
-    list->flvector fx<=? sstats-gc-count display-statistics remove
-    make-reference-bytevector string-foldcase flvector-copy vector-map sstats-gc-bytes
-    lexical-violation? make-non-continuable-violation bytevector-s16-native-ref
-    bytevector->string unread-char make-hashtable call-with-port cpu-time locate-source
-    cddaar hash-table? generate-covin-files equal? source-directories real->flonum
-    fxlogbit1 bytevector-u24-set! quote-syntax add-prefix
+    set-sstats-gc-real! foreign-entry? pair? hashtable-cell box-immobile
+    current-output-port fx<= source-object-sfd current-input-port r6rs:string=?
+    vector-set-fixnum! time=? heap-reserve-ratio immutable-string? set-port-input-index!
+    procedure? standard-output-port source-condition? stencil-vector-length lookahead-char
+    read letrec enum-set-member? flfloor profile-clear foreign-procedure
+    get-initial-thread scheme-script thread-join assv cdddar date-zone-name path-parent
+    mutable-bytevector? r6rs:standard-error-port stencil-vector-ref eq-hashtable-weak?
+    case isqrt &assertion fl>? binary-port-output-count make-i/o-read-error
+    textual-port-output-size char-ci<? bytevector-ieee-single-set! bytevector-u48-ref
+    fixnum-width string-normalize-nfkd ftype-sizeof string->uninterned-symbol box
+    eval-when flnonnegative? truncate-port flvector-fill! $primitive
+    bytevector-s64-native-ref time>=? engine-return condition-message fxvector-fill!
+    bitwise-bit-count truncate port-input-buffer make-custom-textual-input/output-port
+    top-level-bound? null-environment call-with-bytevector-output-port lambda
+    fasl-compressed fxif null? get-source-table! equal-hash source-object-line
+    hashtable-weak? statistics cost-center-time char-foldcase unget-char logbit1
+    source-file-descriptor keep-live fxvector flvector-ref sort verify-loadability putenv
+    continuation-marks-first make-source-condition record-type-name
+    make-continuation-condition load-program time-difference! r6rs:fx+
+    library-timestamp-mode exact-integer-sqrt set-textual-port-output-index! date-second
+    port-position append serious-condition? stencil-vector nonpositive? &no-infinities
+    pretty-format syntax-object->datum fx* imag-part char-numeric? fxsll source-table?
+    define-values load-shared-object fx>=? immutable-vector-copy errorf
+    make-record-constructor-descriptor bytevector-s24-set! latin-1-codec path-last logtest
+    bytevector-u32-native-set! concatenate-object-files scheme cfl* merge! flvector
+    fxpopcount16 parent-rtd bytevector-s16-ref set-textual-port-input-buffer!
+    condition-who r6rs:current-input-port remprop get-string-some! assertion-violation? cd
+    make-error record-type-descriptor positive? subtract-duration! continuation-next-marks
+    subst! command-line r6rs:char-ci<? port-has-port-nonblocking?? string? define-record
+    hashtable-update! printf bitwise-rotate-bit-field compute-size-increments
+    stencil-vector-mask-width csv7:record-type-name file-change-time pretty-maximum-lines
+    logior top-level-program cp0-outer-unroll-limit library-search-handler
+    make-immobile-vector flexp fxlogxor not cdar fold-right &who r6rs:<= datum->syntax
+    scheme-program cddr fxnegative? export ieee list->flvector fx<=? sstats-gc-count
+    display-statistics remove make-reference-bytevector string-foldcase flvector-copy
+    vector-map sstats-gc-bytes lexical-violation? make-non-continuable-violation
+    bytevector-s16-native-ref bytevector->string unread-char make-hashtable call-with-port
+    cpu-time locate-source cddaar hash-table? generate-covin-files equal?
+    source-directories real->flonum fxlogbit1 bytevector-u24-set! quote-syntax add-prefix
     make-custom-binary-input/output-port source-table-set! ftype-ref flvector?
     current-date port-bol? char-upcase hash-table-map format binary-port-input-index
     environment-symbols make-serious-condition fxnonnegative? caaddr set-box!
@@ -86,27 +85,27 @@
     hashtable-set! eq? pbchunk-convert-file eval-syntax-expanders-when
     set-sstats-gc-count! string-ref _ random unregister-guardian
     bytevector-u64-native-set! port-output-size remq fxreverse-bit-field object-counts
-    textual-port-input-size ftype-pointer->sexpr string->symbol symbol-hash car-cas!
+    textual-port-input-size ftype-pointer->sexpr string->symbol symbol-hash
     make-bytevector port-handler cflonum? bytevector-copy r6rs:utf-16-codec
     compile-whole-library iconv-codec putprop make-immobile-reference-bytevector
     syntax->annotation vector->pseudo-random-generator standard-error-port sort!
     hash-table-for-each hashtable-entries r6rs:char-ci<=? immutable-vector?
     close-input-port cons last-pair s8-list->bytevector r5rs eq-hashtable-try-atomic-cell
-    char-grapheme-step print-char-name fxvector-copy! free-identifier=? sstats-difference
-    add-duration! make-source-table bytevector=? &implementation-restriction bitwise-xor
+    char-grapheme-step print-char-name free-identifier=? sstats-difference add-duration!
+    make-source-table bytevector=? &implementation-restriction bitwise-xor
     open-file-input-port inexact? irritants-condition? compile-program-handler char>? fl-
     bytevector-u40-set! string-downcase hashtable-ref get-thread-id break
-    define-top-level-syntax opaque expand-omit-library-invocations cdr-cas!
+    define-top-level-syntax opaque expand-omit-library-invocations
     undefined-variable-warnings untrace cddddr put-source-table foreign-entry string-copy!
     make-annotation r6rs:> open-string-input-port library bitwise-reverse-bit-field
     &syntax wrapper-procedure-data procedure-known-single-valued? fxsra
     directory-separator open-fd-input-port ftype-lock! fx1+ system with-profile-tracker
     make-vector block-write <= condition-accessor fl-make-rectangular time-nanosecond
-    i/o-error-filename bytevector-reference-set! do string-ci<? flvector-copy! atan
-    memory-order-acquire annotation-option-set fxpopcount32 fx+/wraparound
-    port-input-count profile-dump-data quasiquote fllp i/o-write-error? port-output-index
-    decode-float string->number bwp-object? reverse! symbol-hashtable-delete! symbol?
-    r6rs:string->number r6rs:dynamic-wind cosh internal-defines-as-letrec* logor list-copy
+    i/o-error-filename bytevector-reference-set! do string-ci<? atan memory-order-acquire
+    annotation-option-set fxpopcount32 fx+/wraparound port-input-count profile-dump-data
+    quasiquote fllp i/o-write-error? port-output-index decode-float string->number
+    bwp-object? reverse! symbol-hashtable-delete! symbol? r6rs:string->number
+    r6rs:dynamic-wind cosh internal-defines-as-letrec* logor list-copy
     r6rs:flush-output-port when thread? pariah string->list trace-do port-output-full? fx>
     input-port-ready? make-input/output-port flceiling make-output-port utf-16le-codec
     find property-list textual-port-input-count close-port string->bytevector
@@ -127,8 +126,8 @@
     bytevector-reference*-ref log unsyntax fork-thread r6rs:with-output-to-file
     list-assuming-immutable? bytevector-u64-set! path-absolute? r6rs:call-with-input-file
     ceiling r6rs:fx* continuation-condition? collect-notify flfinite? char-name
-    define-property immutable-vector bitwise-arithmetic-shift ftype-any-ref
-    library-extensions fx+ set-binary-port-input-index! ftype-unlock! assoc
+    define-property immutable-vector bitwise-arithmetic-shift library-extensions fx+
+    set-binary-port-input-index! ftype-unlock! assoc
     print-select-flonum-exponential-format case-sensitive make-assertion-violation acos
     r6rs:exit with-implicit define-structure fxvector-length 1- process
     enum-set-intersection cfl- subset-mode make-enumeration bytevector-u64-native-ref =>
@@ -161,10 +160,9 @@
     r6rs:call-with-output-file fl= register-signal-handler fxmod disable-interrupts
     substq! syntax-error lognot quotient ftype-guardian port? fxmodulo buffer-mode?
     set-time-nanosecond! foreign-free top-level-value profile-dump-list
-    phantom-bytevector-length native-transcoder source-table-delete!
-    make-ftype-scheme-object-pointer source-table-dump expand-output
-    source-file-descriptor-checksum file-exists? record-case bytevector->u8-list
-    char-ready? sin trace-define-syntax open-source-file cost-center?
+    phantom-bytevector-length native-transcoder source-table-delete! source-table-dump
+    expand-output source-file-descriptor-checksum file-exists? record-case
+    bytevector->u8-list char-ready? sin trace-define-syntax open-source-file cost-center?
     generate-procedure-source-information meta-cond virtual-register-count pretty-print
     open-bytevector-input-port enable-arithmetic-left-associative make-hash-table
     &violation interpret ftype-pointer-null? i/o-encoding-error-char
@@ -182,14 +180,14 @@
     file-buffer-size fl>=? gensym fxnonpositive? ephemeron-cons denominator
     bytevector-s8-set! file-regular? port-transcoder enum-set->list &i/o-file-is-read-only
     fx=? make-pseudo-random-generator exact->inexact with-output-to-string define-ftype
-    fx-/carry stencil-vector-set! port-file-descriptor profile-palette flbit-field
-    integer-valued? enable-unsafe-application &message flinfinite? time-second exact else
-    for-each eq-hashtable? fl* with-output-to-file string->utf8 foreign-ref
-    r6rs:delete-file string-normalize-nfc fxdiv-and-mod source-table-cell
-    bytevector-uint-set! bound-identifier=? annotation-stripped condition flinteger? fxmin
-    critical-section debug-level syntax-violation-subform record-writer ephemeron-pair?
-    set-port-length! time-difference r6rs:eval r6rs:syntax-rules port-output-buffer
-    real-valued? div-and-mod profile-query-weight div0-and-mod0 expand/optimize
+    fx-/carry stencil-vector-set! port-file-descriptor profile-palette integer-valued?
+    enable-unsafe-application &message flinfinite? time-second exact else for-each
+    eq-hashtable? fl* with-output-to-file string->utf8 foreign-ref r6rs:delete-file
+    string-normalize-nfc fxdiv-and-mod source-table-cell bytevector-uint-set!
+    bound-identifier=? annotation-stripped condition flinteger? fxmin critical-section
+    debug-level syntax-violation-subform record-writer ephemeron-pair? set-port-length!
+    time-difference r6rs:eval r6rs:syntax-rules port-output-buffer real-valued?
+    div-and-mod profile-query-weight div0-and-mod0 expand/optimize
     default-library-search-handler - bytevector-uint-ref set-textual-port-output-size!
     set-textual-port-input-index! string->immutable-string alias format-condition?
     ftype-set! fxarithmetic-shift-left r6rs:standard-output-port i/o-filename-error? ormap
@@ -237,12 +235,12 @@
     symbol-hashtable-cell uninterned-symbol? fixnum? make-boot-header cdr port-closed?
     enum-set=? record-rtd fleven? bitwise-arithmetic-shift-left i/o-error? logbit? reset
     syntax-case open-process-ports r5rs-syntax fxodd? bitwise-length
-    binary-port-output-size directory-separator? record-instance?
-    ftype-scheme-object-pointer-object expt list-head enum-set-universe fx*/carry
-    compile-library-handler vector-length make-arity-wrapper-procedure bytevector-s40-set!
-    caaar assp for-all syntax->vector get-line enum-set-difference div0 sstats-gc-real
-    let* &serious list->fxvector call-with-string-output-port sc-expand exclusive-cond
-    visit call-with-immediate-continuation-mark delay make-i/o-invalid-position-error
+    binary-port-output-size directory-separator? record-instance? expt list-head
+    enum-set-universe fx*/carry compile-library-handler vector-length
+    make-arity-wrapper-procedure bytevector-s40-set! caaar assp for-all syntax->vector
+    get-line enum-set-difference div0 sstats-gc-real let* &serious list->fxvector
+    call-with-string-output-port sc-expand exclusive-cond visit
+    call-with-immediate-continuation-mark delay make-i/o-invalid-position-error
     bytevector-u48-set! maybe-compile-library list? flnonpositive? string-hash
     eq-hashtable-contains? binary-port-input-size fl> with-interrupts-disabled
     get-process-id ftype-pointer-address import flnan? collections box-cas! fl<=
@@ -257,12 +255,11 @@
     textual-port-input-buffer make-no-nans-violation bitwise-if substring-fill!
     compile-procedure-realm vector-cas! thread-condition? revisit set-sstats-cpu!
     default-prompt-and-read clear-output-port make-syntax-violation port-length
-    date-nanosecond record-constructor-descriptor? ftype-any-set! list->string
-    csv7:record-field-accessor real? vector->immutable-vector load-compiled-from-port
-    gensym? i/o-encoding-error? object-backreferences ftype-&ref
-    make-i/o-file-already-exists-error fldiv0 r6rs:string-ci<? hashtable-delete! load
-    vector-set! file-port? source-object? identifier-syntax cdaadr fx*/wraparound
-    commonization-level ftype-scheme-object-pointer-offset symbol-hashtable-ref-cell
+    date-nanosecond record-constructor-descriptor? list->string csv7:record-field-accessor
+    real? vector->immutable-vector load-compiled-from-port gensym? i/o-encoding-error?
+    object-backreferences ftype-&ref make-i/o-file-already-exists-error fldiv0
+    r6rs:string-ci<? hashtable-delete! load vector-set! file-port? source-object?
+    identifier-syntax cdaadr fx*/wraparound commonization-level symbol-hashtable-ref-cell
     bitwise-copy-bit letrec* port-nonblocking? set-port-position! &irritants
     hashtable-values r6rs:hashtable-keys make-violation in-place-minimum-generation trace
     port-has-set-port-position!? compile-profile subst record-type-field-names
@@ -296,7 +293,7 @@
     date-month implementation-restriction-violation? display-condition file-length
     weak-pair? uint-list->bytevector pretty-file box-immutable cdaar utf16->string
     reference-address->object asin message-condition? condition-broadcast gensym-count
-    date-zone-offset black-box set-wrapper-procedure-procedure! load-library
+    date-zone-offset set-wrapper-procedure-procedure! load-library
     make-variable-transformer apropos csv7:record-field-accessible? < fllog newline
     collect-trip-bytes maximum-memory-bytes flsin bytevector->sint-list
     bytevector-s32-native-set! type-descriptor flmod0 enable-error-source-expression char?
@@ -343,7 +340,7 @@
     immutable-bytevector? top-level-syntax expt-mod &i/o-file-protection
     call-with-input-file thread-preserve-ownership! generate-wpo-files
     symbol-hashtable-ref string->utf16 raise define-syntax record-constructor
-    bytevector-s32-native-ref angle bytevector-compress &i/o mod0 vector-copy!
+    bytevector-s32-native-ref angle bytevector-compress &i/o mod0
     bytevector-u16-native-ref quote path-build display r6rs:make-record-type-descriptor
     char-general-category bytevector-u8-set! reset-cost-center! cddar
     source-file-descriptor? cfl-real-part get-bytevector-all port-input-empty? $system

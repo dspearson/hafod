@@ -83,8 +83,8 @@
 ;; 1. with-cwd restores after normal exit
 (test-assert "with-cwd restores after normal exit"
   (let ([saved (cwd)])
-    (let ([inside (with-cwd "/tmp" (cwd))])
-      (and (string=? inside "/tmp")
+    (let ([inside (with-cwd "/usr" (cwd))])
+      (and (string=? inside "/usr")
            (string=? (cwd) saved)))))
 
 ;; 2. with-umask restores after normal exit
@@ -107,11 +107,11 @@
   (let ([saved-cwd (cwd)]
         [saved-umask (umask)])
     (let-values ([(c u e)
-                  (with-cwd "/tmp"
+                  (with-cwd "/usr"
                     (with-umask #o077
                       (with-env '(("HAFOD_NESTED" . "yes"))
                         (values (cwd) (umask) (getenv "HAFOD_NESTED")))))])
-      (and (string=? c "/tmp")
+      (and (string=? c "/usr")
            (= u #o077)
            (string=? e "yes")
            (string=? (cwd) saved-cwd)
@@ -123,7 +123,7 @@
   (let ([saved-cwd (cwd)]
         [saved-umask (umask)])
     (guard (e [#t #t])
-      (with-cwd "/tmp"
+      (with-cwd "/usr"
         (with-umask #o077
           (error 'test "deliberate"))))
     (and (string=? (cwd) saved-cwd)
@@ -136,17 +136,17 @@
       (with-cwd "/"
         (let ([at-root (cwd)])
           (let ([r2
-            (with-cwd "/tmp"
-              (let ([at-tmp (cwd)])
+            (with-cwd "/usr"
+              (let ([at-usr (cwd)])
                 (let ([r3
-                  (with-cwd "/usr"
+                  (with-cwd "/etc"
                     (cwd))])
-                  (list at-root at-tmp r3 (cwd)))))])
+                  (list at-root at-usr r3 (cwd)))))])
             (append r2 (list (cwd))))))])
       (and (string=? (list-ref r1 0) "/")
-           (string=? (list-ref r1 1) "/tmp")
-           (string=? (list-ref r1 2) "/usr")
-           (string=? (list-ref r1 3) "/tmp")
+           (string=? (list-ref r1 1) "/usr")
+           (string=? (list-ref r1 2) "/etc")
+           (string=? (list-ref r1 3) "/usr")
            (string=? (list-ref r1 4) "/")
            (string=? (cwd) saved)))))
 
@@ -179,19 +179,20 @@
        (string=? (->username (->uid "root")) "root")))
 
 ;; 3. group-info by name and gid are consistent
+;; Use gid 0's actual name (Linux: "root", macOS: "wheel")
 (test-assert "group-info by name and gid are consistent"
-  (let ([gr-by-name (group-info "root")]
-        [gr-by-gid  (group-info 0)])
-    (and (string=? (group-info-name gr-by-name) "root")
+  (let* ([gr-by-gid  (group-info 0)]
+         [gname      (group-info-name gr-by-gid)]
+         [gr-by-name (group-info gname)])
+    (and (string=? (group-info-name gr-by-name) gname)
          (= (group-info-gid gr-by-name) 0)
-         (string=? (group-info-name gr-by-gid) "root")
          (= (group-info-gid gr-by-gid) 0))))
 
 ;; 4. ->gid and ->groupname roundtrip
 (test-assert "->gid and ->groupname roundtrip"
-  (and (= (->gid "root") 0)
-       (string=? (->groupname 0) "root")
-       (string=? (->groupname (->gid "root")) "root")))
+  (let ([gname (->groupname 0)])
+    (and (= (->gid gname) 0)
+         (string=? (->groupname (->gid gname)) gname))))
 
 ;; 5. user-info current user is consistent
 (test-assert "user-info current user is consistent"
@@ -222,9 +223,9 @@
 
 ;; 1. Fork inherits scoped cwd via resource alignment
 (test-assert "fork inherits scoped cwd via resource alignment"
-  (string=? "/tmp"
+  (string=? "/"
     (trim-newline
-      (with-cwd "/tmp"
+      (with-cwd "/"
         (run/string (pwd))))))
 
 ;; 2. Fork inherits scoped env via resource alignment
@@ -242,11 +243,11 @@
 ;; 4. Fork inherits all three scoped states simultaneously
 (test-assert "fork inherits all three scoped states simultaneously"
   (let ([output
-    (with-cwd "/tmp"
+    (with-cwd "/"
       (with-umask #o027
         (with-env '(("HAFOD_COMBO" . "yes"))
           (run/string (sh "-c" "echo CWD=$(pwd) UMASK=$(umask) ENV=$HAFOD_COMBO")))))])
-    (and (string-contains output "CWD=/tmp")
+    (and (string-contains output "CWD=/")
          (string-contains output "UMASK=0027")
          (string-contains output "ENV=yes"))))
 

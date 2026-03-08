@@ -80,7 +80,7 @@
     posix-fork posix-_exit posix-exec posix-waitpid posix-pipe
     posix-dup posix-dup2 posix-close posix-open posix-read posix-write
     posix-kill posix-pause
-    O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK
+    O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_NONBLOCK O_NOCTTY
     S_IFMT S_IFDIR S_IFREG S_IFLNK S_IFIFO S_IFSOCK S_IFBLK S_IFCHR
     S_ISUID S_ISGID S_ISVTX
     S_IRUSR S_IWUSR S_IXUSR S_IRGRP S_IWGRP S_IXGRP S_IROTH S_IWOTH S_IXOTH
@@ -359,6 +359,56 @@
     make-thread-local thread-local-ref thread-local-set!
     run-threads threads-start! threads-shutdown! threads-running?
 
+    ;; === (hafod interactive) ===
+    interactive-repl eval-script repl-prompt-hook repl-right-prompt-hook repl-pre-eval-hook repl-post-eval-hook
+    last-status last-duration terminal-width query-terminal-width
+    repl-continuation-prompt ansi-visible-length
+    background-job-count
+
+    ;; === (hafod editor gap-buffer) ===
+    make-gap-buffer gap-buffer-insert! gap-buffer-delete-forward!
+    gap-buffer-delete-backward! gap-buffer-move-cursor!
+    gap-buffer-cursor-pos gap-buffer->string
+    gap-buffer-before-string gap-buffer-after-string
+    gap-buffer-length gap-buffer-char-at
+    gap-buffer-set-from-string! gap-buffer-clear!
+    gap-buffer-delete-word-forward! gap-buffer-delete-word-backward!
+    gap-buffer-kill-to-end!
+
+    ;; === (hafod editor kill-ring) ===
+    make-kill-ring kill-ring-push! kill-ring-yank kill-ring-rotate!
+
+    ;; === (hafod editor keymap) ===
+    make-keymap keymap? keymap-bind! keymap-lookup keymap-lookup-prefix
+
+    ;; === (hafod editor input-decode) ===
+    make-key-event key-event? key-event-type key-event-value key-event-mods
+    key-event=?
+    read-key-event
+    char-display-width string-display-width
+
+    ;; === (hafod editor sexp-tracker) ===
+    sexp-depth find-matching-paren
+
+    ;; === (hafod editor render) ===
+    render-line flash-matching-paren
+
+    ;; === (hafod editor sqlite3) ===
+    sqlite3-open sqlite3-close sqlite3-exec
+    sqlite3-prepare sqlite3-finalize sqlite3-reset
+    sqlite3-bind-text sqlite3-bind-int64
+    sqlite3-step sqlite3-column-text sqlite3-column-int64
+    sqlite3-column-count sqlite3-errmsg
+    SQLITE_OK SQLITE_ROW SQLITE_DONE
+
+    ;; === (hafod editor history) ===
+    open-history history? history-add! history-close!
+    history-prev history-next history-reset-nav!
+    history-save-input! history-saved-input history-cursor
+
+    ;; === (hafod editor editor) ===
+    read-expression with-raw-mode editor-default-keymap
+
     ;; === (chezscheme) re-exports for scsh compatibility ===
     error current-error-port
     write display newline read-char write-char char-ready?
@@ -438,7 +488,17 @@
     (hafod exit-hooks)
     (hafod dot-locking)
     (hafod lib-dirs)
-    (hafod threads))
+    (hafod threads)
+    (hafod interactive)
+    (hafod editor gap-buffer)
+    (hafod editor kill-ring)
+    (hafod editor keymap)
+    (hafod editor input-decode)
+    (hafod editor sexp-tracker)
+    (hafod editor render)
+    (hafod editor sqlite3)
+    (hafod editor history)
+    (hafod editor editor))
 
   ;; No body needed -- this library is a pure re-export aggregator.
   ;; Body definitions live in sub-libraries to avoid import conflicts.

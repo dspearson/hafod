@@ -67,4 +67,55 @@
   6
   (reduce-port (open-input-string "1 2 3") read + 0))
 
+;; make-string-output-port and string-output-port-output
+(test-equal "make-string-output-port and extract"
+  "hello"
+  (let ([p (make-string-output-port)])
+    (display "hello" p)
+    (string-output-port-output p)))
+
+(test-equal "string-output-port-output resets"
+  ""
+  (let ([p (make-string-output-port)])
+    (display "first" p)
+    (string-output-port-output p)
+    ;; After extraction, further output starts fresh
+    (string-output-port-output p)))
+
+(test-equal "make-string-output-port accumulates"
+  "abc"
+  (let ([p (make-string-output-port)])
+    (display "a" p)
+    (display "b" p)
+    (display "c" p)
+    (string-output-port-output p)))
+
+;; call-with-string-output-port
+(test-equal "call-with-string-output-port"
+  "42"
+  (call-with-string-output-port
+    (lambda (p) (display 42 p))))
+
+;; make-char-port-filter
+(test-equal "make-char-port-filter uppercases"
+  "ABC"
+  (let ([filter (make-char-port-filter
+                  (lambda (c) (display (char-upcase c))))])
+    (parameterize ([current-input-port (open-input-string "abc")])
+      (call-with-string-output-port
+        (lambda (out)
+          (parameterize ([current-output-port out])
+            (filter)))))))
+
+;; make-string-port-filter
+(test-equal "make-string-port-filter wraps lines"
+  "[a]\n[b]\n"
+  (let ([filter (make-string-port-filter
+                  (lambda (line) (string-append "[" line "]")))])
+    (parameterize ([current-input-port (open-input-string "a\nb\n")])
+      (call-with-string-output-port
+        (lambda (out)
+          (parameterize ([current-output-port out])
+            (filter)))))))
+
 (test-end)
