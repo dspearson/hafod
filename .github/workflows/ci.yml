@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Chez Scheme
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chezscheme chezscheme-dev liblz4-dev zlib1g-dev libncurses-dev
+
+      - name: Build (compile-wpo)
+        run: make compile-wpo
+
+      - name: Run tests
+        run: make test
+
+      - name: Build native binary
+        run: make native
+
+      - name: Verify native binary
+        run: |
+          bin/hafod-native --version
+          bin/hafod-native -c '(display "ok\n")'
+
+      - name: Build standalone binary
+        run: make standalone
+
+      - name: Verify standalone binary
+        run: |
+          bin/hafod-standalone --version
+          bin/hafod-standalone -c '(display "ok\n")'
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Chez Scheme
+        run: brew install chezscheme lz4
+
+      - name: Generate platform constants
+        run: make platform-constants
+
+      - name: Build (compile-wpo)
+        run: make compile-wpo
+
+      - name: Run tests
+        run: make test
+
+      - name: Build native binary
+        run: make native
+
+      - name: Verify native binary
+        run: |
+          bin/hafod-native --version
+          bin/hafod-native -c '(display "ok\n")'
+
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+
+      - name: Build with Nix
+        run: nix build
+
+      - name: Verify Nix binary
+        run: |
+          ./result/bin/hafod --version
+          ./result/bin/hafod -c '(display "ok\n")'
