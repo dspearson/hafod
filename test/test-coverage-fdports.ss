@@ -65,16 +65,20 @@
 ;; Low-level operations (3 symbols)
 ;; ======================================================================
 
-;; %set-cloexec
+;; %set-cloexec — test on raw fds to avoid port machinery interference
 (test-assert "%set-cloexec is a procedure" (procedure? %set-cloexec))
-(let-values ([(r w) (pipe)])
-  (let ([rfd (port->fdes r)])
+(let ([fds (posix-pipe)])
+  (let ([rfd (car fds)] [wfd (cdr fds)])
     (%set-cloexec rfd #t)
     (let ([flags (posix-fcntl rfd F_GETFD)])
       (test-assert "%set-cloexec sets FD_CLOEXEC"
         (not (zero? (bitwise-and flags FD_CLOEXEC)))))
-    (close r)
-    (close w)))
+    (%set-cloexec rfd #f)
+    (let ([flags (posix-fcntl rfd F_GETFD)])
+      (test-assert "%set-cloexec clears FD_CLOEXEC"
+        (zero? (bitwise-and flags FD_CLOEXEC))))
+    (posix-close rfd)
+    (posix-close wfd)))
 
 ;; shell-open -- opens file and moves to target fd
 ;; Cannot safely test by stealing fd 0/1/2, so just verify it's a procedure
