@@ -24,12 +24,18 @@ jobs:
         run: nix develop --command make test
 
       - name: Build native binary
-        run: nix develop --command make native
+        run: nix develop --command make native LIBDIR=$(pwd)
+
+      - name: Set up native runtime files
+        run: |
+          nix develop --command bash -c 'ln -sf $(dirname $(dirname $(readlink -f $(which scheme))))/lib/csv*/*/petite.boot petite.boot'
+          ln -sf bin/hafod.so hafod.so
+          ln -sf src src
 
       - name: Verify native binary
         run: |
-          bin/hafod-native --version
-          bin/hafod-native -c '(display "ok\n")'
+          HAFOD_LIBDIR=$(pwd) bin/hafod-native --version
+          HAFOD_LIBDIR=$(pwd) bin/hafod-native -c '(display "ok\n")'
 
       - name: Build standalone binary
         run: nix develop --command make standalone
@@ -59,12 +65,18 @@ jobs:
         run: nix develop --command make test
 
       - name: Build native binary
-        run: nix develop --command make native
+        run: nix develop --command make native LIBDIR=$(pwd)
+
+      - name: Set up native runtime files
+        run: |
+          nix develop --command bash -c 'ln -sf $(dirname $(dirname $(readlink -f $(which scheme))))/lib/csv*/*/petite.boot petite.boot'
+          ln -sf bin/hafod.so hafod.so
+          ln -sf src src
 
       - name: Verify native binary
         run: |
-          bin/hafod-native --version
-          bin/hafod-native -c '(display "ok\n")'
+          HAFOD_LIBDIR=$(pwd) bin/hafod-native --version
+          HAFOD_LIBDIR=$(pwd) bin/hafod-native -c '(display "ok\n")'
 
   nix-build:
     runs-on: ubuntu-latest
