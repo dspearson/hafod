@@ -43,19 +43,35 @@
   (define c-lstat (foreign-procedure "lstat" (string void*) int))
   (define c-fstat (foreign-procedure "fstat" (int void*) int))
 
+  ;; Read an unsigned integer of the given byte-size from a foreign buffer.
+  (define (foreign-ref-uint buf offset size)
+    (case size
+      [(1) (foreign-ref 'unsigned-8 buf offset)]
+      [(2) (foreign-ref 'unsigned-16 buf offset)]
+      [(4) (foreign-ref 'unsigned-32 buf offset)]
+      [(8) (foreign-ref 'unsigned-64 buf offset)]
+      [else (error 'foreign-ref-uint "unsupported size" size)]))
+
+  ;; Read a signed integer of the given byte-size from a foreign buffer.
+  (define (foreign-ref-sint buf offset size)
+    (case size
+      [(4) (foreign-ref 'integer-32 buf offset)]
+      [(8) (foreign-ref 'integer-64 buf offset)]
+      [else (error 'foreign-ref-sint "unsupported size" size)]))
+
   ;; Extract stat-info from a filled stat buffer.
   (define (extract-stat-info buf)
     (make-stat-info
-      (mode->type (foreign-ref 'unsigned-32 buf STAT-ST-MODE))
-      (foreign-ref 'unsigned-64 buf STAT-ST-DEV)
-      (foreign-ref 'unsigned-64 buf STAT-ST-INO)
-      (foreign-ref 'unsigned-32 buf STAT-ST-MODE)
-      (foreign-ref 'unsigned-64 buf STAT-ST-NLINK)
+      (mode->type (foreign-ref-uint buf STAT-ST-MODE SIZEOF-ST-MODE))
+      (foreign-ref-uint buf STAT-ST-DEV SIZEOF-ST-DEV)
+      (foreign-ref-uint buf STAT-ST-INO SIZEOF-ST-INO)
+      (foreign-ref-uint buf STAT-ST-MODE SIZEOF-ST-MODE)
+      (foreign-ref-uint buf STAT-ST-NLINK SIZEOF-ST-NLINK)
       (foreign-ref 'unsigned-32 buf STAT-ST-UID)
       (foreign-ref 'unsigned-32 buf STAT-ST-GID)
-      (foreign-ref 'unsigned-64 buf STAT-ST-RDEV)
+      (foreign-ref-uint buf STAT-ST-RDEV SIZEOF-ST-RDEV)
       (foreign-ref 'integer-64 buf STAT-ST-SIZE)
-      (foreign-ref 'integer-64 buf STAT-ST-BLKSIZE)
+      (foreign-ref-sint buf STAT-ST-BLKSIZE SIZEOF-ST-BLKSIZE)
       (foreign-ref 'integer-64 buf STAT-ST-BLOCKS)
       (foreign-ref 'unsigned-64 buf STAT-ST-ATIM)
       (foreign-ref 'unsigned-64 buf STAT-ST-MTIM)

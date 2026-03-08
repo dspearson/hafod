@@ -32,6 +32,8 @@
     printf("  (define %s %d)\n", name, (int)offsetof(type, field))
 #define EMIT_SIZEOF(name, type) \
     printf("  (define %s %d)\n", name, (int)sizeof(type))
+#define EMIT_FIELD_SIZEOF(name, type, field) \
+    printf("  (define %s %d)\n", name, (int)sizeof(((type *)0)->field))
 
 int main(void) {
     printf(";;; (hafod internal platform-constants) -- Auto-generated, do not edit\n");
@@ -45,6 +47,8 @@ int main(void) {
     printf("    STAT-ST-DEV STAT-ST-INO STAT-ST-NLINK STAT-ST-MODE\n");
     printf("    STAT-ST-UID STAT-ST-GID STAT-ST-RDEV STAT-ST-SIZE\n");
     printf("    STAT-ST-BLKSIZE STAT-ST-BLOCKS STAT-ST-ATIM STAT-ST-MTIM STAT-ST-CTIM\n");
+    printf("    SIZEOF-ST-DEV SIZEOF-ST-INO SIZEOF-ST-NLINK SIZEOF-ST-MODE\n");
+    printf("    SIZEOF-ST-RDEV SIZEOF-ST-BLKSIZE SIZEOF-ST-BLOCKS\n");
 
     /* struct dirent */
     printf("    DIRENT-D-INO DIRENT-D-OFF DIRENT-D-RECLEN DIRENT-D-TYPE DIRENT-D-NAME\n");
@@ -144,6 +148,13 @@ int main(void) {
     EMIT_OFFSET("STAT-ST-MTIM", struct stat, st_mtim);
     EMIT_OFFSET("STAT-ST-CTIM", struct stat, st_ctim);
 #endif
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-DEV", struct stat, st_dev);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-INO", struct stat, st_ino);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-NLINK", struct stat, st_nlink);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-MODE", struct stat, st_mode);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-RDEV", struct stat, st_rdev);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-BLKSIZE", struct stat, st_blksize);
+    EMIT_FIELD_SIZEOF("SIZEOF-ST-BLOCKS", struct stat, st_blocks);
     printf("\n");
 
     /* ============================================================ */
