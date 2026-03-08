@@ -17,8 +17,8 @@
 (let ([path (create-temp-file)])
   (test-assert "temp: file exists after create"
     (file-exists? path))
-  (test-assert "temp: path is in temp-dir"
-    (let* ([tdir (string-append (temp-dir) "/")]
+  (test-assert "temp: path is in temp directory"
+    (let* ([tdir (string-append (or (getenv "TMPDIR") "/tmp") "/")]
            [prefix-len (string-length tdir)])
       (and (>= (string-length path) prefix-len)
            (string=? (substring path 0 prefix-len) tdir))))
