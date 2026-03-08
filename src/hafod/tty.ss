@@ -313,7 +313,7 @@
   ;; Make an already-open fd the controlling terminal.
   ;; Uses ioctl(fd, TIOCSCTTY, 0) on Linux.
   (define make-control-tty
-    (let ([c-ioctl (foreign-procedure "ioctl" (int unsigned-long int) int)])
+    (let ([c-ioctl (foreign-procedure "hafod_ioctl_int" (int unsigned-long int) int)])
       (lambda (fd/port)
         (let ([fd (cond
                     [(integer? fd/port) fd/port]

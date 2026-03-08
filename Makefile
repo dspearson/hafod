@@ -17,7 +17,7 @@ CHEZ_LIBDIR ?= $(shell p=$$(dirname $$(dirname $$(readlink -f $$(which $(SCHEME)
 TEST_SCRIPTS := $(wildcard test/test-*.ss)
 TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
 
-.PHONY: all compile compile-wpo native standalone test clean install uninstall test-launcher verify-umbrella platform-constants $(TEST_TARGETS)
+.PHONY: all compile compile-wpo native standalone test clean install uninstall test-launcher verify-umbrella platform-constants ffi-helpers $(TEST_TARGETS)
 
 all: native
 
@@ -28,7 +28,20 @@ platform-constants: tools/gen-platform-constants.c
 	$(CC) -o tools/gen-platform-constants tools/gen-platform-constants.c
 	tools/gen-platform-constants > src/hafod/internal/platform-constants.ss
 
-compile:
+FFI_HELPERS_SRC = tools/hafod-ffi-helpers.c
+ifeq ($(shell uname -s),Darwin)
+FFI_HELPERS_OUT = src/hafod-ffi-helpers.dylib
+FFI_HELPERS_FLAGS = -dynamiclib
+else
+FFI_HELPERS_OUT = src/hafod-ffi-helpers.so
+FFI_HELPERS_FLAGS = -shared -fPIC
+endif
+
+ffi-helpers: $(FFI_HELPERS_OUT)
+$(FFI_HELPERS_OUT): $(FFI_HELPERS_SRC)
+	$(CC) $(CFLAGS) $(FFI_HELPERS_FLAGS) -o $@ $< $(LDFLAGS)
+
+compile: ffi-helpers
 	@rm -f src/hafod.so src/hafod.wpo
 	$(SCHEME) $(LIBDIRS) --compile-imported-libraries --script compile-all.ss
 
@@ -82,11 +95,15 @@ clean:
 	rm -rf lib/
 	rm -f bin/hafod.so bin/hafod.wpo bin/hafod-native bin/hafod-standalone
 	rm -f tools/gen-platform-constants
+	rm -f src/hafod-ffi-helpers.so src/hafod-ffi-helpers.dylib
 
 install: native
 	install -d $(DESTDIR)$(BINDIR)
 	install -d $(DESTDIR)$(LIBDIR)/src
 	cp -r src/hafod src/hafod.ss src/hafod.so $(DESTDIR)$(LIBDIR)/src/
+	@for f in src/hafod-ffi-helpers.so src/hafod-ffi-helpers.dylib; do \
+		[ -f "$$f" ] && install -m 644 "$$f" $(DESTDIR)$(LIBDIR)/src/ || true; \
+	done
 	install -m 644 bin/hafod.sps $(DESTDIR)$(LIBDIR)/hafod.sps
 	install -m 644 bin/hafod.so $(DESTDIR)$(LIBDIR)/hafod.so
 	ln -sf $(CHEZ_LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/petite.boot

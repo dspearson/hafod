@@ -12,6 +12,26 @@
   ;; into the Chez Scheme executable.
   (define load-libc (load-shared-object #f))
 
+  ;; Load hafod FFI helper library.  These are non-variadic C wrappers
+  ;; for variadic POSIX functions (open, fcntl, ioctl) — required on
+  ;; ARM64 macOS where variadic args use a different calling convention.
+  (define load-ffi-helpers
+    (let ([ext (case (machine-type)
+                 [(ta6osx tarm64osx ti3osx a6osx arm64osx i3osx) ".dylib"]
+                 [else ".so"])])
+      (let ([name (string-append "hafod-ffi-helpers" ext)]
+            [try (lambda (path)
+                   (and (file-exists? path)
+                        (guard (e [#t #f]) (load-shared-object path) #t)))])
+        ;; Search: ./src/, ./, library-directories source paths, then dlopen default
+        (or (try (string-append "./src/" name))
+            (try (string-append "./" name))
+            (let loop ([dirs (library-directories)])
+              (and (not (null? dirs))
+                   (or (try (string-append (caar dirs) "/" name))
+                       (loop (cdr dirs)))))
+            (guard (e [#t #f]) (load-shared-object name))))))
+
   ;; Thread-safe errno access: returns a pointer to the thread-local
   ;; errno variable.  The function name differs across platforms:
   ;; glibc/musl use __errno_location, macOS uses __error.

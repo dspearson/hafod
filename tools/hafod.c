@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -27,6 +29,14 @@
 #endif
 
 #include <scheme.h>
+
+/* Non-variadic wrappers for variadic POSIX functions.
+ * Required on ARM64 macOS where variadic args use a different ABI. */
+int hafod_open3(const char *path, int flags, int mode) { return open(path, flags, mode); }
+int hafod_fcntl_int(int fd, int cmd, int arg) { return fcntl(fd, cmd, arg); }
+int hafod_fcntl_void(int fd, int cmd) { return fcntl(fd, cmd); }
+int hafod_ioctl_int(int fd, unsigned long req, int arg) { return ioctl(fd, req, arg); }
+int hafod_ioctl_ptr(int fd, unsigned long req, void *arg) { return ioctl(fd, req, arg); }
 
 #ifndef LIBDIR
 #define LIBDIR "/usr/local/lib/hafod"

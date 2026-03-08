@@ -111,7 +111,7 @@
   (define c-dup (foreign-procedure "dup" (int) int))
   (define c-dup2 (foreign-procedure "dup2" (int int) int))
   (define c-close (foreign-procedure "close" (int) int))
-  (define c-open (foreign-procedure "open" (string int int) int))
+  (define c-open (foreign-procedure "hafod_open3" (string int int) int))
   (define c-read (foreign-procedure "read" (int void* size_t) ssize_t))
   (define c-write (foreign-procedure "write" (int void* size_t) ssize_t))
   (define c-kill (foreign-procedure "kill" (int int) int))

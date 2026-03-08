@@ -57,15 +57,16 @@
   ;; fcntl
   ;; ======================================================================
 
-  ;; Use the 3-arg form always, passing 0 for the third arg when not needed.
-  (define c-fcntl (foreign-procedure "fcntl" (int int int) int))
+  ;; Non-variadic wrappers for fcntl (variadic in C).
+  (define c-fcntl-void (foreign-procedure "hafod_fcntl_void" (int int) int))
+  (define c-fcntl-int (foreign-procedure "hafod_fcntl_int" (int int int) int))
 
   ;; posix-fcntl: file descriptor control.
   ;; (posix-fcntl fd cmd) or (posix-fcntl fd cmd arg)
   (define (posix-fcntl fd cmd . args)
     (if (null? args)
-        (posix-call fcntl (c-fcntl fd cmd 0))
-        (posix-call fcntl (c-fcntl fd cmd (car args)))))
+        (posix-call fcntl (c-fcntl-void fd cmd))
+        (posix-call fcntl (c-fcntl-int fd cmd (car args)))))
 
   ;; ======================================================================
   ;; Supplementary groups
