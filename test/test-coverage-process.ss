@@ -70,12 +70,14 @@
   (procedure? (resource-align! (make-resource "test-res" (lambda () #t)))))
 
 ;; process-chdir -- low-level, directly calls chdir
+;; Use posix-getcwd after chdir to get the resolved path (handles symlinks
+;; like /tmp -> /private/tmp on macOS).
 (test-assert "process-chdir changes OS cwd"
   (let ([orig (posix-getcwd)])
-    (process-chdir "/tmp")
+    (process-chdir "/")
     (let ([now (posix-getcwd)])
       (process-chdir orig)
-      (string=? now "/tmp"))))
+      (string=? now "/"))))
 
 ;; set-gid, set-uid -- require root
 (test-assert "set-gid is a procedure" (procedure? set-gid))
@@ -91,8 +93,8 @@
 ;; with-cwd* -- procedure form of with-cwd
 (test-assert "with-cwd* scopes directory"
   (let ([orig (cwd)])
-    (let ([result (with-cwd* "/tmp" (lambda () (cwd)))])
-      (and (string=? result "/tmp")
+    (let ([result (with-cwd* "/" (lambda () (cwd)))])
+      (and (string=? result "/")
            (string=? (cwd) orig)))))
 
 ;; with-umask* -- procedure form of with-umask
