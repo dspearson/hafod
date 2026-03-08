@@ -134,10 +134,16 @@ int main(void) {
     EMIT_OFFSET("STAT-ST-SIZE", struct stat, st_size);
     EMIT_OFFSET("STAT-ST-BLKSIZE", struct stat, st_blksize);
     EMIT_OFFSET("STAT-ST-BLOCKS", struct stat, st_blocks);
-    /* st_atim is a struct timespec; we want the offset of tv_sec */
+    /* st_atim is a struct timespec; macOS uses st_atimespec instead */
+#ifdef __APPLE__
+    EMIT_OFFSET("STAT-ST-ATIM", struct stat, st_atimespec);
+    EMIT_OFFSET("STAT-ST-MTIM", struct stat, st_mtimespec);
+    EMIT_OFFSET("STAT-ST-CTIM", struct stat, st_ctimespec);
+#else
     EMIT_OFFSET("STAT-ST-ATIM", struct stat, st_atim);
     EMIT_OFFSET("STAT-ST-MTIM", struct stat, st_mtim);
     EMIT_OFFSET("STAT-ST-CTIM", struct stat, st_ctim);
+#endif
     printf("\n");
 
     /* ============================================================ */
