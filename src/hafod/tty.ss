@@ -311,7 +311,6 @@
          (fdes->inport fd))]))
 
   ;; Make an already-open fd the controlling terminal.
-  ;; Uses ioctl(fd, TIOCSCTTY, 0) on Linux.
   (define make-control-tty
     (let ([c-ioctl (foreign-procedure "hafod_ioctl_int" (int unsigned-long int) int)])
       (lambda (fd/port)
@@ -319,7 +318,7 @@
                     [(integer? fd/port) fd/port]
                     [(port? fd/port) (sleazy-call/fdes fd/port (lambda (fd) fd))]
                     [else (error 'make-control-tty "Expected port or fd" fd/port)])])
-          (posix-call make-control-tty (c-ioctl fd #x540E 0))))))
+          (posix-call make-control-tty (c-ioctl fd TIOCSCTTY 0))))))
 
   ;; ======================================================================
   ;; Process Group

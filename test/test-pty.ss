@@ -24,11 +24,10 @@
       (close master)
       result)))
 
-(test-assert "open-pty slave name starts with /dev/pts/"
+(test-assert "open-pty slave name starts with /dev/"
   (let-values ([(master slave-name) (open-pty)])
-    (let ([result (let ([len (string-length slave-name)])
-                    (and (>= len 9)
-                         (string=? "/dev/pts/" (substring slave-name 0 9))))])
+    (let ([result (and (>= (string-length slave-name) 5)
+                       (string=? "/dev/" (substring slave-name 0 5)))])
       (close master)
       result)))
 
@@ -193,11 +192,11 @@
           (close m2)
           result)))))
 
-(test-assert "make-pty-generator slave names start with /dev/pts/"
+(test-assert "make-pty-generator slave names start with /dev/"
   (let ([gen (make-pty-generator)])
     (let-values ([(master slave-name) (gen)])
-      (let ([result (and (>= (string-length slave-name) 9)
-                         (string=? "/dev/pts/" (substring slave-name 0 9)))])
+      (let ([result (and (>= (string-length slave-name) 5)
+                         (string=? "/dev/" (substring slave-name 0 5)))])
         (close master)
         result))))
 

@@ -26,6 +26,7 @@
 #include <grp.h>
 #include <spawn.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 #define EMIT(name, val) printf("  (define %s %d)\n", name, (int)(val))
 #define EMIT_OFFSET(name, type, field) \
@@ -114,6 +115,9 @@ int main(void) {
 
     /* fcntl */
     printf("    PLAT-F-GETFD PLAT-F-SETFD PLAT-FD-CLOEXEC PLAT-F-GETFL PLAT-F-SETFL\n");
+
+    /* ioctl */
+    printf("    PLAT-TIOCSCTTY\n");
 
     /* FNM flags */
     printf("    PLAT-FNM-NOESCAPE PLAT-FNM-PATHNAME PLAT-FNM-PERIOD\n");
@@ -358,6 +362,10 @@ int main(void) {
     EMIT("PLAT-FD-CLOEXEC", FD_CLOEXEC);
     EMIT("PLAT-F-GETFL", F_GETFL);
     EMIT("PLAT-F-SETFL", F_SETFL);
+    printf("\n");
+
+    printf("  ;; ioctl\n");
+    EMIT("PLAT-TIOCSCTTY", TIOCSCTTY);
     printf("\n");
 
     printf("  ;; fnmatch flags\n");

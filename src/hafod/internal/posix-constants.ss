@@ -20,6 +20,9 @@
     ;; fcntl constants
     F_GETFD F_SETFD FD_CLOEXEC F_GETFL F_SETFL
 
+    ;; ioctl constants
+    TIOCSCTTY
+
     ;; Seek constants
     SEEK_SET SEEK_CUR SEEK_END
 
@@ -104,6 +107,9 @@
   (define FD_CLOEXEC PLAT-FD-CLOEXEC)
   (define F_GETFL PLAT-F-GETFL)
   (define F_SETFL PLAT-F-SETFL)
+
+  ;; ioctl constants
+  (define TIOCSCTTY PLAT-TIOCSCTTY)
 
   ;; Seek constants
   (define SEEK_SET 0)
