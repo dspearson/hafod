@@ -1,4 +1,4 @@
-.TH HAFOD 1 "March 2026" "hafod 1.0" "User Commands"
+.TH HAFOD 1 "March 2026" "hafod 1.2" "User Commands"
 .SH NAME
 hafod \- Scheme shell (scsh on Chez Scheme)
 .SH SYNOPSIS
@@ -109,6 +109,16 @@ Show a usage summary and exit.
 .TP
 .B \-\-version
 Show the version string and exit.
+.TP
+.B \-\-no\-config
+Skip loading the user configuration file on startup.
+See
+.B CONFIGURATION
+below.
+.TP
+.B \-\-norc
+Alias for
+.BR \-\-no\-config .
 .SH REPL MODE
 When
 .B hafod
@@ -127,9 +137,311 @@ etc.) are available without an explicit
 .B import
 statement.
 .PP
+The REPL provides a rich line editor with syntax highlighting,
+parenthesis matching, and multi-line editing.
+Expressions are submitted when parentheses are balanced; pressing
+Return on an incomplete expression inserts a newline instead.
+Pasted text is inserted literally via bracketed paste support.
+.PP
+Results are pretty-printed at the current terminal width with syntax
+colouring (numbers, strings, booleans, and symbols each have distinct
+colours).
+Errors are displayed in red.
+.PP
+Shell mode is also available in the REPL; see
+.B SHELL MODE
+below.
+.PP
 Any files specified with
 .B \-l
 are loaded before the REPL starts.
+.SH SHELL MODE
+In the interactive REPL,
+.B hafod
+can execute bare commands without wrapping them in
+.BR run .
+If the first token on a line matches an executable on
+.B PATH
+or a built-in command, the input is treated as a shell command.
+.PP
+Shell mode is only active in the interactive REPL; it is not
+available in scripts loaded with
+.B \-s
+or expressions evaluated with
+.BR \-c .
+.SS Classification Rules
+Input is classified as Scheme or shell using the following rules:
+.PP
+Input starting with
+.BR ( ,
+.BR ' ,
+.BR \` ,
+.BR # ,
+.BR , ,
+or
+.B [
+is always treated as Scheme.
+.PP
+If the first token matches a Scheme keyword (such as
+.BR define ,
+.BR lambda ,
+.BR if ,
+.BR let ,
+etc.), it is treated as Scheme regardless of whether an executable
+with the same name exists on PATH.
+.PP
+If the first token matches a PATH executable or a built-in command,
+and is not a Scheme keyword, the input is treated as a shell command.
+.PP
+Ambiguous input (not matching any of the above) defaults to Scheme
+for safety.
+.SS Pipes
+Commands can be piped together:
+.PP
+.nf
+.RS
+> ls \-la | grep "\\.ss$"
+> cat file.txt | sort | uniq
+.RE
+.fi
+.SS Redirections
+Output can be redirected to a file:
+.PP
+.nf
+.RS
+> ls > filelist.txt
+> echo "appended" >> log.txt
+.RE
+.fi
+.PP
+Input can be redirected from a file:
+.PP
+.nf
+.RS
+> sort < unsorted.txt
+.RE
+.fi
+.SS Glob Expansion
+Glob patterns are expanded before execution:
+.PP
+.nf
+.RS
+> ls *.ss
+> wc \-l src/*.ss
+.RE
+.fi
+.SS Environment Variable Interpolation
+Environment variables are interpolated in arguments:
+.PP
+.nf
+.RS
+> echo $HOME
+> echo ${PATH}
+.RE
+.fi
+.SS Builtins
+The following built-in commands are available in shell mode:
+.TP
+.BI cd " [dir]"
+Change the current directory.
+With no argument, changes to the home directory.
+.B cd \-
+returns to the previous directory.
+Updates
+.B PWD
+and
+.B OLDPWD
+environment variables.
+.TP
+.BI pushd " dir"
+Push
+.I dir
+onto the directory stack and change to it.
+.TP
+.B popd
+Pop the top directory from the stack and change to it.
+.TP
+.BI export " VAR" = value
+Set the environment variable
+.I VAR
+to
+.IR value .
+.SH CONFIGURATION
+On startup in interactive mode,
+.B hafod
+loads
+.I ~/.config/hafod/init.ss
+if it exists.
+The config directory follows the XDG Base Directory specification:
+if
+.B XDG_CONFIG_HOME
+is set, the config file is
+.IB $XDG_CONFIG_HOME /hafod/init.ss .
+.PP
+Config files are plain Scheme, evaluated via
+.B load
+in the interaction environment.
+Any definitions or side effects take effect before the first REPL
+prompt is displayed.
+.PP
+If an error occurs while loading the config file,
+.B hafod
+displays the filename and error message, then continues to the REPL
+normally.
+Config errors are never fatal.
+.PP
+To skip config loading entirely, pass
+.B \-\-no\-config
+(or its alias
+.BR \-\-norc )
+on the command line.
+.SS Config API
+.TP
+.BI (set\-prompt! " string" )
+Set the REPL prompt to
+.IR string .
+.TP
+.BI (bind\-key! " key-desc command" )
+Rebind a key in the line editor.
+.I key-desc
+is an Emacs-style key description such as
+.BR \(dqC\-a\(dq ,
+.BR \(dqM\-f\(dq ,
+.BR \(dqC\-x C\-e\(dq ,
+or
+.BR \(dq<return>\(dq .
+.I command
+is a command procedure (e.g.\&
+.BR cmd\-beginning\-of\-line ).
+.SS Modular Config
+Config files can load other files:
+.PP
+.nf
+.RS
+;; ~/.config/hafod/init.ss
+(set\-prompt! "hafod> ")
+(load "~/.config/hafod/keybindings.ss")
+.RE
+.fi
+.SS Example Config
+.PP
+.nf
+.RS
+;; ~/.config/hafod/init.ss
+(set\-prompt! "$ ")
+(bind\-key! "C\-x C\-e" cmd\-open\-below)
+(enable\-paredit!)
+.RE
+.fi
+.SH KEYBINDINGS
+The REPL line editor uses Emacs-style keybindings.
+.SS Movement
+.TP
+.B C\-a
+Move to the beginning of the line.
+.TP
+.B C\-e
+Move to the end of the line.
+.TP
+.B C\-f
+Move forward one character.
+.TP
+.B C\-b
+Move backward one character.
+.TP
+.B M\-f
+Move forward one word.
+.TP
+.B M\-b
+Move backward one word.
+.SS Editing
+.TP
+.B C\-d
+Delete the character under the cursor.
+.TP
+.B C\-k
+Kill from the cursor to the end of the line.
+.TP
+.B C\-y
+Yank (paste) the last killed text.
+.TP
+.B M\-y
+Cycle through the kill ring (after
+.BR C\-y ).
+.TP
+.B C\-w
+Kill the word before the cursor.
+.TP
+.B C\-t
+Transpose the two characters before the cursor.
+.TP
+.B M\-d
+Kill the word after the cursor.
+.SS History
+.TP
+.B C\-p \fRor\fB Up
+Previous history entry.
+.TP
+.B C\-n \fRor\fB Down
+Next history entry.
+.TP
+.B C\-r
+Reverse incremental search.
+Type a substring to search backwards through history.
+Press
+.B C\-r
+again to find older matches.
+Press
+.B Enter
+to accept the current match, or
+.B C\-g
+to cancel.
+.TP
+.I prefix\fB Up
+Type a prefix, then press
+.B Up
+to filter history to entries starting with that prefix.
+.SS Completion
+.TP
+.B Tab
+Complete the symbol at the cursor from the current environment.
+If the cursor is inside a string literal, complete filenames instead.
+When multiple completions exist, a menu is displayed.
+In shell mode, the first token completes against PATH executables
+and filenames.
+.SS Paredit
+Paredit provides structured editing for S-expressions.
+Toggle it with:
+.TP
+.B (toggle\-paredit!)
+Toggle paredit mode on or off.
+.TP
+.B (enable\-paredit!)
+Enable paredit mode.
+.TP
+.B (disable\-paredit!)
+Disable paredit mode.
+.TP
+.B (paredit\-enabled?)
+Return whether paredit mode is currently enabled.
+.PP
+When paredit is enabled, delimiters are auto-paired and the
+following structural editing keybindings are available:
+.TP
+.B C\-M\-f
+Move forward one S-expression.
+.TP
+.B C\-M\-b
+Move backward one S-expression.
+.TP
+.B C\-M\-u
+Move up one S-expression (out of the current list).
+.TP
+.B C\-M\-d
+Move down one S-expression (into the next list).
+.PP
+Additional paredit commands include slurp, barf, splice, wrap,
+and raise.
 .SH META-ARGUMENT PROCESSING
 .B hafod
 supports scsh-style meta-argument processing for shebang scripts.
@@ -174,6 +486,14 @@ Backslash escape sequences are supported in meta-argument lines:
 .B HAFOD_LIB_DIRS
 Additional library search directories, colon-separated.
 These are prepended to the Chez Scheme library search path.
+.TP
+.B XDG_CONFIG_HOME
+If set,
+.B hafod
+loads its configuration file from
+.IB $XDG_CONFIG_HOME /hafod/init.ss
+instead of the default
+.IR ~/.config/hafod/init.ss .
 .SH EXAMPLES
 Simple script with shebang:
 .PP
@@ -225,6 +545,30 @@ Pipeline with run/string in a one-liner:
 .nf
 .RS
 $ hafod -c '(display (run/string (pipe (ls) (grep "\\\\.ss$"))))'
+.RE
+.fi
+.PP
+Shell mode in the REPL:
+.PP
+.nf
+.RS
+$ hafod
+> ls \-la
+> cat README.md | grep hafod
+> ls *.ss > scheme\-files.txt
+> echo $HOME
+> cd /tmp
+.RE
+.fi
+.PP
+Minimal config file
+.RI ( ~/.config/hafod/init.ss ):
+.PP
+.nf
+.RS
+(set\-prompt! "hafod> ")
+(bind\-key! "C\-x C\-e" cmd\-open\-below)
+(enable\-paredit!)
 .RE
 .fi
 .SH SEE ALSO

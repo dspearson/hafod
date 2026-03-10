@@ -3,7 +3,8 @@
         (only (hafod posix) posix-kill posix-getpid SIGINT SIGWINCH)
         (only (hafod internal posix-constants) TIOCGWINSZ)
         (only (hafod environment) getenv setenv)
-        (only (hafod editor editor) read-expression))
+        (only (hafod editor editor) read-expression)
+        (only (hafod editor render) tokenize display-colourised))
 
 (test-begin "interactive")
 
@@ -457,5 +458,72 @@
          [out (open-output-string)]
          [result (read-expression "> " input out)])
     (eof-object? result)))
+
+;; === REPL-OUT-01: tokenize and display-colourised exported from render.ss ===
+
+(test-assert "REPL-OUT-01a: tokenize is a procedure (exported from render.ss)"
+  (procedure? tokenize))
+
+(test-assert "REPL-OUT-01b: display-colourised is a procedure (exported from render.ss)"
+  (procedure? display-colourised))
+
+(test-assert "REPL-OUT-01c: tokenize produces tokens for known input"
+  (let ([tokens (tokenize "(1 \"hello\" #t foo)")])
+    (and (list? tokens)
+         (> (length tokens) 0)
+         ;; Each token is (type start end depth)
+         (for-all (lambda (tok) (and (list? tok) (= (length tok) 4))) tokens))))
+
+(test-assert "REPL-OUT-01d: display-colourised produces ANSI-coloured output"
+  (let* ([text "(1 \"hello\" #t foo)"]
+         [tokens (tokenize text)]
+         [port (open-output-string)])
+    (display-colourised port text tokens -1)
+    (let ([output (get-output-string port)])
+      ;; Output should contain ANSI escape sequences (ESC[)
+      (string-contains output "\x1b;["))))
+
+;; === REPL-OUT-02: pretty-print-colourised in REPL output ===
+
+(test-assert "REPL-OUT-02a: REPL output contains ANSI escapes for coloured output"
+  (let ([output (test-repl-with-input "(list 1 2 3)\n")])
+    ;; Output should contain ANSI colour codes from syntax highlighting
+    (string-contains output "\x1b;[")))
+
+(test-assert "REPL-OUT-02b: REPL output for multi-value contains ANSI escapes"
+  (let ([output (test-repl-with-input "(values 1 2 3)\n")])
+    ;; Each value should be colourised
+    (string-contains output "\x1b;[")))
+
+(test-assert "REPL-OUT-02c: REPL void suppression still works with colourised output"
+  (let ([output (test-repl-with-input "(values)\n")])
+    ;; Void should still produce no output (just the EOF newline)
+    (string=? output "\n")))
+
+;; === REPL-OUT-03: Error display in red ===
+
+(test-assert "REPL-OUT-03a: error output contains red ANSI escape"
+  (let ([output (test-repl-with-input "(error 'test \"boom\")\n(+ 1 2)\n")])
+    ;; Error should be wrapped in red (ESC[31m)
+    (and (string-contains output "\x1b;[31m")
+         (string-contains output "boom"))))
+
+;; === REPL-OUT-04: repl-prompt-string parameter ===
+
+(test-assert "REPL-OUT-04a: repl-prompt-string is a parameter defaulting to \"> \""
+  (string=? (repl-prompt-string) "> "))
+
+(test-assert "REPL-OUT-04b: repl-prompt-string rejects non-strings"
+  (guard (exn [#t #t])
+    (repl-prompt-string 42)
+    #f))
+
+(test-assert "REPL-OUT-04c: repl-prompt-string accepts strings"
+  (begin
+    (let ([old (repl-prompt-string)])
+      (repl-prompt-string "my> ")
+      (let ([val (repl-prompt-string)])
+        (repl-prompt-string old)
+        (string=? val "my> ")))))
 
 (test-end)

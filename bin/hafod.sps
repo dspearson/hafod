@@ -374,8 +374,9 @@
       "Switches:\n"
       "  -e PROC    After loading script, call (PROC args) as entry point\n"
       "  -l FILE    Load FILE before executing main action (repeatable)\n"
-      "  --login    Start as a login shell (loads ~/.hafod_profile)\n"
-      "  --norc     Skip loading RC files (~/.hafodrc, ~/.hafod_profile)\n"
+      "  --login    Start as a login shell\n"
+      "  --no-config  Skip loading config files\n"
+      "  --norc     Alias for --no-config (backward compat)\n"
       "\n"
       "Terminators (at most one):\n"
       "  -s FILE    Load and run FILE as a hafod/scsh script\n"
@@ -388,11 +389,8 @@
       "With no arguments, starts an interactive REPL with (hafod) imported.\n"
       "\n"
       "Startup files (interactive mode only):\n"
-      "  ~/.hafod_profile  Loaded for login shells (before ~/.hafodrc)\n"
-      "  ~/.hafodrc        Loaded for all interactive shells\n"
-      "\n"
-      "Login shell detection: automatic when argv[0] starts with \"-\"\n"
-      "(e.g., when set as login shell in /etc/passwd), or via --login.\n"
+      "  ~/.config/hafod/init.ss  Loaded on interactive startup\n"
+      "                           (or $XDG_CONFIG_HOME/hafod/init.ss)\n"
       "\n"
       "Shebang (meta-arg) usage:\n"
       "  #!/path/to/hafod \\\n"
@@ -402,30 +400,6 @@
 
 (define (show-version)
   (display "hafod 1.1 (scsh on Chez Scheme)\n"))
-
-;; ======================================================================
-;; RC file loading
-;; ======================================================================
-
-;; Load an RC file if it exists. Silently skips if missing.
-;; Errors during loading are reported but do not prevent REPL startup.
-(define (load-rc-file path)
-  (when (file-exists? path)
-    (guard (exn
-             [#t
-              (display (string-append "hafod: error loading " path ": ") (current-error-port))
-              (display-condition exn (current-error-port))
-              (newline (current-error-port))])
-      (load-script-file path))))
-
-;; Load startup files for an interactive session.
-;; Login shells load ~/.hafod_profile then ~/.hafodrc.
-;; Non-login interactive shells load ~/.hafodrc only.
-(define (load-rc-files login?)
-  (let ([home (home-directory)])
-    (when login?
-      (load-rc-file (string-append (file-name-as-directory home) ".hafod_profile")))
-    (load-rc-file (string-append (file-name-as-directory home) ".hafodrc"))))
 
 ;; ======================================================================
 ;; Argument parsing (scsh-compatible)
@@ -440,14 +414,15 @@
                [entry #f]       ;; -e <entry-point>
                [preloads '()]   ;; -l files (in reverse order)
                [login? #f]      ;; --login flag
-               [norc? #f])      ;; --norc flag
+               [no-config? #f]) ;; --no-config flag
       (if (null? args)
           ;; No terminator -- interactive REPL
           (begin
             (set-command-line! '("hafod"))
             (load-preload-files preloads)
             (ensure-hafod-interaction-environment!)
-            (unless norc? (load-rc-files login?))
+            (unless no-config?
+              (load-config-file (hafod-init-file)))
             (interactive-repl))
 
           (let ([arg (car args)]
@@ -458,21 +433,21 @@
                (when (null? rest)
                  (display "hafod: -l requires a filename\n" (current-error-port))
                  (exit 1))
-               (loop (cdr rest) entry (cons (car rest) preloads) login? norc?)]
+               (loop (cdr rest) entry (cons (car rest) preloads) login? no-config?)]
 
               ;; -e ENTRY -- set entry point
               [(string=? arg "-e")
                (when (null? rest)
                  (display "hafod: -e requires a procedure name\n" (current-error-port))
                  (exit 1))
-               (loop (cdr rest) (string->symbol (car rest)) preloads login? norc?)]
+               (loop (cdr rest) (string->symbol (car rest)) preloads login? no-config?)]
 
               ;; --login -- mark as login shell
               [(string=? arg "--login")
-               (loop rest entry preloads #t norc?)]
+               (loop rest entry preloads #t no-config?)]
 
-              ;; --norc -- skip RC file loading
-              [(string=? arg "--norc")
+              ;; --no-config / --norc -- skip config file loading
+              [(or (string=? arg "--no-config") (string=? arg "--norc"))
                (loop rest entry preloads login? #t)]
 
               ;; -s FILE -- script mode (terminating)
@@ -508,7 +483,8 @@
                (set-command-line! (cons "hafod" rest))
                (load-preload-files preloads)
                (ensure-hafod-interaction-environment!)
-               (unless norc? (load-rc-files login?))
+               (unless no-config?
+                 (load-config-file (hafod-init-file)))
                (interactive-repl)]
 
               ;; --help

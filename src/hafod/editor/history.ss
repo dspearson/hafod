@@ -7,7 +7,10 @@
   (export open-history history? history-add! history-close!
           history-prev history-next history-reset-nav!
           history-save-input! history-saved-input
-          history-cursor)
+          history-cursor history-cursor-set!
+          history-entries
+          history-search-backward history-prefix-search-backward
+          string-prefix?)
   (import (chezscheme)
           (hafod editor sqlite3))
 
@@ -153,5 +156,52 @@
       (when db
         (sqlite3-close db)
         (history-db-set! h #f))))
+
+  ;; ======================================================================
+  ;; Search helpers
+  ;; ======================================================================
+
+  ;; Substring search: return #t if needle is found anywhere in haystack.
+  (define (string-contains haystack needle)
+    (let ([hlen (string-length haystack)]
+          [nlen (string-length needle)])
+      (cond
+        [(= nlen 0) #t]
+        [(> nlen hlen) #f]
+        [else
+         (let loop ([i 0])
+           (cond
+             [(> (+ i nlen) hlen) #f]
+             [(string=? needle (substring haystack i (+ i nlen))) #t]
+             [else (loop (+ i 1))]))])))
+
+  ;; Prefix check: return #t if str starts with prefix.
+  (define (string-prefix? prefix str)
+    (let ([plen (string-length prefix)]
+          [slen (string-length str)])
+      (and (<= plen slen)
+           (string=? prefix (substring str 0 plen)))))
+
+  ;; Search backward through history entries for a substring match.
+  ;; h: history object, query: search string, start-idx: index to start from (inclusive).
+  ;; Returns the index of the first matching entry, or #f.
+  (define (history-search-backward h query start-idx)
+    (let ([entries (history-entries h)])
+      (let loop ([i start-idx])
+        (cond
+          [(< i 0) #f]
+          [(string-contains (vector-ref entries i) query) i]
+          [else (loop (- i 1))]))))
+
+  ;; Search backward through history entries for a prefix match.
+  ;; h: history object, prefix: prefix string, start-idx: index to start from (inclusive).
+  ;; Returns the index of the first matching entry, or #f.
+  (define (history-prefix-search-backward h prefix start-idx)
+    (let ([entries (history-entries h)])
+      (let loop ([i start-idx])
+        (cond
+          [(< i 0) #f]
+          [(string-prefix? prefix (vector-ref entries i)) i]
+          [else (loop (- i 1))]))))
 
 ) ; end library

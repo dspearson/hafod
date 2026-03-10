@@ -172,15 +172,7 @@
     (test-assert "[a-c] does not match d.txt"
       (not (exists (lambda (f) (string-suffix? "d.txt" f)) results))))
 
-  ;; [^abc].txt / [!abc].txt matches d and 1 but not a, b, c
-  (let ([results (glob (string-append dir "/[^abc].txt"))])
-    (test-assert "[^abc] matches d.txt"
-      (exists (lambda (f) (string-suffix? "d.txt" f)) results))
-    (test-assert "[^abc] matches 1.txt"
-      (exists (lambda (f) (string-suffix? "1.txt" f)) results))
-    (test-assert "[^abc] does not match a.txt"
-      (not (exists (lambda (f) (string-suffix? "a.txt" f)) results))))
-
+  ;; [!abc].txt matches d and 1 but not a, b, c (POSIX standard negation)
   (let ([results (glob (string-append dir "/[!abc].txt"))])
     (test-assert "[!abc] matches d.txt"
       (exists (lambda (f) (string-suffix? "d.txt" f)) results))

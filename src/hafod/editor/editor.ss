@@ -8,7 +8,16 @@
           editor-insert-keymap editor-normal-keymap
           ;; Exported for testing
           make-editor-state editor-state-gb editor-state-done? editor-state-result
-          editor-state-mode editor-state-mode-set!)
+          editor-state-mode editor-state-mode-set!
+          ;; Completion helpers (exported for testing)
+          word-at-cursor symbol-completions filename-completions
+          longest-common-prefix path-at-cursor
+          ;; Shell-mode completion
+          shell-completions
+          ;; Keymap layers
+          bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
+          ;; Paredit toggle
+          toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
@@ -17,7 +26,8 @@
           (hafod editor keymap)
           (hafod editor render)
           (hafod editor history)
-          (hafod tty))
+          (hafod tty)
+          (only (hafod shell classifier) path-cache scheme-prefix-chars))
 
   ;; ======================================================================
   ;; Raw mode
@@ -39,9 +49,16 @@
                            (bitwise-not ttyin/cr->nl)))
             (set-tty-info:min raw 1)
             (set-tty-info:time raw 0)
-            (set-tty-info/now fd raw)))
+            (set-tty-info/now fd raw))
+          ;; Enable bracketed paste mode
+          (display "\x1b;[?2004h" (console-output-port))
+          (flush-output-port (console-output-port)))
         thunk
-        (lambda () (set-tty-info/now fd saved)))))
+        (lambda ()
+          ;; Disable bracketed paste mode
+          (display "\x1b;[?2004l" (console-output-port))
+          (flush-output-port (console-output-port))
+          (set-tty-info/now fd saved)))))
 
   ;; ======================================================================
   ;; Editor state record
@@ -510,6 +527,25 @@
           ((= i (string-length indent)))
         (gap-buffer-insert! gb (string-ref indent i)))))
 
+  ;; Smart Return: submit balanced, insert newline for unbalanced, no-op for empty.
+  (define (cmd-smart-return es)
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [len (string-length text)])
+      (cond
+        ;; Empty buffer: no-op
+        [(= len 0) (void)]
+        [else
+         (let ([depth (sexp-depth text)]
+               [state (lexer-state-at text len)])
+           (cond
+             ;; Balanced and in normal state: submit
+             [(and (= depth 0) (eq? state 'normal))
+              (cmd-submit es)]
+             ;; Unbalanced or in string/comment: insert newline
+             [else
+              (cmd-insert-newline es)]))])))
+
   ;; Always submit for eval (Enter in normal mode)
   (define (cmd-submit es)
     (let* ([gb (editor-state-gb es)]
@@ -519,22 +555,96 @@
       (editor-state-done?-set! es #t)
       (editor-state-result-set! es text)))
 
-  ;; History: navigate to previous (older) entry
+  ;; History: navigate to previous (older) entry with optional prefix filtering
   (define (cmd-history-prev es)
-    (let ([gb (editor-state-gb es)])
-      ;; Save current input on first upward press
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)])
+      ;; On first upward press, save input and determine if prefix search
       (when (= (history-cursor editor-history) -1)
-        (history-save-input! editor-history (gap-buffer->string gb)))
-      (let ([entry (history-prev editor-history)])
-        (when entry
-          (gap-buffer-set-from-string! gb entry)))))
+        (history-save-input! editor-history text)
+        ;; If buffer has content and cursor > 0, use prefix search
+        (if (and (> (string-length text) 0) (> pos 0))
+            (set! history-prefix (substring text 0 pos))
+            (set! history-prefix #f)))
+      ;; Navigate
+      (if history-prefix
+          ;; Prefix-filtered search
+          (let* ([entries (history-entries editor-history)]
+                 [cur (history-cursor editor-history)]
+                 [start (if (= cur -1) (- (vector-length entries) 1) (- cur 1))]
+                 [idx (history-prefix-search-backward editor-history history-prefix start)])
+            (when idx
+              (history-cursor-set! editor-history idx)
+              (gap-buffer-set-from-string! gb (vector-ref entries idx))))
+          ;; Normal history navigation
+          (let ([entry (history-prev editor-history)])
+            (when entry
+              (gap-buffer-set-from-string! gb entry))))))
 
-  ;; History: navigate to next (newer) entry
+  ;; History: navigate to next (newer) entry with optional prefix filtering
   (define (cmd-history-next es)
     (let* ([gb (editor-state-gb es)]
-           [entry (history-next editor-history)])
-      (when entry
-        (gap-buffer-set-from-string! gb entry))))
+           [cur (history-cursor editor-history)])
+      (if (and history-prefix (not (= cur -1)))
+          ;; Prefix-filtered forward search
+          (let* ([entries (history-entries editor-history)]
+                 [len (vector-length entries)])
+            (let loop ([i (+ cur 1)])
+              (cond
+                [(>= i len)
+                 ;; Past most recent: return to saved input
+                 (history-cursor-set! editor-history -1)
+                 (set! history-prefix #f)
+                 (gap-buffer-set-from-string! gb (history-saved-input editor-history))]
+                [(string-prefix? history-prefix (vector-ref entries i))
+                 (history-cursor-set! editor-history i)
+                 (gap-buffer-set-from-string! gb (vector-ref entries i))]
+                [else (loop (+ i 1))])))
+          ;; Normal history navigation
+          (let ([entry (history-next editor-history)])
+            (when entry
+              (gap-buffer-set-from-string! gb entry))))))
+
+  ;; Reverse incremental search: Ctrl-R
+  (define (cmd-reverse-search es)
+    (let ([gb (editor-state-gb es)])
+      (cond
+        [(not search-active?)
+         ;; Start search: save current buffer, activate
+         (set! search-saved-buffer (gap-buffer->string gb))
+         (set! search-active? #t)
+         (set! search-query "")
+         (set! search-match-idx (- (vector-length (history-entries editor-history)) 1))
+         ;; Perform initial search (empty query matches everything)
+         (void)]
+        [else
+         ;; Already in search: cycle to next older match
+         (when (> search-match-idx 0)
+           (let ([idx (history-search-backward editor-history search-query
+                        (- search-match-idx 1))])
+             (when idx
+               (set! search-match-idx idx)
+               (let ([entry (vector-ref (history-entries editor-history) idx)])
+                 (gap-buffer-set-from-string! gb entry)))))])))
+
+  ;; Exit search mode. If cancel? is #t, restore original buffer.
+  (define (exit-search-mode! es cancel?)
+    (let ([gb (editor-state-gb es)])
+      (when cancel?
+        (gap-buffer-set-from-string! gb search-saved-buffer))
+      (reset-search-state!)))
+
+  ;; Handle a character typed during search mode: append to query, re-search
+  (define (search-self-insert! es ch)
+    (let ([gb (editor-state-gb es)])
+      (set! search-query (string-append search-query (string ch)))
+      (let ([idx (history-search-backward editor-history search-query search-match-idx)])
+        (cond
+          [idx
+           (set! search-match-idx idx)
+           (gap-buffer-set-from-string! gb (vector-ref (history-entries editor-history) idx))]
+          [else (void)]))))  ; no match -- keep current display
 
   ;; Paste after cursor (p)
   (define (cmd-paste-after es)
@@ -666,15 +776,17 @@
            [text (gap-buffer->string gb)]
            [state (if (> len 0) (lexer-state-at text pos) 'normal)])
       (cond
-        ;; Skip-close: typing ) or ] when cursor is at that char
-        [(and (or (char=? ch #\)) (char=? ch #\]))
+        ;; Skip-close: typing ) or ] when cursor is at that char (paredit only)
+        [(and (paredit-enabled?)
+              (or (char=? ch #\)) (char=? ch #\]))
               (eq? state 'normal)
               (< pos len)
               (char=? (gap-buffer-char-at gb pos) ch))
          (gap-buffer-move-cursor! gb 1)]
-        ;; Auto-pair: ( -> (), [ -> []
-        ;; Insert preceding space if needed (e.g. (cd|) + ( → (cd ()))
-        [(and (or (char=? ch #\() (char=? ch #\[))
+        ;; Auto-pair: ( -> (), [ -> [] (paredit only)
+        ;; Insert preceding space if needed (e.g. (cd|) + ( -> (cd ()))
+        [(and (paredit-enabled?)
+              (or (char=? ch #\() (char=? ch #\[))
               (eq? state 'normal))
          (let ([close (if (char=? ch #\() #\) #\])])
            ;; Insert space before if prev char is not space/opener/start-of-input
@@ -687,20 +799,22 @@
            (gap-buffer-insert! gb ch)
            (gap-buffer-insert! gb close)
            (gap-buffer-move-cursor! gb -1))]
-        ;; Double-quote handling
+        ;; Double-quote handling (paredit auto-pair only when enabled)
         [(char=? ch #\")
          (cond
-           ;; In string and next char is ": skip over
-           [(and (eq? state 'in-string)
+           ;; In string and next char is ": skip over (paredit only)
+           [(and (paredit-enabled?)
+                 (eq? state 'in-string)
                  (< pos len)
                  (char=? (gap-buffer-char-at gb pos) #\"))
             (gap-buffer-move-cursor! gb 1)]
-           ;; Not in string: auto-pair ""
-           [(eq? state 'normal)
+           ;; Not in string: auto-pair "" (paredit only)
+           [(and (paredit-enabled?)
+                 (eq? state 'normal))
             (gap-buffer-insert! gb #\")
             (gap-buffer-insert! gb #\")
             (gap-buffer-move-cursor! gb -1)]
-           ;; In string: just insert
+           ;; In string or paredit disabled: just insert
            [else (gap-buffer-insert! gb ch)])]
         ;; Normal insert
         [else (gap-buffer-insert! gb ch)])))
@@ -966,8 +1080,8 @@
   ;; Default keymap
   ;; ======================================================================
 
-  ;; Shared structural and emacs-style bindings applied to both keymaps.
-  (define (bind-common-keys! km)
+  ;; Base emacs-style bindings (movement, kill, yank, history, search, screen).
+  (define (bind-base-keys! km)
     ;; Movement (Ctrl + Emacs)
     (keymap-bind! km (list (make-key-event 'ctrl #\a 0)) cmd-beginning-of-line)
     (keymap-bind! km (list (make-key-event 'ctrl #\e 0)) cmd-end-of-line)
@@ -1000,27 +1114,95 @@
     (keymap-bind! km (list (make-key-event 'ctrl #\p 0)) cmd-history-prev)
     (keymap-bind! km (list (make-key-event 'ctrl #\n 0)) cmd-history-next)
 
-    ;; Screen
-    (keymap-bind! km (list (make-key-event 'ctrl #\l 0)) cmd-clear-screen)
+    ;; Reverse incremental search
+    (keymap-bind! km (list (make-key-event 'ctrl #\r 0)) cmd-reverse-search)
 
-    ;; Structural editing (paredit / smartparens / Doom Emacs)
-    (keymap-bind! km (list (make-key-event 'ctrl #\f MOD_ALT)) cmd-forward-sexp)
-    (keymap-bind! km (list (make-key-event 'ctrl #\b MOD_ALT)) cmd-backward-sexp)
-    (keymap-bind! km (list (make-key-event 'ctrl #\u MOD_ALT)) cmd-up-list)
-    (keymap-bind! km (list (make-key-event 'ctrl #\d MOD_ALT)) cmd-down-list)
-    (keymap-bind! km (list (make-key-event 'ctrl #\k MOD_ALT)) cmd-kill-sexp)
-    (keymap-bind! km (list (make-key-event 'special 'right MOD_CTRL)) cmd-forward-slurp)
-    (keymap-bind! km (list (make-key-event 'special 'left MOD_CTRL)) cmd-forward-barf)
-    (keymap-bind! km (list (make-key-event 'special 'right (bitwise-ior MOD_CTRL MOD_ALT))) cmd-backward-barf)
-    (keymap-bind! km (list (make-key-event 'special 'left (bitwise-ior MOD_CTRL MOD_ALT))) cmd-backward-slurp)
-    (keymap-bind! km (list (make-key-event 'meta #\) 0)) cmd-forward-slurp)
-    (keymap-bind! km (list (make-key-event 'meta #\} 0)) cmd-forward-barf)
-    (keymap-bind! km (list (make-key-event 'meta #\{ 0)) cmd-backward-barf)
-    (keymap-bind! km (list (make-key-event 'meta #\s 0)) cmd-splice-sexp)
-    (keymap-bind! km (list (make-key-event 'meta #\r 0)) cmd-raise-sexp)
-    (keymap-bind! km (list (make-key-event 'meta #\( 0)) cmd-wrap-round)
-    (keymap-bind! km (list (make-key-event 'meta #\S 0)) cmd-split-sexp)
-    (keymap-bind! km (list (make-key-event 'meta #\J 0)) cmd-join-sexp))
+    ;; Screen
+    (keymap-bind! km (list (make-key-event 'ctrl #\l 0)) cmd-clear-screen))
+
+  ;; Paredit key sequences -- stored for unbind iteration
+  (define paredit-key-sequences
+    (list
+      (list (make-key-event 'ctrl #\f MOD_ALT))
+      (list (make-key-event 'ctrl #\b MOD_ALT))
+      (list (make-key-event 'ctrl #\u MOD_ALT))
+      (list (make-key-event 'ctrl #\d MOD_ALT))
+      (list (make-key-event 'ctrl #\k MOD_ALT))
+      (list (make-key-event 'special 'right MOD_CTRL))
+      (list (make-key-event 'special 'left MOD_CTRL))
+      (list (make-key-event 'special 'right (bitwise-ior MOD_CTRL MOD_ALT)))
+      (list (make-key-event 'special 'left (bitwise-ior MOD_CTRL MOD_ALT)))
+      (list (make-key-event 'meta #\) 0))
+      (list (make-key-event 'meta #\} 0))
+      (list (make-key-event 'meta #\{ 0))
+      (list (make-key-event 'meta #\s 0))
+      (list (make-key-event 'meta #\r 0))
+      (list (make-key-event 'meta #\( 0))
+      (list (make-key-event 'meta #\S 0))
+      (list (make-key-event 'meta #\J 0))))
+
+  ;; Paredit commands corresponding to paredit-key-sequences (same order)
+  (define paredit-commands
+    (list
+      cmd-forward-sexp
+      cmd-backward-sexp
+      cmd-up-list
+      cmd-down-list
+      cmd-kill-sexp
+      cmd-forward-slurp
+      cmd-forward-barf
+      cmd-backward-barf
+      cmd-backward-slurp
+      cmd-forward-slurp
+      cmd-forward-barf
+      cmd-backward-barf
+      cmd-splice-sexp
+      cmd-raise-sexp
+      cmd-wrap-round
+      cmd-split-sexp
+      cmd-join-sexp))
+
+  ;; Structural editing bindings (paredit / smartparens / Doom Emacs).
+  (define (bind-paredit-keys! km)
+    (for-each
+      (lambda (seq cmd) (keymap-bind! km seq cmd))
+      paredit-key-sequences
+      paredit-commands))
+
+  ;; Remove all paredit bindings from a keymap.
+  (define (unbind-paredit-keys! km)
+    (for-each
+      (lambda (seq) (keymap-unbind! km seq))
+      paredit-key-sequences))
+
+  ;; Shared structural and emacs-style bindings applied to both keymaps.
+  ;; Backward-compatible wrapper calling both base and paredit layers.
+  (define (bind-common-keys! km)
+    (bind-base-keys! km)
+    (bind-paredit-keys! km))
+
+  ;; ======================================================================
+  ;; Paredit toggle state
+  ;; ======================================================================
+
+  (define *paredit-enabled* #t)
+
+  (define (paredit-enabled?) *paredit-enabled*)
+
+  (define (enable-paredit!)
+    (unless *paredit-enabled*
+      (bind-paredit-keys! editor-insert-keymap)
+      (bind-paredit-keys! editor-normal-keymap)
+      (set! *paredit-enabled* #t)))
+
+  (define (disable-paredit!)
+    (when *paredit-enabled*
+      (unbind-paredit-keys! editor-insert-keymap)
+      (unbind-paredit-keys! editor-normal-keymap)
+      (set! *paredit-enabled* #f)))
+
+  (define (toggle-paredit!)
+    (if *paredit-enabled* (disable-paredit!) (enable-paredit!)))
 
   ;; Build the insert-mode keymap (emacs bindings + auto-pair self-insert).
   ;; Enter always inserts newline. Escape switches to normal mode.
@@ -1039,8 +1221,8 @@
       ;; Transpose
       (keymap-bind! km (list (make-key-event 'ctrl #\t 0)) cmd-transpose-chars)
 
-      ;; Enter always inserts newline + auto-indent in insert mode
-      (keymap-bind! km (list (make-key-event 'special 'return 0)) cmd-insert-newline)
+      ;; Smart Return: submit balanced, newline for unbalanced, no-op for empty
+      (keymap-bind! km (list (make-key-event 'special 'return 0)) cmd-smart-return)
 
       ;; C-j (LF) submits from insert mode (like readline accept-line)
       (keymap-bind! km (list (make-key-event 'special 'newline 0)) cmd-submit)
@@ -1133,6 +1315,385 @@
   (define editor-history (open-history))
 
   ;; ======================================================================
+  ;; Reverse incremental search state (module-level, one editor at a time)
+  ;; ======================================================================
+
+  (define search-active? #f)
+  (define search-query "")
+  (define search-match-idx -1)
+  (define search-saved-buffer "")
+
+  (define (reset-search-state!)
+    (set! search-active? #f)
+    (set! search-query "")
+    (set! search-match-idx -1)
+    (set! search-saved-buffer ""))
+
+  ;; ======================================================================
+  ;; Prefix-filtered history state
+  ;; ======================================================================
+
+  (define history-prefix #f)  ; #f or string prefix for filtered Up/Down
+
+  ;; ======================================================================
+  ;; Tab completion state (module-level, one editor at a time)
+  ;; ======================================================================
+
+  (define completion-candidates '())   ; list of completion strings
+  (define completion-index -1)         ; selected candidate index (-1 = none)
+  (define completion-start 0)          ; cursor position where prefix starts
+
+  (define (dismiss-completion!)
+    (unless (null? completion-candidates)
+      (set! completion-candidates '())
+      (set! completion-index -1)
+      (set! completion-start 0)))
+
+  ;; ======================================================================
+  ;; Completion helpers
+  ;; ======================================================================
+
+  ;; word-at-cursor: extract partial symbol/token before cursor.
+  ;; Returns (values prefix start-pos).
+  ;; Word boundaries: whitespace, parens, brackets, quotes, semicolons, backtick, comma.
+  (define (word-at-cursor gb)
+    (let* ([pos (gap-buffer-cursor-pos gb)]
+           [text (gap-buffer->string gb)])
+      (let loop ([i (- pos 1)])
+        (cond
+          [(< i 0)
+           (values (substring text 0 pos) 0)]
+          [(let ([ch (string-ref text i)])
+             (or (char-whitespace? ch)
+                 (memv ch '(#\( #\) #\[ #\] #\" #\; #\' #\` #\,))))
+           (values (substring text (+ i 1) pos) (+ i 1))]
+          [else (loop (- i 1))]))))
+
+  ;; path-at-cursor: extract path fragment from inside a string.
+  ;; Scans backward from cursor to opening quote.
+  ;; Returns path string or #f.
+  (define (path-at-cursor gb)
+    (let* ([pos (gap-buffer-cursor-pos gb)]
+           [text (gap-buffer->string gb)])
+      (let loop ([i (- pos 1)])
+        (cond
+          [(< i 0) #f]
+          [(char=? (string-ref text i) #\")
+           (substring text (+ i 1) pos)]
+          [else (loop (- i 1))]))))
+
+  ;; symbol-completions: filter environment-symbols by prefix match.
+  ;; Returns sorted list of matching symbol-name strings.
+  (define (symbol-completions prefix)
+    (let* ([syms (environment-symbols (interaction-environment))]
+           [prefix-len (string-length prefix)]
+           [matches (filter
+                      (lambda (s)
+                        (let ([name (symbol->string s)])
+                          (and (>= (string-length name) prefix-len)
+                               (string=? prefix (substring name 0 prefix-len)))))
+                      syms)]
+           [names (map symbol->string matches)])
+      (list-sort string<? names)))
+
+  ;; filename-completions: list directory entries matching path prefix.
+  ;; Handles ~ expansion to HOME.
+  (define (filename-completions prefix)
+    (let* ([expanded (if (and (> (string-length prefix) 0)
+                              (char=? (string-ref prefix 0) #\~))
+                         (let ([home (or (getenv "HOME") "")])
+                           (string-append home (substring prefix 1 (string-length prefix))))
+                         prefix)]
+           [len (string-length expanded)])
+      ;; Split into directory and basename parts
+      (let* ([last-slash (let loop ([i (- len 1)])
+                           (cond
+                             [(< i 0) #f]
+                             [(char=? (string-ref expanded i) #\/) i]
+                             [else (loop (- i 1))]))]
+             [dir (if last-slash
+                      (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                      ".")]
+             [base-prefix (if last-slash
+                              (substring expanded (+ last-slash 1) len)
+                              expanded)]
+             [base-prefix-len (string-length base-prefix)])
+        (guard (e [#t '()])  ; non-existent dir -> empty list
+          (let* ([entries (directory-list dir)]
+                 [matches (filter
+                            (lambda (entry)
+                              (and (>= (string-length entry) base-prefix-len)
+                                   (string=? base-prefix (substring entry 0 base-prefix-len))
+                                   ;; Skip . and .. unless prefix starts with .
+                                   (or (> base-prefix-len 0)
+                                       (not (or (string=? entry ".") (string=? entry ".."))))))
+                            entries)]
+                 [full-paths (map (lambda (entry)
+                                    (if last-slash
+                                        (string-append
+                                          (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                                          entry)
+                                        entry))
+                                  matches)])
+            (list-sort string<? full-paths))))))
+
+  ;; shell-completions: filter PATH executable names by prefix match.
+  ;; Returns sorted list of matching executable name strings.
+  (define (shell-completions prefix)
+    (if (string=? prefix "")
+        '()
+        (let* ([prefix-len (string-length prefix)]
+               [ht (path-cache)]
+               [keys (vector->list (hashtable-keys ht))]
+               [matches (filter
+                          (lambda (name)
+                            (and (>= (string-length name) prefix-len)
+                                 (string=? (substring name 0 prefix-len) prefix)))
+                          keys)])
+          (list-sort string<? matches))))
+
+  ;; Detect whether the buffer looks like shell mode (no Scheme prefix characters).
+  (define (shell-mode-buffer? text)
+    (let ([len (string-length text)])
+      (let loop ([i 0])
+        (cond
+          [(>= i len) #t]
+          [(memv (string-ref text i) scheme-prefix-chars) #f]
+          [else (loop (+ i 1))]))))
+
+  ;; Detect whether cursor is on the first token (command position).
+  ;; Returns #t if there is no non-whitespace character before the start of the current word.
+  (define (first-token-position? text word-start)
+    (let loop ([i (- word-start 1)])
+      (cond
+        [(< i 0) #t]
+        [(char-whitespace? (string-ref text i)) (loop (- i 1))]
+        [else #f])))
+
+  ;; longest-common-prefix: find shared prefix across a list of strings.
+  (define (longest-common-prefix strs)
+    (cond
+      [(null? strs) ""]
+      [(null? (cdr strs)) (car strs)]
+      [else
+       (let* ([first (car strs)]
+              [flen (string-length first)])
+         (let loop ([i 0])
+           (cond
+             [(>= i flen) first]
+             [else
+              (let ([ch (string-ref first i)])
+                (if (for-all
+                      (lambda (s)
+                        (and (> (string-length s) i)
+                             (char=? (string-ref s i) ch)))
+                      (cdr strs))
+                    (loop (+ i 1))
+                    (substring first 0 i)))])))]))
+
+  ;; Helper: find opening-quote position scanning backward from pos.
+  (define (find-opening-quote text pos)
+    (let loop ([i (- pos 1)])
+      (cond
+        [(< i 0) 0]
+        [(char=? (string-ref text i) #\") (+ i 1)]
+        [else (loop (- i 1))])))
+
+  ;; Helper: apply completions to editor state.
+  ;; replace-start is cursor position where the prefix starts.
+  ;; candidates is a non-empty list of match strings.
+  (define (apply-completions! gb text pos replace-start candidates)
+    (cond
+      [(null? (cdr candidates))
+       ;; Single match: insert directly
+       (let* ([match (car candidates)]
+              [new-text (string-append
+                          (substring text 0 replace-start)
+                          match
+                          (substring text pos (string-length text)))]
+              [new-pos (+ replace-start (string-length match))])
+         (editor-replace-text! gb new-text new-pos))]
+      [else
+       ;; Multiple matches: insert longest common prefix, populate menu
+       (let* ([lcp (longest-common-prefix candidates)]
+              [new-text (string-append
+                          (substring text 0 replace-start)
+                          lcp
+                          (substring text pos (string-length text)))]
+              [new-pos (+ replace-start (string-length lcp))])
+         (set! completion-candidates candidates)
+         (set! completion-index -1)
+         (set! completion-start replace-start)
+         (editor-replace-text! gb new-text new-pos))]))
+
+  ;; cmd-complete: Tab completion command.
+  (define (cmd-complete es)
+    (let ([gb (editor-state-gb es)])
+      (cond
+        ;; Menu already showing: cycle to next candidate
+        [(not (null? completion-candidates))
+         (let* ([n (length completion-candidates)]
+                [new-idx (modulo (+ completion-index 1) n)]
+                [candidate (list-ref completion-candidates new-idx)]
+                [text (gap-buffer->string gb)]
+                [pos (gap-buffer-cursor-pos gb)]
+                [new-text (string-append
+                            (substring text 0 completion-start)
+                            candidate
+                            (substring text pos (string-length text)))]
+                [new-pos (+ completion-start (string-length candidate))])
+           (set! completion-index new-idx)
+           (editor-replace-text! gb new-text new-pos))]
+
+        ;; Fresh Tab press: determine context and compute candidates
+        [else
+         (let* ([text (gap-buffer->string gb)]
+                [pos (gap-buffer-cursor-pos gb)]
+                [len (string-length text)]
+                [state (lexer-state-at text pos)])
+           (cond
+             ;; In string: filename completion
+             [(eq? state 'in-string)
+              (let ([path (path-at-cursor gb)])
+                (when path
+                  (let ([candidates (filename-completions path)]
+                        [quote-pos (find-opening-quote text pos)])
+                    (unless (null? candidates)
+                      (apply-completions! gb text pos quote-pos candidates)))))]
+             ;; Shell mode: no Scheme prefix chars in buffer
+             [(and (> len 0) (shell-mode-buffer? text))
+              (let-values ([(prefix start) (word-at-cursor gb)])
+                (when (> (string-length prefix) 0)
+                  (let ([candidates
+                         (if (first-token-position? text start)
+                             ;; First token: PATH executables merged with filenames
+                             (let* ([shell-cands (shell-completions prefix)]
+                                    [file-cands (filename-completions prefix)]
+                                    ;; Merge and deduplicate via hashtable
+                                    [ht (make-hashtable string-hash string=?)])
+                               (for-each (lambda (s) (hashtable-set! ht s #t)) shell-cands)
+                               (for-each (lambda (s) (hashtable-set! ht s #t)) file-cands)
+                               (list-sort string<? (vector->list (hashtable-keys ht))))
+                             ;; Subsequent tokens: filenames only
+                             (filename-completions prefix))])
+                    (unless (null? candidates)
+                      (apply-completions! gb text pos start candidates)))))]
+             ;; Normal Scheme context: symbol completion
+             [else
+              (let-values ([(prefix start) (word-at-cursor gb)])
+                (when (> (string-length prefix) 0)
+                  (let ([candidates (symbol-completions prefix)])
+                    (unless (null? candidates)
+                      (apply-completions! gb text pos start candidates)))))]))])))
+
+
+  ;; cmd-complete-prev: Shift-Tab / Up during completion: cycle backward
+  (define (cmd-complete-prev es)
+    (let ([gb (editor-state-gb es)])
+      (when (not (null? completion-candidates))
+        (let* ([n (length completion-candidates)]
+               [new-idx (modulo (- (if (= completion-index -1) 0 completion-index) 1) n)]
+               [candidate (list-ref completion-candidates new-idx)]
+               [text (gap-buffer->string gb)]
+               [len (string-length text)]
+               [pos (gap-buffer-cursor-pos gb)]
+               [new-text (string-append
+                           (substring text 0 completion-start)
+                           candidate
+                           (substring text pos len))]
+               [new-pos (+ completion-start (string-length candidate))])
+          (set! completion-index new-idx)
+          (editor-replace-text! gb new-text new-pos)))))
+
+  ;; cmd-complete-accept: Return during completion: accept and dismiss
+  (define (cmd-complete-accept es)
+    (dismiss-completion!))
+
+  ;; Track number of completion menu lines currently displayed
+  (define completion-menu-lines 0)
+
+  ;; Render edit line + optional completion menu.
+  ;; Returns new prev-lines value for the next render call.
+  (define (render-with-menu port prompt gb prev-lines)
+    ;; render-line with extra lines accounting for previous menu
+    (let ([lines (render-line port prompt gb (+ prev-lines completion-menu-lines))])
+      (if (not (null? completion-candidates))
+          ;; Save cursor, move to end of content, render menu, restore cursor
+          (begin
+            (display "\x1b;7" port)  ; save cursor position
+            ;; Move cursor to end of buffer content (past all lines)
+            (let* ([text (string-append (gap-buffer-before-string gb)
+                                        (gap-buffer-after-string gb))]
+                   [before (gap-buffer-before-string gb)]
+                   [total-lines (let ([len (string-length text)])
+                                  (let lp ([i 0] [n 0])
+                                    (if (>= i len) n
+                                        (lp (+ i 1) (if (char=? (string-ref text i) #\newline)
+                                                        (+ n 1) n)))))]
+                   [cursor-row (let ([blen (string-length before)])
+                                 (let lp ([i 0] [n 0])
+                                   (if (>= i blen) n
+                                       (lp (+ i 1) (if (char=? (string-ref before i) #\newline)
+                                                       (+ n 1) n)))))]
+                   [lines-after (- total-lines cursor-row)])
+              ;; Move down to end of content
+              (when (> lines-after 0)
+                (display "\x1b;[" port)
+                (display lines-after port)
+                (display "B" port))
+              ;; Move to beginning of next line
+              (display "\r" port)
+              ;; Render menu
+              (let ([menu-lines (render-completion-menu port
+                                  completion-candidates
+                                  completion-index)])
+                ;; Restore cursor to edit position
+                (display "\x1b;8" port)
+                (flush-output-port port)
+                (set! completion-menu-lines menu-lines)
+                lines)))
+          (begin
+            (set! completion-menu-lines 0)
+            lines))))
+
+  ;; ======================================================================
+  ;; Bracketed paste handling
+  ;; ======================================================================
+
+  ;; Handle bracketed paste: read key events until paste-end, inserting
+  ;; each character directly into the gap buffer (no auto-pairing, no keymap).
+  (define (handle-bracketed-paste es in-port)
+    (let ([gb (editor-state-gb es)])
+      (let loop ()
+        (let ([evt (read-key-event in-port)])
+          (cond
+            [(eof-object? evt) (void)]  ; unexpected EOF during paste
+            ;; paste-end: stop
+            [(and (eq? (key-event-type evt) 'special)
+                  (eq? (key-event-value evt) 'paste-end))
+             (void)]
+            ;; Regular character: insert literally
+            [(and (eq? (key-event-type evt) 'char)
+                  (char? (key-event-value evt)))
+             (gap-buffer-insert! gb (key-event-value evt))
+             (loop)]
+            ;; Control char that maps to printable (e.g. return -> newline)
+            [(and (eq? (key-event-type evt) 'special)
+                  (eq? (key-event-value evt) 'return))
+             (gap-buffer-insert! gb #\newline)
+             (loop)]
+            [(and (eq? (key-event-type evt) 'special)
+                  (eq? (key-event-value evt) 'newline))
+             (gap-buffer-insert! gb #\newline)
+             (loop)]
+            [(and (eq? (key-event-type evt) 'special)
+                  (eq? (key-event-value evt) 'tab))
+             (gap-buffer-insert! gb #\tab)
+             (loop)]
+            ;; Anything else during paste: skip
+            [else (loop)])))))
+
+  ;; ======================================================================
   ;; read-expression: the main entry point
   ;; ======================================================================
 
@@ -1160,6 +1721,9 @@
               [gb (make-gap-buffer)]
               [es (make-editor-state gb editor-kill-ring prompt out-port 0 #f #f 'insert)]
               [finish! (lambda (result)
+                         (reset-search-state!)
+                         (set! history-prefix #f)
+                         (dismiss-completion!)
                          (display "\n" out-port)
                          (reset-cursor out-port)
                          (flush-output-port out-port)
@@ -1184,43 +1748,134 @@
                              (eof-object)
                              (gap-buffer->string gb)))]
                [else
-                (let ([binding (keymap-lookup km evt)])
+                ;; effective-prompt: search mode overrides the normal prompt
+                (let* ([ep (if search-active?
+                               (string-append "(reverse-i-search)'" search-query "': ")
+                               prompt)]
+                       [compl-active? (not (null? completion-candidates))])
                   (cond
-                    ;; Command procedure found
-                    [(procedure? binding)
-                     (binding es)
+                    ;; ------- Completion menu intercepts (highest priority) -------
+                    [(and compl-active?
+                          (eq? (key-event-type evt) 'special)
+                          (eq? (key-event-value evt) 'backtab))
+                     (cmd-complete-prev es)
+                     (loop (render-with-menu out-port ep gb prev-lines))]
+                    [(and compl-active?
+                          (eq? (key-event-type evt) 'special)
+                          (eq? (key-event-value evt) 'return))
+                     (dismiss-completion!)
+                     (set! completion-menu-lines 0)
+                     (loop (render-with-menu out-port ep gb prev-lines))]
+                    [(and compl-active?
+                          (or (and (eq? (key-event-type evt) 'special)
+                                   (eq? (key-event-value evt) 'escape))
+                              (and (eq? (key-event-type evt) 'ctrl)
+                                   (eqv? (key-event-value evt) #\g))))
+                     (dismiss-completion!)
+                     (set! completion-menu-lines 0)
+                     (loop (render-with-menu out-port ep gb prev-lines))]
+
+                    ;; ------- Bracketed paste -------
+                    [(and (eq? (key-event-type evt) 'special)
+                          (eq? (key-event-value evt) 'paste-start))
+                     (when compl-active? (dismiss-completion!) (set! completion-menu-lines 0))
+                     (when search-active? (exit-search-mode! es #f))
+                     (handle-bracketed-paste es in-port)
+                     (if (editor-state-done? es)
+                         (finish! (editor-state-result es))
+                         (loop (render-with-menu out-port ep gb prev-lines)))]
+
+                    ;; ------- Search mode -------
+                    [search-active?
                      (cond
-                       [(editor-state-done? es)
-                        (finish! (editor-state-result es))]
+                       [(and (eq? (key-event-type evt) 'ctrl)
+                             (eqv? (key-event-value evt) #\r))
+                        (cmd-reverse-search es)
+                        (loop (render-with-menu out-port ep gb prev-lines))]
+                       [(or (and (eq? (key-event-type evt) 'ctrl)
+                                 (eqv? (key-event-value evt) #\g))
+                            (and (eq? (key-event-type evt) 'special)
+                                 (eq? (key-event-value evt) 'escape)))
+                        (exit-search-mode! es #t)
+                        (loop (render-with-menu out-port prompt gb prev-lines))]
+                       [(and (eq? (key-event-type evt) 'char)
+                             (char? (key-event-value evt))
+                             (>= (char->integer (key-event-value evt)) 32))
+                        (search-self-insert! es (key-event-value evt))
+                        (loop (render-with-menu out-port ep gb prev-lines))]
+                       [(and (eq? (key-event-type evt) 'special)
+                             (eq? (key-event-value evt) 'backspace))
+                        (when (> (string-length search-query) 0)
+                          (set! search-query
+                            (substring search-query 0 (- (string-length search-query) 1)))
+                          (let ([entries (history-entries editor-history)])
+                            (let ([idx (history-search-backward editor-history search-query
+                                         (- (vector-length entries) 1))])
+                              (when idx
+                                (set! search-match-idx idx)
+                                (gap-buffer-set-from-string! gb
+                                  (vector-ref entries idx))))))
+                        (loop (render-with-menu out-port ep gb prev-lines))]
                        [else
-                        (loop (render-line out-port prompt gb prev-lines))])]
-                    ;; Prefix keymap: read next event and look up in sub-keymap
-                    [(keymap? binding)
-                     (let ([next-evt (read-key-event in-port)])
-                       (if (eof-object? next-evt)
-                           (loop (render-line out-port prompt gb prev-lines))
-                           (let ([sub-binding (keymap-lookup binding next-evt)])
-                             (when (procedure? sub-binding)
-                               (sub-binding es))
-                             (cond
-                               [(editor-state-done? es)
-                                (finish! (editor-state-result es))]
-                               [else
-                                (loop (render-line out-port prompt gb prev-lines))]))))]
-                    ;; Self-insert for printable chars (insert mode only)
-                    [(and (eq? mode 'insert)
-                          (eq? (key-event-type evt) 'char)
-                          (let ([ch (key-event-value evt)])
-                            (and (char? ch)
-                                 (>= (char->integer ch) 32))))
-                     (cmd-self-insert es (key-event-value evt))
-                     (cond
-                       [(editor-state-done? es)
-                        (finish! (editor-state-result es))]
-                       [else
-                        (loop (render-line out-port prompt gb prev-lines))])]
-                    ;; Unbound key: ignore
+                        (exit-search-mode! es #f)
+                        (let ([binding (keymap-lookup km evt)])
+                          (cond
+                            [(procedure? binding)
+                             (binding es)
+                             (if (editor-state-done? es)
+                                 (finish! (editor-state-result es))
+                                 (loop (render-with-menu out-port prompt gb prev-lines)))]
+                            [else
+                             (loop (render-with-menu out-port prompt gb prev-lines))]))])]
+
+                    ;; ------- Normal dispatch -------
                     [else
-                     (loop prev-lines)]))])))))]))
+                     ;; Dismiss completion on non-Tab keys
+                     (when (and compl-active?
+                                (not (and (eq? (key-event-type evt) 'special)
+                                          (eq? (key-event-value evt) 'tab))))
+                       (dismiss-completion!)
+                       (set! completion-menu-lines 0))
+                     (let ([binding (keymap-lookup km evt)])
+                       (cond
+                         [(procedure? binding)
+                          (binding es)
+                          (if (editor-state-done? es)
+                              (finish! (editor-state-result es))
+                              (loop (render-with-menu out-port prompt gb prev-lines)))]
+                         [(keymap? binding)
+                          (let ([next-evt (read-key-event in-port)])
+                            (if (eof-object? next-evt)
+                                (loop (render-with-menu out-port prompt gb prev-lines))
+                                (let ([sub-binding (keymap-lookup binding next-evt)])
+                                  (when (procedure? sub-binding)
+                                    (sub-binding es))
+                                  (if (editor-state-done? es)
+                                      (finish! (editor-state-result es))
+                                      (loop (render-with-menu out-port prompt gb prev-lines))))))]
+                         [(and (eq? mode 'insert)
+                               (eq? (key-event-type evt) 'char)
+                               (let ([ch (key-event-value evt)])
+                                 (and (char? ch)
+                                      (>= (char->integer ch) 32))))
+                          (cmd-self-insert es (key-event-value evt))
+                          (if (editor-state-done? es)
+                              (finish! (editor-state-result es))
+                              (loop (render-with-menu out-port prompt gb prev-lines)))]
+                         [else
+                          (loop prev-lines)]))])
+                ) ; close let*
+              ]   ; close [else of eof/else cond
+              )                          ; close eof/else cond
+            )                            ; close let*
+          )                              ; close let loop
+          )                              ; close let ([initial-lines])
+        )                                ; close let* ([last-nl])
+      ]))                                ; close case-lambda + define
+
+  ;; Bind Tab to completion (must follow cmd-complete definition, placed at end
+  ;; of library so all definitions precede expressions as R6RS requires).
+  (keymap-bind! editor-insert-keymap
+    (list (make-key-event 'special 'tab 0)) cmd-complete)
 
 ) ; end library

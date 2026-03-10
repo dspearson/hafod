@@ -360,10 +360,21 @@
     run-threads threads-start! threads-shutdown! threads-running?
 
     ;; === (hafod interactive) ===
-    interactive-repl eval-script repl-prompt-hook repl-right-prompt-hook repl-pre-eval-hook repl-post-eval-hook
+    interactive-repl eval-script repl-prompt-hook repl-prompt-string repl-right-prompt-hook repl-pre-eval-hook repl-post-eval-hook
     last-status last-duration terminal-width query-terminal-width
     repl-continuation-prompt ansi-visible-length
     background-job-count
+    ;; Shell mode re-exports from interactive
+    rebuild-path-cache! classify-input
+
+    ;; === (hafod shell classifier) ===
+    path-cache scheme-prefix-chars
+
+    ;; === (hafod shell parser) ===
+    parse-shell-command
+
+    ;; === (hafod shell builtins) ===
+    builtin? run-builtin! builtin-names dir-stack
 
     ;; === (hafod editor gap-buffer) ===
     make-gap-buffer gap-buffer-insert! gap-buffer-delete-forward!
@@ -379,7 +390,7 @@
     make-kill-ring kill-ring-push! kill-ring-yank kill-ring-rotate!
 
     ;; === (hafod editor keymap) ===
-    make-keymap keymap? keymap-bind! keymap-lookup keymap-lookup-prefix
+    make-keymap keymap? keymap-bind! keymap-unbind! keymap-lookup keymap-lookup-prefix
 
     ;; === (hafod editor input-decode) ===
     make-key-event key-event? key-event-type key-event-value key-event-mods
@@ -391,7 +402,7 @@
     sexp-depth find-matching-paren
 
     ;; === (hafod editor render) ===
-    render-line flash-matching-paren
+    render-line flash-matching-paren tokenize display-colourised
 
     ;; === (hafod editor sqlite3) ===
     sqlite3-open sqlite3-close sqlite3-exec
@@ -408,6 +419,17 @@
 
     ;; === (hafod editor editor) ===
     read-expression with-raw-mode editor-default-keymap
+    editor-insert-keymap editor-normal-keymap
+    shell-completions
+    bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
+    toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
+
+    ;; === (hafod config) ===
+    xdg-config-home hafod-config-dir hafod-init-file
+    load-config-file
+    set-prompt!
+    bind-key!
+    parse-key-description
 
     ;; === (chezscheme) re-exports for scsh compatibility ===
     error current-error-port
@@ -490,6 +512,9 @@
     (hafod lib-dirs)
     (hafod threads)
     (hafod interactive)
+    (except (hafod shell classifier) classify-input rebuild-path-cache!)
+    (hafod shell parser)
+    (hafod shell builtins)
     (hafod editor gap-buffer)
     (hafod editor kill-ring)
     (hafod editor keymap)
@@ -498,7 +523,8 @@
     (hafod editor render)
     (hafod editor sqlite3)
     (hafod editor history)
-    (hafod editor editor))
+    (hafod editor editor)
+    (hafod config))
 
   ;; No body needed -- this library is a pure re-export aggregator.
   ;; Body definitions live in sub-libraries to avoid import conflicts.

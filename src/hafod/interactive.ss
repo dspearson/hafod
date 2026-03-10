@@ -8,6 +8,7 @@
     interactive-repl
     eval-script
     repl-prompt-hook
+    repl-prompt-string
     repl-right-prompt-hook
     repl-pre-eval-hook
     repl-post-eval-hook
@@ -17,7 +18,10 @@
     query-terminal-width
     repl-continuation-prompt
     ansi-visible-length
-    background-job-count)
+    background-job-count
+    ;; Shell mode re-exports (for config access)
+    rebuild-path-cache!
+    classify-input)
 
   (import (except (chezscheme) getenv)
           (only (hafod posix) status:exit-val SIGWINCH)
@@ -25,16 +29,29 @@
           (only (hafod environment) getenv setenv)
           (only (hafod procobj) background-job-count)
           (only (hafod editor editor) read-expression with-raw-mode)
-          (only (hafod tty) tty?))
+          (only (hafod tty) tty?)
+          (only (hafod editor render) tokenize display-colourised)
+          (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
+          (only (hafod shell parser) parse-shell-command)
+          (only (hafod shell builtins) run-builtin! builtin-names dir-stack))
 
   ;; === Hook parameters ===
 
+  ;; Simple prompt customisation: set this string to change the default prompt.
+  ;; For dynamic prompts, replace repl-prompt-hook instead.
+  (define repl-prompt-string
+    (make-parameter "> "
+      (lambda (v)
+        (unless (string? v)
+          (error 'repl-prompt-string "expected a string" v))
+        v)))
+
   ;; Prompt hook: called before each read. Takes no arguments.
-  ;; Default displays "> " and flushes output.
+  ;; Default displays (repl-prompt-string) and flushes output.
   (define repl-prompt-hook
     (make-parameter
       (lambda ()
-        (display "> " (console-output-port))
+        (display (repl-prompt-string) (console-output-port))
         (flush-output-port (console-output-port)))
       (lambda (v)
         (unless (procedure? v)
@@ -129,6 +146,25 @@
                        (foreign-free buf)
                        (if (> cols 0) cols 80))
                      (try-fd (cdr fds))))]))))))
+
+  ;; === Colourised output ===
+
+  ;; Pretty-print a value with syntax colouring via tokenize + display-colourised.
+  ;; Uses terminal-width for pretty-line-length.
+  (define (pretty-print-colourised value port)
+    (let* ([sp (open-output-string)])
+      (parameterize ([pretty-line-length (terminal-width)])
+        (pretty-print value sp))
+      (let* ([str (get-output-string sp)]
+             ;; Remove trailing newline that pretty-print adds
+             [str (if (and (> (string-length str) 0)
+                           (char=? (string-ref str (- (string-length str) 1)) #\newline))
+                      (substring str 0 (- (string-length str) 1))
+                      str)]
+             [tokens (tokenize str)])
+        ;; Pass cursor-pos = -1 to skip enclosing-paren highlighting
+        (display-colourised port str tokens -1)
+        (newline port))))
 
   ;; === Helpers ===
 
@@ -282,6 +318,9 @@
           ;; Initialize terminal width
           (terminal-width (query-terminal-width))
 
+          ;; Initialize PATH cache for shell-mode classification
+          (rebuild-path-cache!)
+
           ;; Register SIGWINCH handler to update terminal-width dynamically
           (register-signal-handler SIGWINCH
             (lambda (sig)
@@ -329,9 +368,27 @@
                            (display-right-prompt (console-output-port))
                            (let ([line (with-raw-mode 0
                                          (lambda () (read-expression prompt-str)))])
-                             (if (eof-object? line)
-                                 (eof-object)
-                                 (read (open-input-string line)))))
+                           (cond
+                             [(eof-object? line) (eof-object)]
+                             [else
+                              (let ([class (classify-input line)])
+                                (case class
+                                  [(builtin)
+                                   ;; Execute builtin directly, skip eval
+                                   (guard (exn
+                                            [#t (display "\x1b;[31m" (console-error-port))
+                                                (display-condition exn (console-error-port))
+                                                (display "\x1b;[39m" (console-error-port))
+                                                (newline (console-error-port))])
+                                     (run-builtin! line))
+                                   ;; Return (void) so the existing cond path skips display
+                                   (void)]
+                                  [(shell)
+                                   ;; Parse to EPF datum, return for eval
+                                   (parse-shell-command line)]
+                                  [else
+                                   ;; Original path (scheme)
+                                   (read (open-input-string line))]))])))
                          ;; Non-terminal mode: existing behaviour
                          (begin
                            ;; 1. Display right prompt (before left prompt)
@@ -348,6 +405,9 @@
                    ;; EOF: exit cleanly
                    (newline (console-output-port))
                    (void)]
+                  [(eq? form (void))
+                   ;; Builtin already executed, loop without eval
+                   (loop)]
                   [else
                    ;; 3. Pre-eval hook
                    ((repl-pre-eval-hook) form)
@@ -363,7 +423,9 @@
                                (last-duration (elapsed-milliseconds current-t0 t1))
                                (set! current-t0 #f)
                                (last-status 1))
+                             (display "\x1b;[31m" (console-error-port))
                              (display-condition exn (console-error-port))
+                             (display "\x1b;[39m" (console-error-port))
                              (newline (console-error-port))
                              ;; Post-eval hook (failure case)
                              ((repl-post-eval-hook) form (void))
@@ -383,16 +445,16 @@
                             ((repl-post-eval-hook) form (void))]
                            [(and (null? (cdr results)) (eq? (car results) (void)))
                             ((repl-post-eval-hook) form (void))]
-                           ;; Single value: pretty-print it
+                           ;; Single value: pretty-print with syntax colouring
                            [(null? (cdr results))
-                            (pretty-print (car results) (console-output-port))
+                            (pretty-print-colourised (car results) (console-output-port))
                             ((repl-post-eval-hook) form (car results))]
-                           ;; Multiple values: print each
+                           ;; Multiple values: print each with syntax colouring
                            [else
                             (for-each
                               (lambda (v)
                                 (unless (eq? v (void))
-                                  (pretty-print v (console-output-port))))
+                                  (pretty-print-colourised v (console-output-port))))
                               results)
                             ((repl-post-eval-hook) form (car results))])
                          (loop))))])))))))

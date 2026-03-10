@@ -9,7 +9,7 @@
           read-key-event
           char-display-width string-display-width
           MOD_SHIFT MOD_ALT MOD_CTRL)
-  (import (chezscheme))
+  (import (chezscheme) (hafod internal platform-constants))
 
   ;; Load libc for wcwidth
   (define load-libc (load-shared-object #f))
@@ -70,6 +70,7 @@
       [(#\D) 'left]
       [(#\H) 'home]
       [(#\F) 'end]
+      [(#\Z) 'backtab]   ; Shift-Tab (ESC[Z)
       [else #f]))
 
   ;; Tilde sequences: key-number~ -> key symbol
@@ -80,6 +81,8 @@
       [(4) 'end]
       [(5) 'page-up]
       [(6) 'page-down]
+      [(200) 'paste-start]
+      [(201) 'paste-end]
       [else #f]))
 
   ;; Parse CSI sequence: ESC [ already consumed, read params + final
@@ -163,8 +166,7 @@
 
   ;; Ensure locale is set for wcwidth to handle CJK correctly
   (define c-setlocale (foreign-procedure "setlocale" (int string) string))
-  (define LC_ALL 6)  ; LC_ALL on Linux
-  (define locale-initialized (c-setlocale LC_ALL ""))
+  (define locale-initialized (c-setlocale PLAT-LC-ALL ""))
 
   ;; wcwidth FFI for display width calculation
   (define c-wcwidth (foreign-procedure "wcwidth" (int) int))

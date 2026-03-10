@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/utsname.h>
+#include <locale.h>
 
 #define EMIT(name, val) printf("  (define %s %d)\n", name, (int)(val))
 #define EMIT_OFFSET(name, type, field) \
@@ -133,6 +134,9 @@ int main(void) {
     /* Regex flags */
     printf("    PLAT-REG-EXTENDED PLAT-REG-ICASE PLAT-REG-NOSUB PLAT-REG-NEWLINE\n");
     printf("    PLAT-REG-NOTBOL PLAT-REG-NOTEOL PLAT-REG-NOMATCH\n");
+
+    /* Locale */
+    printf("    PLAT-LC-ALL\n");
 
     printf("  )\n");
     printf("  (import (chezscheme))\n\n");
@@ -402,6 +406,10 @@ int main(void) {
     EMIT("PLAT-REG-NOTBOL", REG_NOTBOL);
     EMIT("PLAT-REG-NOTEOL", REG_NOTEOL);
     EMIT("PLAT-REG-NOMATCH", REG_NOMATCH);
+
+    printf("  ;; Locale\n");
+    EMIT("PLAT-LC-ALL", LC_ALL);
+    printf("\n");
 
     printf("\n) ; end library\n");
     return 0;

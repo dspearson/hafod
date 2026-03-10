@@ -67,7 +67,7 @@ seasonal shell.
 
 ```sh
 make                    # compile all libraries
-make test               # run the full test suite (1,900+ tests)
+make test               # run the full test suite (2,300+ tests)
 ```
 
 If `scheme` is not on your PATH or is named differently:
@@ -134,6 +134,32 @@ is created in the bin directory for compatibility.
 ```sh
 make uninstall          # removes installed files
 ```
+
+## Configuration
+
+hafod loads `~/.config/hafod/init.ss` on startup in interactive mode.
+The config directory follows the XDG Base Directory specification: if
+`XDG_CONFIG_HOME` is set, hafod loads `$XDG_CONFIG_HOME/hafod/init.ss`
+instead.
+
+Config files are plain Scheme, evaluated in the interaction environment.
+Any definitions or side effects take effect before the first REPL prompt:
+
+```scheme
+;; ~/.config/hafod/init.ss
+(set-prompt! "hafod> ")
+(bind-key! "C-x C-e" cmd-open-below)
+(enable-paredit!)
+```
+
+Pass `--no-config` (or `--norc`) to skip config loading.
+
+If the config file contains an error, hafod displays the filename and
+error message, then continues to the REPL normally -- config errors are
+never fatal.
+
+Config can be split across files using `(load "other-file.ss")` from
+within `init.ss`.
 
 ## Usage
 
@@ -203,6 +229,33 @@ Meta-argument shebang (for passing multiple flags):
   (for-each (lambda (a) (display a) (newline)) args))
 ```
 
+### Shell Mode
+
+In the interactive REPL, commands can be typed directly without
+`(run ...)` wrapping.  If the first token matches a PATH executable or
+a built-in command, the input is executed as a shell command:
+
+```
+> ls -la
+> cat file.txt | grep pattern
+> ls *.ss > files.txt
+> echo $HOME
+> cd /tmp
+> pushd /var/log
+> export EDITOR=vim
+```
+
+Input starting with `(`, `'`, `` ` ``, `#`, or `,` is always treated as
+Scheme.  Scheme keywords (such as `define`, `lambda`, `if`) override
+PATH executables with the same name.  Ambiguous input defaults to Scheme
+for safety.
+
+Built-in commands: `cd` (with `cd -` to return to the previous
+directory), `pushd`/`popd` (directory stack), and `export VAR=value`.
+
+Shell mode is only active in the interactive REPL -- it does not apply
+to scripts or `-c` expressions.
+
 ## Library structure
 
 All functionality is available via a single import:
@@ -243,6 +296,10 @@ Individual subsystems can also be imported separately:
 | `(hafod awk)` | AWK macro |
 | `(hafod pty)` | Pseudo-terminal support (open-pty, fork-pty-session) |
 | `(hafod exit-hooks)` | Exit hook registration and execution |
+| `(hafod config)` | Config API (set-prompt!, bind-key!, XDG config loading) |
+| `(hafod shell classifier)` | Shell mode input classifier |
+| `(hafod shell parser)` | Shell command parser (pipes, redirects, globs) |
+| `(hafod shell builtins)` | Shell builtins (cd, pushd, popd, export) |
 | `(hafod dot-locking)` | Dot-file locking (obtain-dot-lock, with-dot-lock) |
 | `(hafod lib-dirs)` | Library directory search |
 | `(scsh)` | Compatibility alias -- re-exports everything from `(hafod)` |
@@ -271,6 +328,12 @@ Internal libraries (not intended for direct use):
 | `(hafod internal sre-compile)` | SRE-to-POSIX regex compiler |
 | `(hafod internal strings)` | String utilities |
 | `(hafod internal tty-constants)` | TTY flag constants |
+| `(hafod internal platform-constants)` | Platform-specific struct offsets and constants |
+| `(hafod editor input-decode)` | Terminal input decoder, wcwidth display width |
+| `(hafod editor keymap)` | Trie-based keymap with composable layers |
+| `(hafod editor render)` | Line editor rendering with syntax colouring |
+| `(hafod editor history)` | SQLite-backed persistent history |
+| `(hafod editor editor)` | Gap-buffer line editor with paredit |
 
 ## Examples
 
@@ -305,8 +368,8 @@ hafod -s examples/01-system-info.ss
 
 ## Tests
 
-The test suite comprises 54 Scheme test suites (1,900+ assertions) and a
-60-test shell-based launcher test:
+The test suite comprises 68 Scheme test suites (2,300+ assertions) and a
+91-test shell-based launcher test:
 
 ```sh
 make test                       # run all Scheme tests
@@ -452,6 +515,17 @@ hafod adds several capabilities beyond the original scsh:
   along a search path
 - **Enhanced launcher** -- `-l` preload files, `-e` entry point,
   `--` REPL mode, `|` preprocessing
+- **Shell mode** -- bare command execution in the REPL, input
+  classifier, pipes, redirects, globs, env vars, builtins (cd,
+  pushd, popd, export)
+- **Interactive editor** -- gap-buffer line editor with syntax
+  colouring, smart enter, bracketed paste, reverse incremental
+  search (C-r), prefix-filtered Up, tab completion with menu
+- **Paredit** -- structural editing with auto-pairing, toggleable
+  at runtime via `toggle-paredit!`
+- **Config system** -- XDG-compliant `~/.config/hafod/init.ss`,
+  `set-prompt!`, `bind-key!` with Emacs-style key descriptions,
+  `--no-config` flag
 
 ### Quick migration checklist
 
@@ -463,7 +537,7 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,028 scsh-compatible symbols are
+5. Most scripts work unchanged -- 1,100+ scsh-compatible symbols are
    exported
 
 ## Performance

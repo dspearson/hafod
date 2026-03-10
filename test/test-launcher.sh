@@ -650,120 +650,98 @@ out=$("$HAFOD" --help 2>&1)
 assert_contains "--help mentions -l" "-l FILE" "$out"
 
 # ======================================================================
-section "RC file loading"
+section "Config System Tests"
 # ======================================================================
 
-# Set HOME to a temp directory for RC tests
-RC_HOME="$TMPDIR/rc-home"
-mkdir -p "$RC_HOME"
-
-# ~/.hafodrc is loaded in interactive mode
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-loaded* #t)
+# XDG config loading (CONF-01): init.ss is loaded on interactive startup
+mkdir -p "$TMPDIR/xdg-config/hafod"
+cat > "$TMPDIR/xdg-config/hafod/init.ss" << 'EOF'
+(set-prompt! "test> ")
 EOF
 
-out=$(echo '(display *rc-loaded*)' | HOME="$RC_HOME" "$HAFOD" 2>&1)
-assert_contains ".hafodrc loaded in interactive mode" "#t" "$out"
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" -- 2>/dev/null)
+assert_contains "XDG config loads init.ss" "test> " "$out"
 
-# ~/.hafodrc side effects are visible
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-marker* "hello-from-rc")
+# Config definitions are visible in REPL
+cat > "$TMPDIR/xdg-config/hafod/init.ss" << 'EOF'
+(define *config-marker* "hello-from-config")
 EOF
 
-out=$(echo '(display *rc-marker*)' | HOME="$RC_HOME" "$HAFOD" 2>&1)
-assert_contains ".hafodrc definitions available in REPL" "hello-from-rc" "$out"
+out=$(echo '(display *config-marker*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" -- 2>/dev/null)
+assert_contains "Config definitions available in REPL" "hello-from-config" "$out"
 
-# --norc skips RC loading
-out=$(echo '(display (top-level-bound? (quote *rc-marker*)))' | HOME="$RC_HOME" "$HAFOD" --norc 2>&1)
-assert_contains "--norc skips .hafodrc" "#f" "$out"
+# Config error handling (CONF-03): errors display filename, REPL continues
+mkdir -p "$TMPDIR/xdg-bad/hafod"
+echo '(this-is-broken' > "$TMPDIR/xdg-bad/hafod/init.ss"
 
-# ~/.hafod_profile loaded only for login shells
-cat > "$RC_HOME/.hafod_profile" << 'EOF'
-(define *profile-loaded* #t)
-EOF
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-loaded* #t)
-EOF
+out=$(echo '(display "ok")' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" -- 2>/dev/null)
+assert_contains "Config error does not prevent startup" "ok" "$out"
 
-# Non-login: profile NOT loaded, rc IS loaded
-out=$(echo '(display (top-level-bound? (quote *profile-loaded*)))' | HOME="$RC_HOME" "$HAFOD" 2>&1)
-assert_contains ".hafod_profile NOT loaded for non-login shell" "#f" "$out"
+STDERR=$(echo '(void)' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" -- 2>&1 >/dev/null || true)
+assert_contains "Config error mentions filename" "init.ss" "$STDERR"
 
-# --login: both profile and rc loaded
-out=$(echo '(display *profile-loaded*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
-assert_contains ".hafod_profile loaded with --login" "#t" "$out"
-
-out=$(echo '(display *rc-loaded*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
-assert_contains ".hafodrc also loaded with --login" "#t" "$out"
-
-# Profile loads before rc (profile can set values rc uses)
-cat > "$RC_HOME/.hafod_profile" << 'EOF'
-(define *load-order* '(profile))
-EOF
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(set! *load-order* (append *load-order* '(rc)))
+# --no-config flag (CONF-04): skips init.ss loading
+mkdir -p "$TMPDIR/xdg-skip/hafod"
+cat > "$TMPDIR/xdg-skip/hafod/init.ss" << 'EOF'
+(set-prompt! "custom> ")
 EOF
 
-out=$(echo '(display *load-order*)' | HOME="$RC_HOME" "$HAFOD" --login 2>&1)
-assert_contains "profile loads before rc" "(profile rc)" "$out"
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --no-config -- 2>/dev/null)
+assert_contains "--no-config skips init.ss" "> " "$out"
 
-# RC error does not prevent REPL startup
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(error 'test "intentional rc error")
+# --norc backward compat alias also skips config
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --norc -- 2>/dev/null)
+assert_contains "--norc alias skips init.ss" "> " "$out"
+
+# Missing config file is silently skipped (no error)
+mkdir -p "$TMPDIR/xdg-empty/hafod"
+out=$(echo '(display "works")' | XDG_CONFIG_HOME="$TMPDIR/xdg-empty" "$HAFOD" -- 2>/dev/null)
+assert_contains "Missing config file silently skipped" "works" "$out"
+
+# Config not loaded for -c mode
+mkdir -p "$TMPDIR/xdg-cmode/hafod"
+cat > "$TMPDIR/xdg-cmode/hafod/init.ss" << 'EOF'
+(define *config-loaded* #t)
 EOF
 
-out=$(echo '(display "repl-ok")' | HOME="$RC_HOME" "$HAFOD" 2>&1)
-assert_contains "RC error does not prevent REPL" "repl-ok" "$out"
+out=$(XDG_CONFIG_HOME="$TMPDIR/xdg-cmode" "$HAFOD" -c '(display (top-level-bound? (quote *config-loaded*)))' 2>&1)
+assert_eq "Config not loaded for -c mode" "#f" "$out"
 
-# Missing RC file is silently skipped (no error)
-rm -f "$RC_HOME/.hafodrc" "$RC_HOME/.hafod_profile"
-out=$(echo '(display "works")' | HOME="$RC_HOME" "$HAFOD" 2>&1)
-assert_contains "missing RC files silently skipped" "works" "$out"
-
-# RC not loaded for -c mode
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-loaded* #t)
+# Config not loaded for -s mode
+cat > "$TMPDIR/config-script-test.ss" << 'EOF'
+(display (top-level-bound? (quote *config-loaded*)))
 EOF
 
-out=$(HOME="$RC_HOME" "$HAFOD" -c '(display (top-level-bound? (quote *rc-loaded*)))' 2>&1)
-assert_eq "RC not loaded for -c mode" "#f" "$out"
+out=$(XDG_CONFIG_HOME="$TMPDIR/xdg-cmode" "$HAFOD" -s "$TMPDIR/config-script-test.ss" 2>&1)
+assert_eq "Config not loaded for -s mode" "#f" "$out"
 
-# RC not loaded for -s mode
-cat > "$TMPDIR/rc-script-test.ss" << 'EOF'
-(display (top-level-bound? (quote *rc-loaded*)))
+# -- terminator also loads config
+mkdir -p "$TMPDIR/xdg-dash/hafod"
+cat > "$TMPDIR/xdg-dash/hafod/init.ss" << 'EOF'
+(define *config-via-dash-dash* #t)
 EOF
 
-out=$(HOME="$RC_HOME" "$HAFOD" -s "$TMPDIR/rc-script-test.ss" 2>&1)
-assert_eq "RC not loaded for -s mode" "#f" "$out"
+out=$(echo '(display *config-via-dash-dash*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-dash" "$HAFOD" -- 2>/dev/null)
+assert_contains "-- terminator loads config" "#t" "$out"
 
-# --norc with --login skips everything
-cat > "$RC_HOME/.hafod_profile" << 'EOF'
-(define *profile-loaded* #t)
-EOF
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-loaded* #t)
-EOF
-
-out=$(echo '(display (top-level-bound? (quote *profile-loaded*)))' | HOME="$RC_HOME" "$HAFOD" --login --norc 2>&1)
-assert_contains "--norc --login skips profile" "#f" "$out"
-
-# -- terminator also loads RC
-rm -f "$RC_HOME/.hafod_profile"
-cat > "$RC_HOME/.hafodrc" << 'EOF'
-(define *rc-via-dash-dash* #t)
-EOF
-
-out=$(echo '(display *rc-via-dash-dash*)' | HOME="$RC_HOME" "$HAFOD" -- 2>&1)
-assert_contains "-- terminator loads RC" "#t" "$out"
-
-# --help mentions --login and --norc
+# --help mentions --no-config and init.ss
 out=$("$HAFOD" --help 2>&1)
 assert_contains "--help mentions --login" "--login" "$out"
+assert_contains "--help mentions --no-config" "--no-config" "$out"
 assert_contains "--help mentions --norc" "--norc" "$out"
-assert_contains "--help mentions .hafodrc" ".hafodrc" "$out"
+assert_contains "--help mentions init.ss" "init.ss" "$out"
 
-# Clean up RC test directory
-rm -rf "$RC_HOME"
+# Multi-file config (CONF-07): init.ss can load other files
+mkdir -p "$TMPDIR/xdg-multi/hafod"
+cat > "$TMPDIR/xdg-multi/hafod/extra.ss" << 'EOF'
+(define *extra-loaded* #t)
+EOF
+cat > "$TMPDIR/xdg-multi/hafod/init.ss" << 'INITEOF'
+(load (string-append (hafod-config-dir) "/extra.ss"))
+INITEOF
+
+out=$(echo '(display *extra-loaded*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-multi" "$HAFOD" -- 2>/dev/null)
+assert_contains "Multi-file config loads without error" "#t" "$out"
 
 # ======================================================================
 section "INTG-02: Piped input fallback (no raw mode)"

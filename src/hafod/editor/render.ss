@@ -3,7 +3,8 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod editor render)
-  (export render-line flash-matching-paren)
+  (export render-line flash-matching-paren tokenize display-colourised
+          render-completion-menu)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
@@ -385,5 +386,52 @@
       (sleep (make-time 'time-duration 120000000 0))
       ;; Re-render to clear the highlight
       (render-line port prompt gb prev-lines)))
+
+  ;; ======================================================================
+  ;; render-completion-menu
+  ;; ======================================================================
+
+  ;; Render a vertical list of completion candidates below the edit line.
+  ;; Highlights the selected candidate with reverse video.
+  ;; Returns the number of menu lines displayed (for cleanup tracking).
+  (define render-completion-menu
+    (case-lambda
+      [(port candidates selected-index)
+       (render-completion-menu port candidates selected-index 10)]
+      [(port candidates selected-index max-items)
+       (let* ([n (length candidates)]
+              [visible-count (min n max-items)]
+              ;; Scroll window to keep selected-index visible
+              [window-start (cond
+                              [(< selected-index 0) 0]  ; no selection yet
+                              [(< selected-index max-items) 0]
+                              [else (- selected-index (- max-items 1))])]
+              [window-end (+ window-start visible-count)]
+              [overflow (> n max-items)])
+         ;; Move to next line and emit menu entries
+         (display "\n" port)
+         (let loop ([i window-start] [lines 0])
+           (cond
+             [(or (>= i window-end) (>= i n))
+              ;; Show overflow indicator if needed
+              (let ([total-lines (if (and overflow (> (- n window-end) 0))
+                                     (begin
+                                       (display "  ... and " port)
+                                       (display (- n window-end) port)
+                                       (display " more\n" port)
+                                       (+ lines 1))
+                                     lines)])
+                total-lines)]
+             [else
+              (let ([candidate (list-ref candidates i)])
+                ;; Highlight selected candidate with reverse video
+                (when (= i selected-index)
+                  (display "\x1b;[7m" port))
+                (display "  " port)
+                (display candidate port)
+                (when (= i selected-index)
+                  (display "\x1b;[0m" port))
+                (display "\n" port)
+                (loop (+ i 1) (+ lines 1)))])))]))
 
 ) ; end library

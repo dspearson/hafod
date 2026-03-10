@@ -4,7 +4,7 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod editor keymap)
-  (export make-keymap keymap? keymap-bind! keymap-lookup keymap-lookup-prefix)
+  (export make-keymap keymap? keymap-bind! keymap-unbind! keymap-lookup keymap-lookup-prefix)
   (import (chezscheme)
           (hafod editor input-decode))
 
@@ -52,6 +52,19 @@
                            (keymap-bindings-set! km (cons (cons key new-km) cleaned)))
                          new-km))])
          (keymap-bind! sub (cdr sequence) command))]))
+
+  ;; Unbind a key sequence from the keymap
+  ;; sequence: list of key-events to remove
+  (define (keymap-unbind! km sequence)
+    (cond
+      [(null? sequence) (void)]
+      [(null? (cdr sequence))
+       (let ([key (car sequence)])
+         (keymap-bindings-set! km (remove-binding (keymap-bindings km) key)))]
+      [else
+       ;; Multi-key: find sub-keymap and recurse
+       (let ([sub (keymap-lookup-prefix km (car sequence))])
+         (when sub (keymap-unbind! sub (cdr sequence))))]))
 
   ;; Lookup a single key-event in the keymap
   ;; Returns: command procedure (leaf), keymap (prefix), or #f (not found)
