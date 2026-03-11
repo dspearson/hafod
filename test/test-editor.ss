@@ -229,9 +229,10 @@
       1 start)))
 
 ;; Test 26: symbol-completions with prefix "string-le" includes "string-length"
+;; Now returns (name . positions) pairs with fuzzy matching.
 (let ([results (symbol-completions "string-le")])
   (test-assert "symbol-completions finds string-length"
-    (member "string-length" results)))
+    (assoc "string-length" results)))
 
 ;; Test 27: symbol-completions with empty prefix returns many symbols
 (let ([results (symbol-completions "")])

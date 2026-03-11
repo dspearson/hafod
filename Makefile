@@ -32,11 +32,19 @@ UNAME_S := $(shell uname -s)
 all: native
 
 # Regenerate platform-specific struct offsets and constants.
-# The committed default covers x86_64-linux (glibc), so this target is
-# only needed when building on a different OS or architecture.
+# Automatically runs on first build or when architecture changes.
+PLATFORM_STAMP = src/hafod/internal/.platform-stamp
+UNAME_M := $(shell uname -m)
+PLATFORM_TAG := $(UNAME_S)-$(UNAME_M)
+
 platform-constants: tools/gen-platform-constants.c
 	$(CC) -o tools/gen-platform-constants tools/gen-platform-constants.c
 	tools/gen-platform-constants > src/hafod/internal/platform-constants.ss
+	echo "$(PLATFORM_TAG)" > $(PLATFORM_STAMP)
+
+# Regenerate if stamp is missing or doesn't match current platform
+$(PLATFORM_STAMP):
+	@$(MAKE) platform-constants
 
 FFI_HELPERS_SRC = tools/hafod-ffi-helpers.c
 ifeq ($(UNAME_S),Darwin)
@@ -51,7 +59,10 @@ ffi-helpers: $(FFI_HELPERS_OUT)
 $(FFI_HELPERS_OUT): $(FFI_HELPERS_SRC)
 	$(CC) $(CFLAGS) $(FFI_HELPERS_FLAGS) -o $@ $< $(LDFLAGS)
 
-compile: ffi-helpers
+compile: ffi-helpers $(PLATFORM_STAMP)
+	@if [ -f "$(PLATFORM_STAMP)" ] && [ "$$(cat $(PLATFORM_STAMP))" != "$(PLATFORM_TAG)" ]; then \
+		$(MAKE) platform-constants; \
+	fi
 	$(SCHEME) $(LIBDIRS) --compile-imported-libraries --script compile-all.ss
 
 compile-wpo: compile
@@ -114,6 +125,7 @@ clean:
 	rm -rf lib/
 	rm -f bin/hafod.so bin/hafod.wpo bin/hafod-native bin/hafod-standalone
 	rm -f tools/gen-platform-constants
+	rm -f src/hafod/internal/.platform-stamp
 	rm -f src/hafod-ffi-helpers.so src/hafod-ffi-helpers.dylib
 
 install:
@@ -135,7 +147,9 @@ install:
 	elif [ -f bin/hafod-standalone ]; then \
 		install -m 755 bin/hafod-standalone $(DESTDIR)$(BINDIR)/hafod; \
 	else \
-		sed 's|HAFOD_ROOT="$$(cd "$$BINDIR/.." \&\& pwd)"|HAFOD_ROOT="$(LIBDIR)"|' \
+		sed -e 's|HAFOD_ROOT="$$(cd "$$BINDIR/.." \&\& pwd)"|HAFOD_ROOT="$(LIBDIR)"|' \
+		    -e 's|"$$BINDIR/hafod.so"|"$(LIBDIR)/hafod.so"|' \
+		    -e 's|"$$BINDIR/hafod.sps"|"$(LIBDIR)/hafod.sps"|' \
 			bin/hafod > $(DESTDIR)$(BINDIR)/hafod; \
 		chmod +x $(DESTDIR)$(BINDIR)/hafod; \
 	fi

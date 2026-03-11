@@ -151,6 +151,131 @@
   (let ([form (parse-shell-command "ls -la")])
     (string? (cadadr form))))
 
+;; === && (and-if) ===
+
+(test-equal "&& simple"
+  '(let ([_s (run (ls))]) (if (zero? _s) (run (echo "done")) _s))
+  (parse-shell-command "ls && echo done"))
+
+(test-equal "&& with args"
+  '(let ([_s (run (mkdir "-p" "foo"))]) (if (zero? _s) (run (touch "foo/bar")) _s))
+  (parse-shell-command "mkdir -p foo && touch foo/bar"))
+
+(test-equal "&& triple chain"
+  (let* ([inner '(let ([_s (run (a))]) (if (zero? _s) (run (b)) _s))]
+         [outer `(let ([_s ,inner]) (if (zero? _s) (run (c)) _s))])
+    outer)
+  (parse-shell-command "a && b && c"))
+
+;; === || (or-if) ===
+
+(test-equal "|| simple"
+  '(let ([_s (run (ls))]) (if (zero? _s) _s (run (echo "fail"))))
+  (parse-shell-command "ls || echo fail"))
+
+(test-equal "|| triple chain"
+  (let* ([inner '(let ([_s (run (a))]) (if (zero? _s) _s (run (b))))]
+         [outer `(let ([_s ,inner]) (if (zero? _s) _s (run (c))))])
+    outer)
+  (parse-shell-command "a || b || c"))
+
+;; === mixed && and || ===
+
+(test-equal "&& then ||"
+  (let* ([inner '(let ([_s (run (a))]) (if (zero? _s) (run (b)) _s))]
+         [outer `(let ([_s ,inner]) (if (zero? _s) _s (run (c))))])
+    outer)
+  (parse-shell-command "a && b || c"))
+
+;; === ; (semicolon) ===
+
+(test-equal "; simple"
+  '(begin (run (ls)) (run (echo "done")))
+  (parse-shell-command "ls ; echo done"))
+
+(test-equal "; triple"
+  '(begin (run (a)) (run (b)) (run (c)))
+  (parse-shell-command "a ; b ; c"))
+
+(test-equal "; trailing is ok"
+  '(run (ls))
+  (parse-shell-command "ls ;"))
+
+;; === & (background) ===
+
+(test-equal "& simple"
+  '(job-bg! "sleep 10" (fork (lambda () (set-process-group 0 0) (run (sleep "10")))))
+  (parse-shell-command "sleep 10 &"))
+
+(test-equal "; and &"
+  '(begin (job-bg! "sleep 10" (fork (lambda () (set-process-group 0 0) (run (sleep "10"))))) (run (echo "started")))
+  (parse-shell-command "sleep 10 & echo started"))
+
+;; === && with pipe ===
+
+(test-equal "&& with pipeline"
+  '(let ([_s (run (pipe (ls) (grep "foo")))]) (if (zero? _s) (run (echo "found")) _s))
+  (parse-shell-command "ls | grep foo && echo found"))
+
+;; === && with redirect ===
+
+(test-equal "&& with redirect"
+  '(let ([_s (run (ls) (> "out.txt"))]) (if (zero? _s) (run (echo "done")) _s))
+  (parse-shell-command "ls > out.txt && echo done"))
+
+;; === & with && ===
+
+(test-equal "background and-or chain"
+  '(job-bg! "a &&  b" (fork (lambda () (set-process-group 0 0) (let ([_s (run (a))]) (if (zero? _s) (run (b)) _s)))))
+  (parse-shell-command "a && b &"))
+
+;; === Brace expansion ===
+
+(test-equal "brace comma expansion"
+  '(run (echo "a" "b" "c"))
+  (parse-shell-command "echo {a,b,c}"))
+
+(test-equal "brace with prefix"
+  '(run (echo "file.c" "file.h" "file.o"))
+  (parse-shell-command "echo file.{c,h,o}"))
+
+(test-equal "brace with suffix"
+  '(run (echo "aX" "bX" "cX"))
+  (parse-shell-command "echo {a,b,c}X"))
+
+(test-equal "brace with prefix and suffix"
+  '(run (echo "pre-a-suf" "pre-b-suf"))
+  (parse-shell-command "echo pre-{a,b}-suf"))
+
+(test-equal "brace numeric range"
+  '(run (echo "1" "2" "3" "4" "5"))
+  (parse-shell-command "echo {1..5}"))
+
+(test-equal "brace reverse range"
+  '(run (echo "3" "2" "1"))
+  (parse-shell-command "echo {3..1}"))
+
+(test-equal "brace single item no expansion"
+  '(run (echo "{a}"))
+  (parse-shell-command "echo {a}"))
+
+(test-equal "brace nested"
+  '(run (echo "a" "b" "c"))
+  (parse-shell-command "echo {a,{b,c}}"))
+
+(test-equal "brace cross-product"
+  '(run (echo "ac" "ad" "bc" "bd"))
+  (parse-shell-command "echo {a,b}{c,d}"))
+
+;; Quoted braces should not expand
+(test-equal "single-quoted braces no expansion"
+  '(run (echo "{a,b,c}"))
+  (parse-shell-command "echo '{a,b,c}'"))
+
+(test-equal "double-quoted braces no expansion"
+  '(run (echo "{a,b,c}"))
+  (parse-shell-command "echo \"{a,b,c}\""))
+
 ;; === Edge cases ===
 
 (test-equal "leading/trailing whitespace"

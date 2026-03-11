@@ -4,7 +4,8 @@
 
 (library (hafod editor render)
   (export render-line flash-matching-paren tokenize display-colourised
-          render-completion-menu)
+          render-completion-menu render-completion-menu/highlight
+          render-line/suggestion)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
@@ -55,17 +56,19 @@
   ;; Colour palettes (Doom Emacs inspired)
   ;; ======================================================================
 
-  ;; Rainbow paren colours — doom-moonlight theme, 9 levels
+  ;; Rainbow paren colours — golden-angle hue spacing for maximum adjacent contrast.
+  ;; Each successive level is ~137.5° apart in hue, ensuring no two neighbours
+  ;; are perceptually similar.  Lightness kept high (70-85%) for dark backgrounds.
   (define paren-colours
-    '#((192 153 255)    ; depth 0: magenta  #c099ff
-       (255 153  94)    ; depth 1: orange   #ff995e
-       (255 152 164)    ; depth 2: light-red #ff98a4
-       (180 249 248)    ; depth 3: cyan     #b4f9f8
-       (249 137 211)    ; depth 4: violet   #f989d3
-       (255 199 119)    ; depth 5: yellow   #ffc777
-       (130 170 255)    ; depth 6: blue     #82aaff
-       (119 224 198)    ; depth 7: teal     #77e0c6
-       (134 225 252)))  ; depth 8: dark-cyan #86e1fc
+    '#((255 153  94)    ; depth 0: orange    #ff995e  hue≈24°
+       (130 170 255)    ; depth 1: blue      #82aaff  hue≈222°
+       (195 232 141)    ; depth 2: green     #c3e88d  hue≈87°
+       (249 137 211)    ; depth 3: pink      #f989d3  hue≈320°
+       (180 249 248)    ; depth 4: cyan      #b4f9f8  hue≈179°
+       (255 199 119)    ; depth 5: yellow    #ffc777  hue≈35°
+       (192 153 255)    ; depth 6: purple    #c099ff  hue≈263°
+       (119 224 198)    ; depth 7: teal      #77e0c6  hue≈157°
+       (255 152 164)))  ; depth 8: rose      #ff98a4  hue≈353°
 
   ;; Token colours (doom-moonlight)
   (define string-colour  '(195 232 141))  ; green  #c3e88d
@@ -359,6 +362,46 @@
       (flush-output-port port)
       total-lines))
 
+  ;; render-line/suggestion: like render-line but appends dim ghost text after cursor
+  ;; when cursor is at end-of-buffer.
+  (define (render-line/suggestion port prompt gb prev-lines suggestion)
+    (let* ([before (gap-buffer-before-string gb)]
+           [after  (gap-buffer-after-string gb)]
+           [text (string-append before after)]
+           [cursor-pos (gap-buffer-cursor-pos gb)]
+           [total-lines (count-newlines text)]
+           [prompt-width (ansi-display-width prompt)]
+           [cursor-row (count-newlines before)]
+           [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
+                          (width-after-last-newline before)
+                          1)]
+           [move-up (max total-lines prev-lines)])
+      (when (> move-up 0)
+        (display "\x1b;[" port)
+        (display move-up port)
+        (display "A" port))
+      (display "\r\x1b;[J" port)
+      (display prompt port)
+      (let ([tokens (tokenize text)])
+        (display-colourised port text tokens cursor-pos))
+      ;; Display ghost suggestion if cursor is at end
+      (when (and (= cursor-pos (string-length text))
+                 (> (string-length suggestion) 0))
+        (display "\x1b;[38;5;240m" port)  ; dim grey
+        (display suggestion port)
+        (display "\x1b;[39m" port))
+      ;; Position cursor
+      (let ([lines-after-cursor (- total-lines cursor-row)])
+        (when (> lines-after-cursor 0)
+          (display "\x1b;[" port)
+          (display lines-after-cursor port)
+          (display "A" port)))
+      (display "\x1b;[" port)
+      (display cursor-col port)
+      (display "G" port)
+      (flush-output-port port)
+      total-lines))
+
   ;; ======================================================================
   ;; flash-matching-paren
   ;; ======================================================================
@@ -433,5 +476,108 @@
                   (display "\x1b;[0m" port))
                 (display "\n" port)
                 (loop (+ i 1) (+ lines 1)))])))]))
+
+  ;; ======================================================================
+  ;; render-completion-menu/highlight
+  ;; ======================================================================
+
+  ;; Like render-completion-menu, but accepts (candidate . positions) pairs
+  ;; and highlights the matched characters with bold/underline.
+  ;; Shows n/N match count indicator on the first line.
+  (define render-completion-menu/highlight
+    (case-lambda
+      [(port entries selected-index)
+       (render-completion-menu/highlight port entries selected-index 10)]
+      [(port entries selected-index max-items)
+       (let* ([n (length entries)]
+              [visible-count (min n max-items)]
+              [window-start (cond
+                              [(< selected-index 0) 0]
+                              [(< selected-index max-items) 0]
+                              [else (- selected-index (- max-items 1))])]
+              [window-end (+ window-start visible-count)]
+              [overflow (> n max-items)])
+         (display "\n" port)
+         ;; Match count indicator
+         (display "\x1b;[38;5;240m" port)  ; dim grey
+         (display "  " port)
+         (if (>= selected-index 0)
+             (begin (display (+ selected-index 1) port)
+                    (display "/" port)
+                    (display n port))
+             (begin (display n port)
+                    (display " match" port)
+                    (when (not (= n 1)) (display "es" port))))
+         (display "\x1b;[39m" port)
+         (display "\n" port)
+         (let loop ([i window-start] [lines 1])  ; 1 for the count line
+           (cond
+             [(or (>= i window-end) (>= i n))
+              (let ([total-lines (if (and overflow (> (- n window-end) 0))
+                                     (begin
+                                       (display "  ... and " port)
+                                       (display (- n window-end) port)
+                                       (display " more\n" port)
+                                       (+ lines 1))
+                                     lines)])
+                total-lines)]
+             [else
+              (let* ([entry (list-ref entries i)]
+                     [candidate (car entry)]
+                     ;; Support both (name . positions) and (name positions desc)
+                     [positions (if (and (pair? (cdr entry))
+                                         (pair? (cddr entry))
+                                         (list? (cadr entry)))
+                                    (cadr entry)
+                                    (cdr entry))]
+                     [description (if (and (pair? (cdr entry))
+                                           (pair? (cddr entry))
+                                           (list? (cadr entry)))
+                                      (caddr entry)
+                                      #f)])
+                (when (= i selected-index)
+                  (display "\x1b;[7m" port))
+                (display "  " port)
+                (display-with-highlights port candidate positions)
+                ;; Show description in dim grey after candidate
+                (when (and description (string? description))
+                  (when (not (= i selected-index))
+                    (display "\x1b;[38;5;240m" port))
+                  (display "  " port)
+                  (display description port)
+                  (when (not (= i selected-index))
+                    (display "\x1b;[39m" port)))
+                (when (= i selected-index)
+                  (display "\x1b;[0m" port))
+                (display "\n" port)
+                (loop (+ i 1) (+ lines 1)))])))]))
+
+  ;; Display a string with certain character positions highlighted (bold+underline).
+  (define (display-with-highlights port str positions)
+    (let ([len (string-length str)]
+          [pos-set (make-eq-hashtable)])
+      ;; Build a set of positions for O(1) lookup
+      (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
+      (let loop ([i 0] [in-highlight? #f])
+        (when (< i len)
+          (let ([want-hl? (hashtable-ref pos-set i #f)])
+            (cond
+              [(and want-hl? (not in-highlight?))
+               (display "\x1b;[1;4m" port)  ; bold + underline
+               (display (string-ref str i) port)
+               (loop (+ i 1) #t)]
+              [(and (not want-hl?) in-highlight?)
+               (display "\x1b;[22;24m" port)  ; reset bold + underline
+               (display (string-ref str i) port)
+               (loop (+ i 1) #f)]
+              [else
+               (display (string-ref str i) port)
+               (loop (+ i 1) in-highlight?)]))))
+      ;; Reset if we ended in highlight
+      (when (let loop ([i 0] [last #f])
+              (cond [(>= i len) last]
+                    [(hashtable-ref pos-set i #f) (loop (+ i 1) #t)]
+                    [else (loop (+ i 1) #f)]))
+        (display "\x1b;[22;24m" port))))
 
 ) ; end library

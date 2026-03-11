@@ -28,12 +28,15 @@
           (only (hafod internal posix-constants) TIOCGWINSZ)
           (only (hafod environment) getenv setenv)
           (only (hafod procobj) background-job-count)
-          (only (hafod editor editor) read-expression with-raw-mode)
+          (only (hafod editor editor) read-expression with-raw-mode editor-history-entries)
           (only (hafod tty) tty?)
           (only (hafod editor render) tokenize display-colourised)
           (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
           (only (hafod shell parser) parse-shell-command)
-          (only (hafod shell builtins) run-builtin! builtin-names dir-stack))
+          (only (hafod shell builtins) run-builtin! builtin-names dir-stack)
+          (only (hafod shell jobs) install-job-signals! update-jobs! drain-notifications!)
+          (only (hafod shell history-expand) history-expand)
+          (only (hafod fuzzy) fuzzy-filter))
 
   ;; === Hook parameters ===
 
@@ -286,6 +289,80 @@
           [else 0])
         0))
 
+  ;; === Command timing display ===
+
+  ;; Format milliseconds as human-readable duration.
+  (define (format-duration ms)
+    (cond
+      [(< ms 1000) #f]  ; don't display sub-second
+      [(< ms 60000)
+       (let* ([s (/ ms 1000.0)])
+         (format #f "~,1fs" s))]
+      [(< ms 3600000)
+       (let* ([total-s (quotient ms 1000)]
+              [m (quotient total-s 60)]
+              [s (remainder total-s 60)])
+         (format #f "~am ~as" m s))]
+      [else
+       (let* ([total-s (quotient ms 1000)]
+              [h (quotient total-s 3600)]
+              [m (quotient (remainder total-s 3600) 60)]
+              [s (remainder total-s 60)])
+         (format #f "~ah ~am ~as" h m s))]))
+
+  ;; Display duration to stderr if > 2 seconds.
+  (define (display-command-timing!)
+    (let ([dur (last-duration)])
+      (when (>= dur 2000)
+        (let ([str (format-duration dur)])
+          (when str
+            (display "\x1b;[38;5;240m" (console-error-port))
+            (display str (console-error-port))
+            (display "\x1b;[39m" (console-error-port))
+            (newline (console-error-port)))))))
+
+  ;; === Command-not-found suggestions ===
+
+  ;; Extract first whitespace-delimited token from a string.
+  (define (first-token str)
+    (let ([len (string-length str)])
+      (let skip-ws ([i 0])
+        (cond
+          [(>= i len) ""]
+          [(char-whitespace? (string-ref str i)) (skip-ws (+ i 1))]
+          [else
+           (let collect ([j i])
+             (cond
+               [(or (>= j len) (char-whitespace? (string-ref str j)))
+                (substring str i j)]
+               [else (collect (+ j 1))]))]))))
+
+  ;; Check if a command exists in PATH cache; if not, suggest similar names.
+  ;; Shows up to 3 fuzzy-matched suggestions from the PATH cache.
+  (define (command-not-found-check line)
+    (let* ([cmd (first-token line)]
+           [ht (path-cache)]
+           [keys (vector->list (hashtable-keys ht))])
+      (when (and (> (string-length cmd) 0)
+                 (not (hashtable-ref ht cmd #f)))
+        (let ([suggestions (let ([filtered (fuzzy-filter cmd keys)])
+                             (if (> (length filtered) 3)
+                                 (list (car filtered) (cadr filtered) (caddr filtered))
+                                 filtered))])
+          (display "\x1b;[38;5;240m" (console-error-port))
+          (display cmd (console-error-port))
+          (display ": command not found" (console-error-port))
+          (when (pair? suggestions)
+            (display ". Did you mean: " (console-error-port))
+            (let lp ([rest suggestions] [first? #t])
+              (unless (null? rest)
+                (unless first? (display ", " (console-error-port)))
+                (display (car rest) (console-error-port))
+                (lp (cdr rest) #f)))
+            (display "?" (console-error-port)))
+          (display "\x1b;[39m" (console-error-port))
+          (newline (console-error-port))))))
+
   ;; === REPL state ===
 
   ;; Mutable variable tracking eval start time. #f when not in eval.
@@ -320,6 +397,9 @@
 
           ;; Initialize PATH cache for shell-mode classification
           (rebuild-path-cache!)
+
+          ;; Install job control signal handlers
+          (install-job-signals!)
 
           ;; Register SIGWINCH handler to update terminal-width dynamically
           (register-signal-handler SIGWINCH
@@ -364,6 +444,12 @@
                                                   [current-output-port sp])
                                      ((repl-prompt-hook)))
                                    (get-output-string sp))])
+                           ;; Drain job notifications before prompt
+                           (update-jobs!)
+                           (for-each (lambda (msg)
+                                       (display msg (console-error-port))
+                                       (newline (console-error-port)))
+                                     (drain-notifications!))
                            ;; Display right prompt before starting editor
                            (display-right-prompt (console-output-port))
                            (let ([line (with-raw-mode 0
@@ -371,6 +457,15 @@
                            (cond
                              [(eof-object? line) (eof-object)]
                              [else
+                              ;; History expansion (!! !$ !n !-n !prefix)
+                              (let* ([expanded (history-expand line (editor-history-entries))]
+                                     [line (if (string=? expanded line)
+                                               line
+                                               (begin
+                                                 ;; Print expanded command (bash convention)
+                                                 (display expanded (console-error-port))
+                                                 (newline (console-error-port))
+                                                 expanded))])
                               (let ([class (classify-input line)])
                                 (case class
                                   [(builtin)
@@ -388,7 +483,20 @@
                                    (parse-shell-command line)]
                                   [else
                                    ;; Original path (scheme)
-                                   (read (open-input-string line))]))])))
+                                   ;; Check for command-not-found when input doesn't
+                                   ;; start with Scheme prefix chars
+                                   (let* ([trimmed (let skip ([i 0])
+                                                     (if (and (< i (string-length line))
+                                                              (char-whitespace? (string-ref line i)))
+                                                         (skip (+ i 1))
+                                                         i))]
+                                          [first-ch (and (< trimmed (string-length line))
+                                                         (string-ref line trimmed))])
+                                     (when (and first-ch
+                                                (char-alphabetic? first-ch)
+                                                (not (memv first-ch '(#\( #\' #\` #\# #\, #\[))))
+                                       (command-not-found-check line)))
+                                   (read (open-input-string line))])))])))
                          ;; Non-terminal mode: existing behaviour
                          (begin
                            ;; 1. Display right prompt (before left prompt)
@@ -429,6 +537,7 @@
                              (newline (console-error-port))
                              ;; Post-eval hook (failure case)
                              ((repl-post-eval-hook) form (void))
+                             (display-command-timing!)
                              (loop)])
                      (call-with-values
                        (lambda () (eval form (interaction-environment)))
@@ -457,6 +566,7 @@
                                   (pretty-print-colourised v (console-output-port))))
                               results)
                             ((repl-post-eval-hook) form (car results))])
+                         (display-command-timing!)
                          (loop))))])))))))
         (lambda ()
           ;; Cleanup: decrement SHLVL, never below 0

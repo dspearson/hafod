@@ -17,17 +17,21 @@
           ;; Keymap layers
           bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
           ;; Paredit toggle
-          toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!)
+          toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
+          ;; History access (for history expansion)
+          editor-history-entries)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
           (hafod editor sexp-tracker)
           (hafod editor input-decode)
           (hafod editor keymap)
-          (hafod editor render)
+          (hafod editor render)  ;; render-line, render-line/suggestion, etc.
           (hafod editor history)
+          (hafod fuzzy)
           (hafod tty)
-          (only (hafod shell classifier) path-cache scheme-prefix-chars))
+          (only (hafod shell classifier) path-cache scheme-prefix-chars)
+          (only (hafod shell completers) lookup-completer))
 
   ;; ======================================================================
   ;; Raw mode
@@ -218,11 +222,18 @@
                  (gap-buffer-move-cursor! gb (- del-idx pos))
                  (gap-buffer-delete-forward! gb))))])))
 
+  ;; Delete forward without EOF — for normal-mode x/Delete where empty buffer is a no-op.
+  (define (cmd-delete-char-no-eof es)
+    (let ([len (gap-buffer-length (editor-state-gb es))])
+      (unless (= len 0)
+        (cmd-delete-char es))))
+
   ;; Delete forward (C-d / Delete key) — structural: splices non-empty delimiters.
   (define (cmd-delete-char es)
     (let* ([gb (editor-state-gb es)]
            [pos (gap-buffer-cursor-pos gb)]
-           [len (gap-buffer-length gb)])
+           [len (gap-buffer-length gb)]
+           [_ (when (and (> len 0) (< pos len)) (editor-snapshot! gb))])
       (cond
         [(= len 0)
          (editor-state-done?-set! es #t)
@@ -263,6 +274,7 @@
            [pos (gap-buffer-cursor-pos gb)]
            [len (gap-buffer-length gb)])
       (when (> pos 0)
+        (editor-snapshot! gb)
         (let* ([text (gap-buffer->string gb)]
                [prev-ch (string-ref text (- pos 1))]
                [next-ch (and (< pos len) (string-ref text pos))]
@@ -300,6 +312,7 @@
   ;; (not including it). If at top level, kill to end of buffer.
   (define (cmd-kill-line es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [pos (gap-buffer-cursor-pos gb)]
            [text (gap-buffer->string gb)]
@@ -327,6 +340,7 @@
 
   (define (cmd-kill-word es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [pos (gap-buffer-cursor-pos gb)]
            [text (gap-buffer->string gb)]
@@ -341,6 +355,7 @@
 
   (define (cmd-backward-kill-word es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [pos (gap-buffer-cursor-pos gb)]
            [text (gap-buffer->string gb)]
@@ -358,6 +373,7 @@
 
   (define (cmd-kill-whole-line es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [text (gap-buffer->string gb)])
       (when (> (string-length text) 0)
@@ -379,6 +395,7 @@
   ;; Yank commands
   (define (cmd-yank es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [text (kill-ring-yank kr)])
       (when text
@@ -411,6 +428,7 @@
   ;; Transpose
   (define (cmd-transpose-chars es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [pos (gap-buffer-cursor-pos gb)]
            [len (gap-buffer-length gb)])
       (when (and (>= pos 2) (<= pos len))
@@ -771,6 +789,7 @@
   ;; Self-insert with paredit-style auto-pairing and skip-close.
   (define (cmd-self-insert es ch)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot-for-insert! gb ch)]
            [pos (gap-buffer-cursor-pos gb)]
            [len (gap-buffer-length gb)]
            [text (gap-buffer->string gb)]
@@ -844,6 +863,7 @@
   ;; Kill sexp: kill from cursor to end of next sexp
   (define (cmd-kill-sexp es)
     (let* ([gb (editor-state-gb es)]
+           [_ (editor-snapshot! gb)]
            [kr (editor-state-kr es)]
            [pos (gap-buffer-cursor-pos gb)]
            [text (gap-buffer->string gb)]
@@ -1077,6 +1097,118 @@
             (editor-replace-text! gb new-text new-pos))))))
 
   ;; ======================================================================
+  ;; Undo/Redo state
+  ;; ======================================================================
+
+  (define undo-stack '())
+  (define redo-stack '())
+  (define undo-max 100)
+  (define undo-insert-count 0)
+
+  (define (reset-undo-state!)
+    (set! undo-stack '())
+    (set! redo-stack '())
+    (set! undo-insert-count 0))
+
+  (define (undo-push-snapshot! text cursor-pos)
+    (set! undo-stack (cons (cons text cursor-pos)
+                           (if (>= (length undo-stack) undo-max)
+                               (list-head undo-stack (- undo-max 1))
+                               undo-stack)))
+    (set! redo-stack '())
+    (set! undo-insert-count 0))
+
+  (define (editor-snapshot-for-insert! gb ch)
+    (cond
+      [(or (char-whitespace? ch) (>= undo-insert-count 20))
+       (undo-push-snapshot! (gap-buffer->string gb) (gap-buffer-cursor-pos gb))
+       (set! undo-insert-count 1)]
+      [(= undo-insert-count 0)
+       (undo-push-snapshot! (gap-buffer->string gb) (gap-buffer-cursor-pos gb))
+       (set! undo-insert-count 1)]
+      [else (set! undo-insert-count (+ undo-insert-count 1))]))
+
+  (define (editor-snapshot! gb)
+    (undo-push-snapshot! (gap-buffer->string gb) (gap-buffer-cursor-pos gb)))
+
+  (define (cmd-undo es)
+    (let ([gb (editor-state-gb es)])
+      (when (pair? undo-stack)
+        (let ([current (cons (gap-buffer->string gb) (gap-buffer-cursor-pos gb))]
+              [prev (car undo-stack)])
+          (set! redo-stack (cons current redo-stack))
+          (set! undo-stack (cdr undo-stack))
+          (set! undo-insert-count 0)
+          (gap-buffer-set-from-string! gb (car prev))
+          (let ([target-pos (cdr prev)]
+                [len (string-length (car prev))])
+            (gap-buffer-move-cursor! gb (- (min target-pos len) (gap-buffer-cursor-pos gb))))))))
+
+  (define (cmd-redo es)
+    (let ([gb (editor-state-gb es)])
+      (when (pair? redo-stack)
+        (let ([current (cons (gap-buffer->string gb) (gap-buffer-cursor-pos gb))]
+              [next (car redo-stack)])
+          (set! undo-stack (cons current undo-stack))
+          (set! redo-stack (cdr redo-stack))
+          (set! undo-insert-count 0)
+          (gap-buffer-set-from-string! gb (car next))
+          (let ([target-pos (cdr next)]
+                [len (string-length (car next))])
+            (gap-buffer-move-cursor! gb (- (min target-pos len) (gap-buffer-cursor-pos gb))))))))
+
+  ;; ======================================================================
+  ;; Auto-suggestion state (fish-style ghost text)
+  ;; ======================================================================
+
+  (define suggestion-text "")  ; the ghost suffix to display after cursor
+
+  ;; Update suggestion: search history for prefix match of current buffer.
+  ;; Only suggests when cursor is at end of buffer.
+  ;; Note: editor-history is referenced via closure; must be defined before first call.
+  (define (update-suggestion! gb)
+    (let* ([text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [len (string-length text)])
+      (cond
+        [(and (= pos len) (> len 0))
+         (let* ([entries (history-entries editor-history)]
+                [n (vector-length entries)]
+                [idx (history-prefix-search-backward editor-history text (- n 1))])
+           (if idx
+               (let ([entry (vector-ref entries idx)])
+                 (set! suggestion-text (substring entry len (string-length entry))))
+               (set! suggestion-text "")))]
+        [else (set! suggestion-text "")])))
+
+  ;; Accept suggestion: insert ghost text into buffer.
+  (define (cmd-accept-suggestion es)
+    (let ([gb (editor-state-gb es)])
+      (when (> (string-length suggestion-text) 0)
+        (let ([text suggestion-text])
+          (set! suggestion-text "")
+          (do ([i 0 (+ i 1)])
+              ((= i (string-length text)))
+            (gap-buffer-insert! gb (string-ref text i)))))))
+
+  ;; Suggestion-aware movement: accept ghost text if at end of buffer.
+  (define (cmd-forward-char-or-accept es)
+    (let* ([gb (editor-state-gb es)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [len (gap-buffer-length gb)])
+      (if (and (= pos len) (> (string-length suggestion-text) 0))
+          (cmd-accept-suggestion es)
+          (cmd-forward-char es))))
+
+  (define (cmd-end-of-line-or-accept es)
+    (let* ([gb (editor-state-gb es)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [len (gap-buffer-length gb)])
+      (if (and (= pos len) (> (string-length suggestion-text) 0))
+          (cmd-accept-suggestion es)
+          (cmd-end-of-line es))))
+
+  ;; ======================================================================
   ;; Default keymap
   ;; ======================================================================
 
@@ -1090,11 +1222,11 @@
     (keymap-bind! km (list (make-key-event 'meta #\f 0)) cmd-forward-word)
     (keymap-bind! km (list (make-key-event 'meta #\b 0)) cmd-backward-word)
 
-    ;; Arrow keys and Home/End
+    ;; Arrow keys and Home/End (Right/End accept ghost suggestion at EOB)
     (keymap-bind! km (list (make-key-event 'special 'left 0)) cmd-backward-char)
-    (keymap-bind! km (list (make-key-event 'special 'right 0)) cmd-forward-char)
+    (keymap-bind! km (list (make-key-event 'special 'right 0)) cmd-forward-char-or-accept)
     (keymap-bind! km (list (make-key-event 'special 'home 0)) cmd-beginning-of-line)
-    (keymap-bind! km (list (make-key-event 'special 'end 0)) cmd-end-of-line)
+    (keymap-bind! km (list (make-key-event 'special 'end 0)) cmd-end-of-line-or-accept)
     (keymap-bind! km (list (make-key-event 'special 'left MOD_ALT)) cmd-backward-word)
     (keymap-bind! km (list (make-key-event 'special 'right MOD_ALT)) cmd-forward-word)
 
@@ -1118,7 +1250,11 @@
     (keymap-bind! km (list (make-key-event 'ctrl #\r 0)) cmd-reverse-search)
 
     ;; Screen
-    (keymap-bind! km (list (make-key-event 'ctrl #\l 0)) cmd-clear-screen))
+    (keymap-bind! km (list (make-key-event 'ctrl #\l 0)) cmd-clear-screen)
+
+    ;; Undo/Redo
+    (keymap-bind! km (list (make-key-event 'ctrl #\_ 0)) cmd-undo)
+    (keymap-bind! km (list (make-key-event 'meta #\/ 0)) cmd-redo))
 
   ;; Paredit key sequences -- stored for unbind iteration
   (define paredit-key-sequences
@@ -1263,7 +1399,7 @@
       (keymap-bind! km (list (make-key-event 'char #\O 0)) cmd-open-above)
 
       ;; ---- Editing ----
-      (keymap-bind! km (list (make-key-event 'char #\x 0)) cmd-delete-char)
+      (keymap-bind! km (list (make-key-event 'char #\x 0)) cmd-delete-char-no-eof)
       (keymap-bind! km (list (make-key-event 'char #\X 0)) cmd-delete-backward-char)
       (keymap-bind! km (list (make-key-event 'char #\D 0)) cmd-kill-line)
       (keymap-bind! km (list (make-key-event 'char #\C 0))
@@ -1273,7 +1409,7 @@
       (keymap-bind! km (list (make-key-event 'char #\p 0)) cmd-paste-after)
       (keymap-bind! km (list (make-key-event 'char #\P 0)) cmd-paste-before)
       (keymap-bind! km (list (make-key-event 'special 'backspace 0)) cmd-backward-char)
-      (keymap-bind! km (list (make-key-event 'special 'delete 0)) cmd-delete-char)
+      (keymap-bind! km (list (make-key-event 'special 'delete 0)) cmd-delete-char-no-eof)
 
       ;; ---- d prefix (delete operator) ----
       (keymap-bind! km (list (make-key-event 'char #\d 0) (make-key-event 'char #\d 0))
@@ -1314,6 +1450,10 @@
   (define editor-kill-ring (make-kill-ring))
   (define editor-history (open-history))
 
+  ;; Return the history entries vector (for history expansion in interactive.ss).
+  (define (editor-history-entries)
+    (history-entries editor-history))
+
   ;; ======================================================================
   ;; Reverse incremental search state (module-level, one editor at a time)
   ;; ======================================================================
@@ -1340,12 +1480,16 @@
   ;; ======================================================================
 
   (define completion-candidates '())   ; list of completion strings
+  (define completion-positions '())    ; list of match-position lists (parallel to candidates)
+  (define completion-descriptions '()) ; list of description strings or #f (parallel to candidates)
   (define completion-index -1)         ; selected candidate index (-1 = none)
   (define completion-start 0)          ; cursor position where prefix starts
 
   (define (dismiss-completion!)
     (unless (null? completion-candidates)
       (set! completion-candidates '())
+      (set! completion-positions '())
+      (set! completion-descriptions '())
       (set! completion-index -1)
       (set! completion-start 0)))
 
@@ -1382,22 +1526,15 @@
            (substring text (+ i 1) pos)]
           [else (loop (- i 1))]))))
 
-  ;; symbol-completions: filter environment-symbols by prefix match.
-  ;; Returns sorted list of matching symbol-name strings.
+  ;; symbol-completions: fuzzy-match environment-symbols against prefix.
+  ;; Returns list of (name . positions) pairs sorted by fuzzy score.
   (define (symbol-completions prefix)
     (let* ([syms (environment-symbols (interaction-environment))]
-           [prefix-len (string-length prefix)]
-           [matches (filter
-                      (lambda (s)
-                        (let ([name (symbol->string s)])
-                          (and (>= (string-length name) prefix-len)
-                               (string=? prefix (substring name 0 prefix-len)))))
-                      syms)]
-           [names (map symbol->string matches)])
-      (list-sort string<? names)))
+           [names (map symbol->string syms)])
+      (fuzzy-filter/positions prefix names)))
 
-  ;; filename-completions: list directory entries matching path prefix.
-  ;; Handles ~ expansion to HOME.
+  ;; filename-completions: list directory entries fuzzy-matching path basename.
+  ;; Handles ~ expansion to HOME. Returns list of (fullpath . positions) pairs.
   (define (filename-completions prefix)
     (let* ([expanded (if (and (> (string-length prefix) 0)
                               (char=? (string-ref prefix 0) #\~))
@@ -1417,40 +1554,37 @@
              [base-prefix (if last-slash
                               (substring expanded (+ last-slash 1) len)
                               expanded)]
-             [base-prefix-len (string-length base-prefix)])
+             [dir-prefix (if last-slash
+                             (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                             #f)]
+             [dir-prefix-len (if dir-prefix (string-length dir-prefix) 0)])
         (guard (e [#t '()])  ; non-existent dir -> empty list
           (let* ([entries (directory-list dir)]
-                 [matches (filter
+                 [visible (filter
                             (lambda (entry)
-                              (and (>= (string-length entry) base-prefix-len)
-                                   (string=? base-prefix (substring entry 0 base-prefix-len))
-                                   ;; Skip . and .. unless prefix starts with .
-                                   (or (> base-prefix-len 0)
-                                       (not (or (string=? entry ".") (string=? entry ".."))))))
+                              ;; Skip . and .. unless base-prefix starts with .
+                              (or (> (string-length base-prefix) 0)
+                                  (not (or (string=? entry ".") (string=? entry "..")))))
                             entries)]
-                 [full-paths (map (lambda (entry)
-                                    (if last-slash
-                                        (string-append
-                                          (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
-                                          entry)
-                                        entry))
-                                  matches)])
-            (list-sort string<? full-paths))))))
+                 [sorted (fuzzy-filter/positions base-prefix visible)])
+            (map (lambda (pair)
+                   (let ([entry (car pair)]
+                         [positions (cdr pair)])
+                     (if dir-prefix
+                         ;; Shift positions by dir-prefix length for display
+                         (cons (string-append dir-prefix entry)
+                               (map (lambda (p) (+ p dir-prefix-len)) positions))
+                         pair)))
+                 sorted))))))
 
-  ;; shell-completions: filter PATH executable names by prefix match.
-  ;; Returns sorted list of matching executable name strings.
+  ;; shell-completions: fuzzy-match PATH executable names.
+  ;; Returns list of (name . positions) pairs sorted by fuzzy score.
   (define (shell-completions prefix)
     (if (string=? prefix "")
         '()
-        (let* ([prefix-len (string-length prefix)]
-               [ht (path-cache)]
-               [keys (vector->list (hashtable-keys ht))]
-               [matches (filter
-                          (lambda (name)
-                            (and (>= (string-length name) prefix-len)
-                                 (string=? (substring name 0 prefix-len) prefix)))
-                          keys)])
-          (list-sort string<? matches))))
+        (let* ([ht (path-cache)]
+               [keys (vector->list (hashtable-keys ht))])
+          (fuzzy-filter/positions prefix keys))))
 
   ;; Detect whether the buffer looks like shell mode (no Scheme prefix characters).
   (define (shell-mode-buffer? text)
@@ -1460,6 +1594,40 @@
           [(>= i len) #t]
           [(memv (string-ref text i) scheme-prefix-chars) #f]
           [else (loop (+ i 1))]))))
+
+  ;; Extract the first whitespace-delimited token from buffer text.
+  ;; Returns the first token as a string, or "" if empty.
+  (define (first-token text)
+    (let ([len (string-length text)])
+      (let skip ([i 0])
+        (cond
+          [(>= i len) ""]
+          [(char-whitespace? (string-ref text i)) (skip (+ i 1))]
+          [else
+           (let collect ([j i])
+             (cond
+               [(>= j len) (substring text i j)]
+               [(char-whitespace? (string-ref text j)) (substring text i j)]
+               [else (collect (+ j 1))]))]))))
+
+  ;; Extract previous tokens (arguments) from buffer text, excluding the
+  ;; current word being completed. Returns list of tokens between first token
+  ;; and the word at word-start.
+  (define (previous-args text word-start)
+    (let ([len word-start])
+      (let loop ([i 0] [args '()] [in-first? #t])
+        (cond
+          [(>= i len) (reverse args)]
+          [(char-whitespace? (string-ref text i))
+           (loop (+ i 1) args #f)]
+          [else
+           (let collect ([j i])
+             (cond
+               [(or (>= j len) (char-whitespace? (string-ref text j)))
+                (if in-first?
+                    (loop j args #f)  ; skip command name
+                    (loop j (cons (substring text i j) args) #f))]
+               [else (collect (+ j 1))]))]))))
 
   ;; Detect whether cursor is on the first token (command position).
   ;; Returns #t if there is no non-whitespace character before the start of the current word.
@@ -1501,30 +1669,38 @@
 
   ;; Helper: apply completions to editor state.
   ;; replace-start is cursor position where the prefix starts.
-  ;; candidates is a non-empty list of match strings.
-  (define (apply-completions! gb text pos replace-start candidates)
-    (cond
-      [(null? (cdr candidates))
-       ;; Single match: insert directly
-       (let* ([match (car candidates)]
-              [new-text (string-append
-                          (substring text 0 replace-start)
-                          match
-                          (substring text pos (string-length text)))]
-              [new-pos (+ replace-start (string-length match))])
-         (editor-replace-text! gb new-text new-pos))]
-      [else
-       ;; Multiple matches: insert longest common prefix, populate menu
-       (let* ([lcp (longest-common-prefix candidates)]
-              [new-text (string-append
-                          (substring text 0 replace-start)
-                          lcp
-                          (substring text pos (string-length text)))]
-              [new-pos (+ replace-start (string-length lcp))])
-         (set! completion-candidates candidates)
-         (set! completion-index -1)
-         (set! completion-start replace-start)
-         (editor-replace-text! gb new-text new-pos))]))
+  ;; candidates is a list of (name . positions) pairs.
+  ;; Optional descs is a parallel list of description strings or #f.
+  (define apply-completions!
+    (case-lambda
+      [(gb text pos replace-start candidates)
+       (apply-completions! gb text pos replace-start candidates #f)]
+      [(gb text pos replace-start candidates descs)
+       (let ([names (map car candidates)])
+         (cond
+           [(null? (cdr candidates))
+            ;; Single match: insert directly
+            (let* ([match (car names)]
+                   [new-text (string-append
+                               (substring text 0 replace-start)
+                               match
+                               (substring text pos (string-length text)))]
+                   [new-pos (+ replace-start (string-length match))])
+              (editor-replace-text! gb new-text new-pos))]
+           [else
+            ;; Multiple matches: insert longest common prefix, populate menu
+            (let* ([lcp (longest-common-prefix names)]
+                   [new-text (string-append
+                               (substring text 0 replace-start)
+                               lcp
+                               (substring text pos (string-length text)))]
+                   [new-pos (+ replace-start (string-length lcp))])
+              (set! completion-candidates names)
+              (set! completion-positions (map cdr candidates))
+              (set! completion-descriptions (or descs (map (lambda (_) #f) candidates)))
+              (set! completion-index -1)
+              (set! completion-start replace-start)
+              (editor-replace-text! gb new-text new-pos))]))]))
 
   ;; cmd-complete: Tab completion command.
   (define (cmd-complete es)
@@ -1564,20 +1740,43 @@
              [(and (> len 0) (shell-mode-buffer? text))
               (let-values ([(prefix start) (word-at-cursor gb)])
                 (when (> (string-length prefix) 0)
-                  (let ([candidates
-                         (if (first-token-position? text start)
-                             ;; First token: PATH executables merged with filenames
-                             (let* ([shell-cands (shell-completions prefix)]
-                                    [file-cands (filename-completions prefix)]
-                                    ;; Merge and deduplicate via hashtable
-                                    [ht (make-hashtable string-hash string=?)])
-                               (for-each (lambda (s) (hashtable-set! ht s #t)) shell-cands)
-                               (for-each (lambda (s) (hashtable-set! ht s #t)) file-cands)
-                               (list-sort string<? (vector->list (hashtable-keys ht))))
-                             ;; Subsequent tokens: filenames only
-                             (filename-completions prefix))])
-                    (unless (null? candidates)
-                      (apply-completions! gb text pos start candidates)))))]
+                  (if (first-token-position? text start)
+                      ;; First token: PATH executables merged with filenames
+                      (let* ([shell-cands (shell-completions prefix)]
+                             [file-cands (filename-completions prefix)]
+                             [ht (make-hashtable string-hash string=?)]
+                             [all (append shell-cands file-cands)]
+                             [deduped (let lp ([rest all] [acc '()])
+                                       (cond
+                                         [(null? rest) (reverse acc)]
+                                         [(hashtable-ref ht (caar rest) #f)
+                                          (lp (cdr rest) acc)]
+                                         [else
+                                          (hashtable-set! ht (caar rest) #t)
+                                          (lp (cdr rest) (cons (car rest) acc))]))])
+                        (unless (null? deduped)
+                          (apply-completions! gb text pos start deduped)))
+                      ;; Subsequent tokens: check for registered completer
+                      (let* ([cmd (first-token text)]
+                             [completer (lookup-completer cmd)])
+                        (if completer
+                            ;; Registered completer returns (name positions desc) triples
+                            (let* ([ctx (list (cons 'args (previous-args text start)))]
+                                   [results (guard (e [#t '()])
+                                              (completer prefix ctx))])
+                              (if (null? results)
+                                  ;; Fall back to filenames
+                                  (let ([fc (filename-completions prefix)])
+                                    (unless (null? fc)
+                                      (apply-completions! gb text pos start fc)))
+                                  ;; Extract pairs and descriptions from triples
+                                  (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) results)]
+                                        [descs (map caddr results)])
+                                    (apply-completions! gb text pos start pairs descs))))
+                            ;; No completer: filenames
+                            (let ([fc (filename-completions prefix)])
+                              (unless (null? fc)
+                                (apply-completions! gb text pos start fc))))))))]
              ;; Normal Scheme context: symbol completion
              [else
               (let-values ([(prefix start) (word-at-cursor gb)])
@@ -1612,11 +1811,18 @@
   ;; Track number of completion menu lines currently displayed
   (define completion-menu-lines 0)
 
-  ;; Render edit line + optional completion menu.
+  ;; Render edit line + optional completion menu + ghost suggestion.
   ;; Returns new prev-lines value for the next render call.
   (define (render-with-menu port prompt gb prev-lines)
-    ;; render-line with extra lines accounting for previous menu
-    (let ([lines (render-line port prompt gb (+ prev-lines completion-menu-lines))])
+    ;; Update suggestion on every render (cheap: just a prefix search)
+    (when (null? completion-candidates)
+      (update-suggestion! gb))
+    ;; render-line with ghost suggestion and extra lines for previous menu
+    (let ([lines (if (and (null? completion-candidates)
+                          (> (string-length suggestion-text) 0))
+                     (render-line/suggestion port prompt gb
+                       (+ prev-lines completion-menu-lines) suggestion-text)
+                     (render-line port prompt gb (+ prev-lines completion-menu-lines)))])
       (if (not (null? completion-candidates))
           ;; Save cursor, move to end of content, render menu, restore cursor
           (begin
@@ -1644,8 +1850,10 @@
               ;; Move to beginning of next line
               (display "\r" port)
               ;; Render menu
-              (let ([menu-lines (render-completion-menu port
-                                  completion-candidates
+              (let ([menu-lines (render-completion-menu/highlight port
+                                  (if (null? completion-descriptions)
+                                      (map cons completion-candidates completion-positions)
+                                      (map list completion-candidates completion-positions completion-descriptions))
                                   completion-index)])
                 ;; Restore cursor to edit position
                 (display "\x1b;8" port)
@@ -1724,6 +1932,8 @@
                          (reset-search-state!)
                          (set! history-prefix #f)
                          (dismiss-completion!)
+                         (reset-undo-state!)
+                         (set! suggestion-text "")
                          (display "\n" out-port)
                          (reset-cursor out-port)
                          (flush-output-port out-port)

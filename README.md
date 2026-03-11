@@ -67,7 +67,7 @@ seasonal shell.
 
 ```sh
 make                    # compile all libraries
-make test               # run the full test suite (2,300+ tests)
+make test               # run the full test suite (2,500+ tests)
 ```
 
 If `scheme` is not on your PATH or is named differently:
@@ -240,9 +240,16 @@ a built-in command, the input is executed as a shell command:
 > cat file.txt | grep pattern
 > ls *.ss > files.txt
 > echo $HOME
+> mkdir -p foo && touch foo/bar
+> make clean || echo "no Makefile"
+> sleep 10 &
+> jobs
+> fg %1
 > cd /tmp
 > pushd /var/log
 > export EDITOR=vim
+> echo file.{c,h,o}
+> !!
 ```
 
 Input starting with `(`, `'`, `` ` ``, `#`, or `,` is always treated as
@@ -251,7 +258,8 @@ PATH executables with the same name.  Ambiguous input defaults to Scheme
 for safety.
 
 Built-in commands: `cd` (with `cd -` to return to the previous
-directory), `pushd`/`popd` (directory stack), and `export VAR=value`.
+directory), `pushd`/`popd` (directory stack), `export VAR=value`,
+`jobs`, `fg`, and `bg`.
 
 Shell mode is only active in the interactive REPL -- it does not apply
 to scripts or `-c` expressions.
@@ -299,7 +307,11 @@ Individual subsystems can also be imported separately:
 | `(hafod config)` | Config API (set-prompt!, bind-key!, XDG config loading) |
 | `(hafod shell classifier)` | Shell mode input classifier |
 | `(hafod shell parser)` | Shell command parser (pipes, redirects, globs) |
-| `(hafod shell builtins)` | Shell builtins (cd, pushd, popd, export) |
+| `(hafod shell builtins)` | Shell builtins (cd, pushd, popd, export, jobs, fg, bg) |
+| `(hafod shell history-expand)` | History expansion (!!, !$, !n, !prefix) |
+| `(hafod shell jobs)` | Job control (job table, fg/bg, process groups, signals) |
+| `(hafod shell completers)` | Programmable completions (git, ssh, kill, make) |
+| `(hafod fuzzy)` | Fuzzy matching (Smith-Waterman DP, search syntax) |
 | `(hafod dot-locking)` | Dot-file locking (obtain-dot-lock, with-dot-lock) |
 | `(hafod lib-dirs)` | Library directory search |
 | `(scsh)` | Compatibility alias -- re-exports everything from `(hafod)` |
@@ -517,10 +529,26 @@ hafod adds several capabilities beyond the original scsh:
   `--` REPL mode, `|` preprocessing
 - **Shell mode** -- bare command execution in the REPL, input
   classifier, pipes, redirects, globs, env vars, builtins (cd,
-  pushd, popd, export)
+  pushd, popd, export), `&&`/`||`/`;` chaining, `&` background,
+  brace expansion (`{a,b,c}`, `{1..5}`, nested cross-product),
+  history expansion (`!!`, `!$`, `!n`, `!prefix`)
+- **Job control** -- job table, `fg`/`bg`/`jobs` builtins, process
+  groups, SIGTSTP/SIGTTIN/SIGTTOU handling, background job
+  notifications at prompt
 - **Interactive editor** -- gap-buffer line editor with syntax
   colouring, smart enter, bracketed paste, reverse incremental
-  search (C-r), prefix-filtered Up, tab completion with menu
+  search (C-r), prefix-filtered Up, tab completion with menu,
+  undo/redo (C-/ and M-/), fish-style auto-suggestions,
+  command timing display
+- **Fuzzy matching** -- Smith-Waterman DP scoring for completions
+  and search, extended search syntax (`!prefix` negation, `^exact`
+  anchoring, `.suffix`), Unicode normalisation (é→e, ñ→n),
+  tiebreak by length then first-match position
+- **Programmable completions** -- command-specific completers for
+  git (subcommands, branches, modified files), ssh (hosts from
+  `~/.ssh/config` and `known_hosts`), kill (PIDs with process
+  names), make (targets from Makefile), with description display
+  in completion menu; user-extensible via `register-completer!`
 - **Paredit** -- structural editing with auto-pairing, toggleable
   at runtime via `toggle-paredit!`
 - **Config system** -- XDG-compliant `~/.config/hafod/init.ss`,

@@ -12,7 +12,8 @@
           history-search-backward history-prefix-search-backward
           string-prefix?)
   (import (chezscheme)
-          (hafod editor sqlite3))
+          (hafod editor sqlite3)
+          (hafod fuzzy))
 
   ;; History record:
   ;;   db      — SQLite database handle (or #f if unavailable)
@@ -182,7 +183,7 @@
       (and (<= plen slen)
            (string=? prefix (substring str 0 plen)))))
 
-  ;; Search backward through history entries for a substring match.
+  ;; Search backward through history entries for a fuzzy match.
   ;; h: history object, query: search string, start-idx: index to start from (inclusive).
   ;; Returns the index of the first matching entry, or #f.
   (define (history-search-backward h query start-idx)
@@ -190,7 +191,7 @@
       (let loop ([i start-idx])
         (cond
           [(< i 0) #f]
-          [(string-contains (vector-ref entries i) query) i]
+          [(fuzzy-match query (vector-ref entries i)) i]
           [else (loop (- i 1))]))))
 
   ;; Search backward through history entries for a prefix match.

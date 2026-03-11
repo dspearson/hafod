@@ -30,7 +30,7 @@
   (define builtin-names-set
     (let ([ht (make-hashtable string-hash string=?)])
       (for-each (lambda (n) (hashtable-set! ht n #t))
-                '("cd" "pushd" "popd" "export"))
+                '("cd" "pushd" "popd" "export" "jobs" "fg" "bg"))
       ht))
 
   ;; PATH cache: command-name -> #t for O(1) lookup

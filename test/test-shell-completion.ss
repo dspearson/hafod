@@ -13,9 +13,10 @@
 (rebuild-path-cache!)
 
 ;; === shell-completions tests ===
+;; shell-completions now returns (name . positions) pairs with fuzzy matching.
 
 (test-equal "shell-completions: ls in results for prefix 'ls'"
-  #t (and (member "ls" (shell-completions "ls")) #t))
+  #t (and (assoc "ls" (shell-completions "ls")) #t))
 
 (test-equal "shell-completions: nonexistent prefix returns empty"
   '() (shell-completions "zzz-nonexistent-cmd-xyz"))
@@ -24,11 +25,9 @@
   '() (shell-completions ""))
 
 (test-equal "shell-completions: grep in results for prefix 'gr'"
-  #t (and (member "grep" (shell-completions "gr")) #t))
+  #t (and (assoc "grep" (shell-completions "gr")) #t))
 
-(test-equal "shell-completions: results are sorted"
-  #t (let ([results (shell-completions "l")])
-       (and (> (length results) 1)
-            (equal? results (list-sort string<? results)))))
+(test-assert "shell-completions: results are non-empty for common prefix"
+  (> (length (shell-completions "l")) 1))
 
 (test-end)

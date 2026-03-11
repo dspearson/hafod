@@ -373,6 +373,15 @@
     ;; === (hafod shell parser) ===
     parse-shell-command
 
+    ;; === (hafod shell history-expand) ===
+    history-expand
+
+    ;; === (hafod shell jobs) ===
+    job-bg! job-fg! job-bg-resume! list-jobs install-job-signals!
+
+    ;; === (hafod shell completers) ===
+    register-completer! lookup-completer completer-names
+
     ;; === (hafod shell builtins) ===
     builtin? run-builtin! builtin-names dir-stack
 
@@ -401,8 +410,15 @@
     ;; === (hafod editor sexp-tracker) ===
     sexp-depth find-matching-paren
 
+    ;; === (hafod fuzzy) ===
+    fuzzy-match fuzzy-score fuzzy-filter fuzzy-filter/positions
+    parse-search-pattern match-search-pattern filter-search-pattern
+    search-term? search-term-type search-term-negated?
+    search-term-pattern search-term-case-sensitive?
+
     ;; === (hafod editor render) ===
     render-line flash-matching-paren tokenize display-colourised
+    render-completion-menu/highlight
 
     ;; === (hafod editor sqlite3) ===
     sqlite3-open sqlite3-close sqlite3-exec
@@ -423,6 +439,7 @@
     shell-completions
     bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
     toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
+    editor-history-entries
 
     ;; === (hafod config) ===
     xdg-config-home hafod-config-dir hafod-init-file
@@ -514,7 +531,11 @@
     (hafod interactive)
     (except (hafod shell classifier) classify-input rebuild-path-cache!)
     (hafod shell parser)
+    (hafod shell history-expand)
+    (hafod shell jobs)
+    (hafod shell completers)
     (hafod shell builtins)
+    (hafod fuzzy)
     (hafod editor gap-buffer)
     (hafod editor kill-ring)
     (hafod editor keymap)

@@ -8,14 +8,15 @@
   (import (except (chezscheme) getenv)
           (only (hafod process-state) chdir cwd)
           (only (hafod environment) getenv setenv)
-          (only (hafod user-group) home-directory))
+          (only (hafod user-group) home-directory)
+          (only (hafod shell jobs) list-jobs job-fg! job-bg-resume!))
 
   ;; Directory stack for pushd/popd
   (define dir-stack-list '())
 
   (define (dir-stack) dir-stack-list)
 
-  (define builtin-name-list '("cd" "pushd" "popd" "export"))
+  (define builtin-name-list '("cd" "pushd" "popd" "export" "jobs" "fg" "bg"))
 
   (define (builtin-names) builtin-name-list)
 
@@ -150,5 +151,8 @@
           [(string=? cmd "pushd") (builtin-pushd args)]
           [(string=? cmd "popd") (builtin-popd args)]
           [(string=? cmd "export") (builtin-export args)]
+          [(string=? cmd "jobs") (list-jobs)]
+          [(string=? cmd "fg") (job-fg! (if (null? args) "" (car args)))]
+          [(string=? cmd "bg") (job-bg-resume! (if (null? args) "" (car args)))]
           [else (display (format "~a: not a builtin\n" cmd) (console-error-port))]))))
 )
