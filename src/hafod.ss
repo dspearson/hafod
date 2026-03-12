@@ -366,6 +366,8 @@
     background-job-count
     ;; Shell mode re-exports from interactive
     rebuild-path-cache! classify-input
+    ;; Feature toggles from interactive
+    shell-mode? history-expansion?
 
     ;; === (hafod shell classifier) ===
     path-cache scheme-prefix-chars
@@ -422,6 +424,7 @@
     ;; === (hafod editor render) ===
     render-line flash-matching-paren tokenize display-colourised
     render-completion-menu/highlight
+    rainbow-identifiers? rainbow-parens? syntax-highlight?
 
     ;; === (hafod editor sqlite3) ===
     sqlite3-open sqlite3-close sqlite3-exec
@@ -444,6 +447,8 @@
     toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
     editor-history-entries
     editor-finder-proc
+    ;; Feature toggles from editor
+    fuzzy-finder? tab-completions?
 
     ;; === (hafod config) ===
     xdg-config-home hafod-config-dir hafod-init-file

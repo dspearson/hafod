@@ -21,7 +21,9 @@
           ;; History access (for history expansion)
           editor-history-entries
           ;; Finder injection (set by umbrella to break circular dependency)
-          editor-finder-proc)
+          editor-finder-proc
+          ;; Feature toggles
+          fuzzy-finder? tab-completions?)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
@@ -723,7 +725,7 @@
 
   ;; Fuzzy history search: Ctrl-R
   (define (cmd-fuzzy-history es)
-    (let ([finder (editor-finder-proc)])
+    (let ([finder (and (fuzzy-finder?) (editor-finder-proc))])
       (when finder
         (let* ([gb (editor-state-gb es)]
                [items (deduplicate-history (history-entries editor-history))]
@@ -733,7 +735,7 @@
 
   ;; File picker: Ctrl-T
   (define (cmd-file-picker es)
-    (let ([finder (editor-finder-proc)])
+    (let ([finder (and (fuzzy-finder?) (editor-finder-proc))])
       (when finder
         (let* ([gb (editor-state-gb es)]
                [files (collect-files)]
@@ -743,7 +745,7 @@
 
   ;; Directory picker: Alt-C
   (define (cmd-dir-picker es)
-    (let ([finder (editor-finder-proc)])
+    (let ([finder (and (fuzzy-finder?) (editor-finder-proc))])
       (when finder
         (let* ([gb (editor-state-gb es)]
                [dirs (collect-directories)]
@@ -1550,7 +1552,15 @@
   ;; Value: (lambda (items prompt) ...) -> string or #f
   (define editor-finder-proc (make-parameter #f))
 
-  ;; (Old reverse incremental search state removed -- replaced by fuzzy finder)
+  ;; Toggle for fuzzy finder pickers (Ctrl-R history, Ctrl-T files, Alt-C dirs).
+  ;; When #f, these keybindings do nothing.
+  (define fuzzy-finder?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for tab completion.
+  ;; When #f, Tab inserts a literal tab character.
+  (define tab-completions?
+    (make-parameter #t (lambda (v) (and v #t))))
 
   ;; ======================================================================
   ;; Prefix-filtered history state
@@ -1799,6 +1809,8 @@
 
   ;; cmd-complete: Tab completion command.
   (define (cmd-complete es)
+    (if (not (tab-completions?))
+        (gap-buffer-insert! (editor-state-gb es) #\tab)
     (let ([gb (editor-state-gb es)])
       (cond
         ;; Menu already showing: cycle to next candidate
@@ -1878,7 +1890,7 @@
                 (when (> (string-length prefix) 0)
                   (let ([candidates (symbol-completions prefix)])
                     (unless (null? candidates)
-                      (apply-completions! gb text pos start candidates)))))]))])))
+                      (apply-completions! gb text pos start candidates)))))]))]))))
 
 
   ;; cmd-complete-prev: Shift-Tab / Up during completion: cycle backward

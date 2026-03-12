@@ -150,6 +150,15 @@ Any definitions or side effects take effect before the first REPL prompt:
 (set-prompt! "hafod> ")
 (bind-key! "C-x C-e" cmd-open-below)
 (enable-paredit!)
+
+;; Feature toggles (all default to #t)
+(shell-mode? #f)           ; disable shell-compat mode (pure Scheme REPL)
+(rainbow-identifiers? #f)  ; disable rainbow identifier colouring
+(rainbow-parens? #f)       ; disable depth-coloured parentheses
+(syntax-highlight? #f)     ; disable string/comment/number/boolean colours
+(fuzzy-finder? #f)         ; disable Ctrl-R/Ctrl-T/Alt-C fzf pickers
+(tab-completions? #f)      ; disable tab completion (Tab inserts literal tab)
+(history-expansion? #f)    ; disable !! !$ !n history expansion
 ```
 
 Pass `--no-config` (or `--norc`) to skip config loading.
@@ -312,6 +321,7 @@ Individual subsystems can also be imported separately:
 | `(hafod shell jobs)` | Job control (job table, fg/bg, process groups, signals) |
 | `(hafod shell completers)` | Programmable completions (git, ssh, kill, make) |
 | `(hafod fuzzy)` | Fuzzy matching (Smith-Waterman DP, search syntax) |
+| `(hafod finder)` | Full-screen fuzzy finder (fzf-style interactive picker) |
 | `(hafod dot-locking)` | Dot-file locking (obtain-dot-lock, with-dot-lock) |
 | `(hafod lib-dirs)` | Library directory search |
 | `(scsh)` | Compatibility alias -- re-exports everything from `(hafod)` |
@@ -343,7 +353,7 @@ Internal libraries (not intended for direct use):
 | `(hafod internal platform-constants)` | Platform-specific struct offsets and constants |
 | `(hafod editor input-decode)` | Terminal input decoder, wcwidth display width |
 | `(hafod editor keymap)` | Trie-based keymap with composable layers |
-| `(hafod editor render)` | Line editor rendering with syntax colouring |
+| `(hafod editor render)` | Line editor rendering with syntax colouring and feature toggles |
 | `(hafod editor history)` | SQLite-backed persistent history |
 | `(hafod editor editor)` | Gap-buffer line editor with paredit |
 
@@ -536,10 +546,25 @@ hafod adds several capabilities beyond the original scsh:
   groups, SIGTSTP/SIGTTIN/SIGTTOU handling, background job
   notifications at prompt
 - **Interactive editor** -- gap-buffer line editor with syntax
-  colouring, smart enter, bracketed paste, reverse incremental
-  search (C-r), prefix-filtered Up, tab completion with menu,
-  undo/redo (C-/ and M-/), fish-style auto-suggestions,
-  command timing display
+  colouring (rainbow parens, rainbow identifiers, strings,
+  comments, numbers, booleans), smart enter, bracketed paste,
+  prefix-filtered Up/Down, undo/redo (C-/ and M-/), fish-style
+  auto-suggestions, command timing display, terminal-wrap-aware
+  multiline rendering
+- **fzf-style fuzzy finder** -- full-screen fuzzy picker on
+  alternate screen buffer with real-time filtering:
+  - Ctrl-R: syntax-coloured history search (deduplicated,
+    rainbow parens and identifiers in candidates)
+  - Ctrl-T: file picker (`git ls-files` in repos, recursive
+    walk outside)
+  - Alt-C: directory picker with `cd` on selection
+  - Extended search syntax: `!negation`, `^prefix`, `.suffix`,
+    `'exact`, terms separated by spaces (AND)
+- **Fish-style tab completion** -- multi-column grid layout with
+  arrow key navigation, coloured directories (blue with `/`),
+  muted indigo selection highlight, scrolling pager with row
+  indicator; falls back to single-column when descriptions are
+  present
 - **Fuzzy matching** -- Smith-Waterman DP scoring for completions
   and search, extended search syntax (`!prefix` negation, `^exact`
   anchoring, `.suffix`), Unicode normalisation (é→e, ñ→n),
@@ -551,6 +576,10 @@ hafod adds several capabilities beyond the original scsh:
   in completion menu; user-extensible via `register-completer!`
 - **Paredit** -- structural editing with auto-pairing, toggleable
   at runtime via `toggle-paredit!`
+- **Feature toggles** -- all non-core features can be individually
+  enabled/disabled via parameters: `shell-mode?`,
+  `rainbow-identifiers?`, `rainbow-parens?`, `syntax-highlight?`,
+  `fuzzy-finder?`, `tab-completions?`, `history-expansion?`
 - **Config system** -- XDG-compliant `~/.config/hafod/init.ss`,
   `set-prompt!`, `bind-key!` with Emacs-style key descriptions,
   `--no-config` flag

@@ -12,7 +12,11 @@
           paren-colours num-paren-colours
           string-colour comment-colour number-colour boolean-colour
           fg-colour fg-colour-l
-          ident-colour-from-hash ident-hash)
+          ident-colour-from-hash ident-hash
+          ;; Settings
+          rainbow-identifiers?
+          rainbow-parens?
+          syntax-highlight?)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
@@ -84,6 +88,27 @@
   (define boolean-colour '(180 249 248))  ; cyan   #b4f9f8
 
   (define num-paren-colours (vector-length paren-colours))
+
+  ;; Toggle for rainbow identifier colouring.
+  ;; When #t (default), identifiers inside parentheses get CIE L*a*b* hue
+  ;; colours.  Top-level atoms (depth 0, i.e. shell commands) are always
+  ;; rendered in the default foreground regardless of this setting.
+  ;; Set to #f to disable rainbow identifiers entirely.
+  (define rainbow-identifiers?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for rainbow parenthesis colouring.
+  ;; When #t (default), parens/brackets are coloured by nesting depth.
+  ;; Set to #f to render all parens in default foreground.
+  (define rainbow-parens?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for syntax highlighting of strings, comments, numbers, booleans.
+  ;; When #t (default), these token types get distinct colours.
+  ;; Set to #f to render everything in default foreground (except rainbow
+  ;; parens/identifiers which have their own toggles).
+  (define syntax-highlight?
+    (make-parameter #t (lambda (v) (and v #t))))
 
   ;; ======================================================================
   ;; CIE L*a*b* rainbow identifiers (matching Doom's algorithm)
@@ -292,35 +317,51 @@
             (let ([span (substring text start end)])
               (case type
                 [(paren)
-                 (let ([col (vector-ref paren-colours
-                              (modulo depth num-paren-colours))]
-                       [bold? (or (eqv? start open-idx)
-                                  (eqv? start close-idx))])
-                   (when bold? (display "\x1b;[1m" port))
-                   (fg-colour-l port col)
-                   (display span port)
-                   (display "\x1b;[0m" port))]
+                 (if (rainbow-parens?)
+                     (let ([col (vector-ref paren-colours
+                                  (modulo depth num-paren-colours))]
+                           [bold? (or (eqv? start open-idx)
+                                      (eqv? start close-idx))])
+                       (when bold? (display "\x1b;[1m" port))
+                       (fg-colour-l port col)
+                       (display span port)
+                       (display "\x1b;[0m" port))
+                     (let ([bold? (or (eqv? start open-idx)
+                                      (eqv? start close-idx))])
+                       (when bold? (display "\x1b;[1m" port))
+                       (display span port)
+                       (when bold? (display "\x1b;[22m" port))))]
                 [(atom)
-                 (let ([col (ident-colour-from-hash (ident-hash span))])
-                   (fg-colour-l port col)
-                   (display span port)
-                   (display "\x1b;[39m" port))]
+                 (if (and (rainbow-identifiers?) (> depth 0))
+                     (let ([col (ident-colour-from-hash (ident-hash span))])
+                       (fg-colour-l port col)
+                       (display span port)
+                       (display "\x1b;[39m" port))
+                     (display span port))]
                 [(number)
-                 (fg-colour-l port number-colour)
-                 (display span port)
-                 (display "\x1b;[39m" port)]
+                 (if (syntax-highlight?)
+                     (begin (fg-colour-l port number-colour)
+                            (display span port)
+                            (display "\x1b;[39m" port))
+                     (display span port))]
                 [(boolean)
-                 (fg-colour-l port boolean-colour)
-                 (display span port)
-                 (display "\x1b;[39m" port)]
+                 (if (syntax-highlight?)
+                     (begin (fg-colour-l port boolean-colour)
+                            (display span port)
+                            (display "\x1b;[39m" port))
+                     (display span port))]
                 [(string)
-                 (fg-colour-l port string-colour)
-                 (display span port)
-                 (display "\x1b;[39m" port)]
+                 (if (syntax-highlight?)
+                     (begin (fg-colour-l port string-colour)
+                            (display span port)
+                            (display "\x1b;[39m" port))
+                     (display span port))]
                 [(comment)
-                 (fg-colour-l port comment-colour)
-                 (display span port)
-                 (display "\x1b;[39m" port)]
+                 (if (syntax-highlight?)
+                     (begin (fg-colour-l port comment-colour)
+                            (display span port)
+                            (display "\x1b;[39m" port))
+                     (display span port))]
                 [else
                  (display span port)]))))
         tokens)))

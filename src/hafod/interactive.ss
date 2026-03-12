@@ -22,7 +22,10 @@
     background-job-count
     ;; Shell mode re-exports (for config access)
     rebuild-path-cache!
-    classify-input)
+    classify-input
+    ;; Feature toggles
+    shell-mode?
+    history-expansion?)
 
   (import (except (chezscheme) getenv)
           (only (hafod posix) status:exit-val SIGWINCH)
@@ -120,6 +123,20 @@
         (unless (and (integer? v) (exact? v) (>= v 0))
           (error 'last-duration "expected a non-negative exact integer" v))
         v)))
+
+  ;; === Feature toggles ===
+
+  ;; Toggle for shell-compatibility mode.
+  ;; When #t (default), bare commands like "ls -la" are routed to the shell
+  ;; executor.  Set to #f to treat all input as Scheme expressions.
+  (define shell-mode?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for history expansion (!!, !$, !n, !-n, !prefix).
+  ;; When #t (default), history expansion is performed before evaluation.
+  ;; Set to #f to disable (e.g. if ! in identifiers causes problems).
+  (define history-expansion?
+    (make-parameter #t (lambda (v) (and v #t))))
 
   ;; === Terminal width ===
 
@@ -480,7 +497,9 @@
                              [(eof-object? line) (eof-object)]
                              [else
                               ;; History expansion (!! !$ !n !-n !prefix)
-                              (let* ([expanded (history-expand line (editor-history-entries))]
+                              (let* ([expanded (if (history-expansion?)
+                                                   (history-expand line (editor-history-entries))
+                                                   line)]
                                      [line (if (string=? expanded line)
                                                line
                                                (begin
@@ -488,7 +507,9 @@
                                                  (display expanded (console-error-port))
                                                  (newline (console-error-port))
                                                  expanded))])
-                              (let ([class (classify-input line)])
+                              (let ([class (if (shell-mode?)
+                                               (classify-input line)
+                                               'scheme)])
                                 (case class
                                   [(builtin)
                                    ;; Execute builtin directly, skip eval
