@@ -386,7 +386,7 @@
     builtin? run-builtin! builtin-names dir-stack
 
     ;; === (hafod editor gap-buffer) ===
-    make-gap-buffer gap-buffer-insert! gap-buffer-delete-forward!
+    make-gap-buffer gap-buffer-insert! gap-buffer-insert-string! gap-buffer-delete-forward!
     gap-buffer-delete-backward! gap-buffer-move-cursor!
     gap-buffer-cursor-pos gap-buffer->string
     gap-buffer-before-string gap-buffer-after-string
@@ -416,6 +416,9 @@
     search-term? search-term-type search-term-negated?
     search-term-pattern search-term-case-sensitive?
 
+    ;; === (hafod finder) ===
+    fuzzy-select run-finder
+
     ;; === (hafod editor render) ===
     render-line flash-matching-paren tokenize display-colourised
     render-completion-menu/highlight
@@ -440,6 +443,7 @@
     bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
     toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
     editor-history-entries
+    editor-finder-proc
 
     ;; === (hafod config) ===
     xdg-config-home hafod-config-dir hafod-init-file
@@ -536,6 +540,7 @@
     (hafod shell completers)
     (hafod shell builtins)
     (hafod fuzzy)
+    (hafod finder)
     (hafod editor gap-buffer)
     (hafod editor kill-ring)
     (hafod editor keymap)
@@ -547,6 +552,4 @@
     (hafod editor editor)
     (hafod config))
 
-  ;; No body needed -- this library is a pure re-export aggregator.
-  ;; Body definitions live in sub-libraries to avoid import conflicts.
 )

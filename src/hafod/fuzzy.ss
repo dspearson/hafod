@@ -12,6 +12,7 @@
           fuzzy-filter/positions
           ;; Extended search syntax
           parse-search-pattern match-search-pattern filter-search-pattern
+          filter-search-pattern/positions
           ;; Search term record
           search-term? search-term-type search-term-negated?
           search-term-pattern search-term-case-sensitive?)
@@ -846,5 +847,19 @@
                            candidates)]
                  [sorted (list-sort score-tiebreak scored)])
             (map cadr sorted)))))
+
+  ;; Like filter-search-pattern but returns (candidate . positions) pairs
+  ;; sorted by score. Positions are the match highlight positions.
+  (define (filter-search-pattern/positions pattern-str candidates)
+    (let ([term-sets (parse-search-pattern pattern-str)])
+      (if (null? term-sets)
+          (map (lambda (c) (cons c '())) candidates)
+          (let* ([scored (filter-map
+                           (lambda (c)
+                             (let ([result (match-search-pattern term-sets c)])
+                               (and result (list (car result) c (cdr result)))))
+                           candidates)]
+                 [sorted (list-sort score-tiebreak scored)])
+            (map (lambda (entry) (cons (cadr entry) (caddr entry))) sorted)))))
 
 ) ; end library

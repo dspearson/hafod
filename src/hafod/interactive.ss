@@ -16,6 +16,7 @@
     last-duration
     terminal-width
     query-terminal-width
+    query-terminal-size
     repl-continuation-prompt
     ansi-visible-length
     background-job-count
@@ -148,6 +149,27 @@
                      (let ([cols (foreign-ref 'unsigned-16 buf 2)])  ;; ws_col at offset 2
                        (foreign-free buf)
                        (if (> cols 0) cols 80))
+                     (try-fd (cdr fds))))]))))))
+
+  ;; Query actual terminal size (rows and columns) via ioctl(TIOCGWINSZ).
+  ;; Returns (values rows cols) with fallback 24x80 if not a terminal.
+  (define query-terminal-size
+    (let ([c-ioctl (foreign-procedure "hafod_ioctl_ptr" (int unsigned-long void*) int)])
+      (lambda ()
+        (let ([buf (foreign-alloc 8)])  ;; struct winsize = 4 unsigned shorts = 8 bytes
+          (let try-fd ([fds '(1 0 2)])  ;; try stdout, stdin, stderr
+            (cond
+              [(null? fds)
+               (foreign-free buf)
+               (values 24 80)]  ;; fallback
+              [else
+               (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
+                 (if (zero? rc)
+                     (let* ([rows (foreign-ref 'unsigned-16 buf 0)]  ;; ws_row at offset 0
+                            [cols (foreign-ref 'unsigned-16 buf 2)]) ;; ws_col at offset 2
+                       (foreign-free buf)
+                       (values (if (> rows 0) rows 24)
+                               (if (> cols 0) cols 80)))
                      (try-fd (cdr fds))))]))))))
 
   ;; === Colourised output ===

@@ -65,6 +65,12 @@
     (eval '(import (hafod)) (interaction-environment))
     (set! %hafod-imported? #t)))
 
+;; Wire fuzzy finder into editor.  The umbrella library body expression
+;; (editor-finder-proc run-finder) is not reliably executed by Chez when
+;; the library is loaded via compile-whole-program, so we do it here at
+;; program startup where side effects are guaranteed to run.
+(editor-finder-proc run-finder)
+
 ;; Set both the Chez command-line parameters AND the hafod command-line state.
 ;; chez:command-line / chez:command-line-arguments are the Chez parameters
 ;; (renamed to avoid conflict); set-command-line-args! sets hafod's internal state.

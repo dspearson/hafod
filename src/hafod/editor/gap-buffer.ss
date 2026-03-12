@@ -4,7 +4,8 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod editor gap-buffer)
-  (export make-gap-buffer gap-buffer-insert! gap-buffer-delete-forward!
+  (export make-gap-buffer gap-buffer-insert! gap-buffer-insert-string!
+          gap-buffer-delete-forward!
           gap-buffer-delete-backward! gap-buffer-move-cursor!
           gap-buffer-cursor-pos gap-buffer->string
           gap-buffer-before-string gap-buffer-after-string
@@ -64,6 +65,12 @@
     (let ([gs (gap-buffer-gap-start gb)])
       (vector-set! (gap-buffer-buf gb) gs ch)
       (gap-buffer-gap-start-set! gb (fx+ gs 1))))
+
+  (define (gap-buffer-insert-string! gb s)
+    (let ([len (string-length s)])
+      (do ([i 0 (fx+ i 1)])
+          ((fx= i len))
+        (gap-buffer-insert! gb (string-ref s i)))))
 
   (define (gap-buffer-delete-forward! gb)
     (let ([ge (gap-buffer-gap-end gb)])

@@ -19,7 +19,9 @@
           ;; Paredit toggle
           toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
           ;; History access (for history expansion)
-          editor-history-entries)
+          editor-history-entries
+          ;; Finder injection (set by umbrella to break circular dependency)
+          editor-finder-proc)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
@@ -30,8 +32,30 @@
           (hafod editor history)
           (hafod fuzzy)
           (hafod tty)
+          (only (hafod internal posix-constants) TIOCGWINSZ)
           (only (hafod shell classifier) path-cache scheme-prefix-chars)
-          (only (hafod shell completers) lookup-completer))
+          (only (hafod shell completers) lookup-completer)
+          (only (hafod collect) run/strings*)
+          (only (hafod process) exec-path))
+
+  ;; ======================================================================
+  ;; Terminal size query (local to editor, avoids circular dep with interactive)
+  ;; ======================================================================
+
+  (define editor-query-terminal-cols
+    (let ([c-ioctl (foreign-procedure "hafod_ioctl_ptr" (int unsigned-long void*) int)])
+      (lambda ()
+        (let ([buf (foreign-alloc 8)])
+          (let try-fd ([fds '(1 0 2)])
+            (cond
+              [(null? fds) (foreign-free buf) 80]
+              [else
+               (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
+                 (if (zero? rc)
+                     (let ([cols (foreign-ref 'unsigned-16 buf 2)])
+                       (foreign-free buf)
+                       (if (> cols 0) cols 80))
+                     (try-fd (cdr fds))))]))))))
 
   ;; ======================================================================
   ;; Raw mode
@@ -624,45 +648,110 @@
             (when entry
               (gap-buffer-set-from-string! gb entry))))))
 
-  ;; Reverse incremental search: Ctrl-R
-  (define (cmd-reverse-search es)
-    (let ([gb (editor-state-gb es)])
-      (cond
-        [(not search-active?)
-         ;; Start search: save current buffer, activate
-         (set! search-saved-buffer (gap-buffer->string gb))
-         (set! search-active? #t)
-         (set! search-query "")
-         (set! search-match-idx (- (vector-length (history-entries editor-history)) 1))
-         ;; Perform initial search (empty query matches everything)
-         (void)]
-        [else
-         ;; Already in search: cycle to next older match
-         (when (> search-match-idx 0)
-           (let ([idx (history-search-backward editor-history search-query
-                        (- search-match-idx 1))])
-             (when idx
-               (set! search-match-idx idx)
-               (let ([entry (vector-ref (history-entries editor-history) idx)])
-                 (gap-buffer-set-from-string! gb entry)))))])))
+  ;; ======================================================================
+  ;; Fuzzy finder editor commands (history, file, directory pickers)
+  ;; ======================================================================
 
-  ;; Exit search mode. If cancel? is #t, restore original buffer.
-  (define (exit-search-mode! es cancel?)
-    (let ([gb (editor-state-gb es)])
-      (when cancel?
-        (gap-buffer-set-from-string! gb search-saved-buffer))
-      (reset-search-state!)))
+  ;; Deduplicate history entries, returning most-recent-first list.
+  ;; Entries vector is oldest-first (index 0 = oldest, len-1 = newest).
+  ;; Iterate newest-to-oldest, skip duplicates.  cons builds the list
+  ;; so that index 0 (= oldest unique) ends up at the head — then reverse
+  ;; gives newest-first.
+  (define (deduplicate-history entries)
+    (let* ([len (vector-length entries)]
+           [seen (make-hashtable string-hash string=?)])
+      (let loop ([i (fx- len 1)] [acc '()])
+        (if (fx< i 0)
+            (reverse acc)
+            (let ([entry (vector-ref entries i)])
+              (if (or (not (string? entry))
+                      (fx= (string-length entry) 0)
+                      (hashtable-ref seen entry #f))
+                  (loop (fx- i 1) acc)
+                  (begin
+                    (hashtable-set! seen entry #t)
+                    (loop (fx- i 1) (cons entry acc)))))))))
 
-  ;; Handle a character typed during search mode: append to query, re-search
-  (define (search-self-insert! es ch)
-    (let ([gb (editor-state-gb es)])
-      (set! search-query (string-append search-query (string ch)))
-      (let ([idx (history-search-backward editor-history search-query search-match-idx)])
-        (cond
-          [idx
-           (set! search-match-idx idx)
-           (gap-buffer-set-from-string! gb (vector-ref (history-entries editor-history) idx))]
-          [else (void)]))))  ; no match -- keep current display
+  ;; Recursive file walk with depth limit, skipping hidden entries.
+  (define (walk-files dir max-depth)
+    (if (fx<= max-depth 0)
+        '()
+        (guard (e [#t '()])
+          (let loop ([entries (directory-list dir)] [acc '()])
+            (if (null? entries)
+                acc
+                (let ([name (car entries)])
+                  (if (char=? (string-ref name 0) #\.)
+                      (loop (cdr entries) acc)
+                      (let ([path (string-append dir "/" name)])
+                        (if (file-directory? path)
+                            (loop (cdr entries)
+                                  (append (walk-files path (fx- max-depth 1)) acc))
+                            (loop (cdr entries) (cons path acc)))))))))))
+
+  ;; Collect files: prefer git ls-files, fall back to walk.
+  (define (collect-files)
+    (let ([files (guard (e [#t '()])
+                   (run/strings* (lambda () (exec-path "git" "ls-files"))))])
+      (if (null? files)
+          (walk-files "." 8)
+          files)))
+
+  ;; Collect directories: recursive walk from "." skipping hidden entries.
+  (define (collect-directories)
+    (let walk ([dir "."] [depth 8])
+      (if (fx<= depth 0)
+          '()
+          (guard (e [#t '()])
+            (let loop ([entries (directory-list dir)] [acc '()])
+              (if (null? entries)
+                  acc
+                  (let ([name (car entries)])
+                    (if (char=? (string-ref name 0) #\.)
+                        (loop (cdr entries) acc)
+                        (let ([path (if (string=? dir ".")
+                                        name
+                                        (string-append dir "/" name))])
+                          (if (file-directory? path)
+                              (loop (cdr entries)
+                                    (cons path (append (walk path (fx- depth 1)) acc)))
+                              (loop (cdr entries) acc)))))))))))
+
+  ;; Quote a path for shell use.
+  (define (quote-path s)
+    (string-append "\"" s "\""))
+
+  ;; Fuzzy history search: Ctrl-R
+  (define (cmd-fuzzy-history es)
+    (let ([finder (editor-finder-proc)])
+      (when finder
+        (let* ([gb (editor-state-gb es)]
+               [items (deduplicate-history (history-entries editor-history))]
+               [result (finder items "> " #t)])
+          (when result
+            (gap-buffer-set-from-string! gb result))))))
+
+  ;; File picker: Ctrl-T
+  (define (cmd-file-picker es)
+    (let ([finder (editor-finder-proc)])
+      (when finder
+        (let* ([gb (editor-state-gb es)]
+               [files (collect-files)]
+               [result (finder files "> ")])
+          (when result
+            (gap-buffer-insert-string! gb result))))))
+
+  ;; Directory picker: Alt-C
+  (define (cmd-dir-picker es)
+    (let ([finder (editor-finder-proc)])
+      (when finder
+        (let* ([gb (editor-state-gb es)]
+               [dirs (collect-directories)]
+               [result (finder dirs "> ")])
+          (when result
+            (gap-buffer-set-from-string! gb (string-append "cd " (quote-path result)))
+            (editor-state-done?-set! es #t)
+            (editor-state-result-set! es (gap-buffer->string (editor-state-gb es))))))))
 
   ;; Paste after cursor (p)
   (define (cmd-paste-after es)
@@ -1246,8 +1335,10 @@
     (keymap-bind! km (list (make-key-event 'ctrl #\p 0)) cmd-history-prev)
     (keymap-bind! km (list (make-key-event 'ctrl #\n 0)) cmd-history-next)
 
-    ;; Reverse incremental search
-    (keymap-bind! km (list (make-key-event 'ctrl #\r 0)) cmd-reverse-search)
+    ;; Fuzzy finder commands
+    (keymap-bind! km (list (make-key-event 'ctrl #\r 0)) cmd-fuzzy-history)
+    (keymap-bind! km (list (make-key-event 'ctrl #\t 0)) cmd-file-picker)
+    (keymap-bind! km (list (make-key-event 'meta #\c 0)) cmd-dir-picker)
 
     ;; Screen
     (keymap-bind! km (list (make-key-event 'ctrl #\l 0)) cmd-clear-screen)
@@ -1454,20 +1545,12 @@
   (define (editor-history-entries)
     (history-entries editor-history))
 
-  ;; ======================================================================
-  ;; Reverse incremental search state (module-level, one editor at a time)
-  ;; ======================================================================
+  ;; Finder procedure injection: set by umbrella (hafod) after loading (hafod finder)
+  ;; to break the circular dependency editor -> finder -> editor.
+  ;; Value: (lambda (items prompt) ...) -> string or #f
+  (define editor-finder-proc (make-parameter #f))
 
-  (define search-active? #f)
-  (define search-query "")
-  (define search-match-idx -1)
-  (define search-saved-buffer "")
-
-  (define (reset-search-state!)
-    (set! search-active? #f)
-    (set! search-query "")
-    (set! search-match-idx -1)
-    (set! search-saved-buffer ""))
+  ;; (Old reverse incremental search state removed -- replaced by fuzzy finder)
 
   ;; ======================================================================
   ;; Prefix-filtered history state
@@ -1485,13 +1568,21 @@
   (define completion-index -1)         ; selected candidate index (-1 = none)
   (define completion-start 0)          ; cursor position where prefix starts
 
+  ;; Grid layout state (computed by render-completion-grid)
+  (define completion-grid-cols 1)
+  (define completion-grid-rows 0)
+  (define completion-scroll-offset 0)
+
   (define (dismiss-completion!)
     (unless (null? completion-candidates)
       (set! completion-candidates '())
       (set! completion-positions '())
       (set! completion-descriptions '())
       (set! completion-index -1)
-      (set! completion-start 0)))
+      (set! completion-start 0)
+      (set! completion-grid-cols 1)
+      (set! completion-grid-rows 0)
+      (set! completion-scroll-offset 0)))
 
   ;; ======================================================================
   ;; Completion helpers
@@ -1568,13 +1659,17 @@
                             entries)]
                  [sorted (fuzzy-filter/positions base-prefix visible)])
             (map (lambda (pair)
-                   (let ([entry (car pair)]
-                         [positions (cdr pair)])
+                   (let* ([entry (car pair)]
+                          [positions (cdr pair)]
+                          [full-path (string-append dir "/" entry)]
+                          [is-dir? (guard (e [#t #f]) (file-directory? full-path))]
+                          [display-entry (if is-dir?
+                                             (string-append entry "/")
+                                             entry)])
                      (if dir-prefix
-                         ;; Shift positions by dir-prefix length for display
-                         (cons (string-append dir-prefix entry)
+                         (cons (string-append dir-prefix display-entry)
                                (map (lambda (p) (+ p dir-prefix-len)) positions))
-                         pair)))
+                         (cons display-entry positions))))
                  sorted))))))
 
   ;; shell-completions: fuzzy-match PATH executable names.
@@ -1808,6 +1903,34 @@
   (define (cmd-complete-accept es)
     (dismiss-completion!))
 
+  ;; cmd-completion-navigate: arrow key navigation in the grid
+  (define (cmd-completion-navigate es direction)
+    (let* ([gb (editor-state-gb es)]
+           [n (length completion-candidates)]
+           [cols completion-grid-cols]
+           [cur (if (< completion-index 0) 0 completion-index)]
+           [new-idx
+            (case direction
+              [(right) (let ([next (+ cur 1)])
+                         (if (>= next n) cur next))]
+              [(left)  (let ([prev (- cur 1)])
+                         (if (< prev 0) cur prev))]
+              [(down)  (let ([next (+ cur cols)])
+                         (if (>= next n) cur next))]
+              [(up)    (let ([prev (- cur cols)])
+                         (if (< prev 0) cur prev))]
+              [else cur])])
+      (let* ([candidate (list-ref completion-candidates new-idx)]
+             [text (gap-buffer->string gb)]
+             [pos (gap-buffer-cursor-pos gb)]
+             [new-text (string-append
+                         (substring text 0 completion-start)
+                         candidate
+                         (substring text pos (string-length text)))]
+             [new-pos (+ completion-start (string-length candidate))])
+        (set! completion-index new-idx)
+        (editor-replace-text! gb new-text new-pos))))
+
   ;; Track number of completion menu lines currently displayed
   (define completion-menu-lines 0)
 
@@ -1818,11 +1941,12 @@
     (when (null? completion-candidates)
       (update-suggestion! gb))
     ;; render-line with ghost suggestion and extra lines for previous menu
-    (let ([lines (if (and (null? completion-candidates)
-                          (> (string-length suggestion-text) 0))
-                     (render-line/suggestion port prompt gb
-                       (+ prev-lines completion-menu-lines) suggestion-text)
-                     (render-line port prompt gb (+ prev-lines completion-menu-lines)))])
+    (let* ([term-cols (editor-query-terminal-cols)]
+           [lines (if (and (null? completion-candidates)
+                           (> (string-length suggestion-text) 0))
+                      (render-line/suggestion port prompt gb
+                        (+ prev-lines completion-menu-lines) suggestion-text term-cols)
+                      (render-line port prompt gb (+ prev-lines completion-menu-lines) term-cols))])
       (if (not (null? completion-candidates))
           ;; Save cursor, move to end of content, render menu, restore cursor
           (begin
@@ -1849,17 +1973,24 @@
                 (display "B" port))
               ;; Move to beginning of next line
               (display "\r" port)
-              ;; Render menu
-              (let ([menu-lines (render-completion-menu/highlight port
-                                  (if (null? completion-descriptions)
-                                      (map cons completion-candidates completion-positions)
-                                      (map list completion-candidates completion-positions completion-descriptions))
-                                  completion-index)])
-                ;; Restore cursor to edit position
-                (display "\x1b;8" port)
-                (flush-output-port port)
-                (set! completion-menu-lines menu-lines)
-                lines)))
+              ;; Render menu (fish-style grid)
+              (let ([term-cols (editor-query-terminal-cols)])
+                (let-values ([(menu-lines gcols grows soff)
+                              (render-completion-grid port
+                                (if (null? completion-descriptions)
+                                    (map cons completion-candidates completion-positions)
+                                    (map list completion-candidates completion-positions completion-descriptions))
+                                completion-index
+                                term-cols
+                                10)])
+                  ;; Restore cursor to edit position
+                  (display "\x1b;8" port)
+                  (flush-output-port port)
+                  (set! completion-menu-lines menu-lines)
+                  (set! completion-grid-cols gcols)
+                  (set! completion-grid-rows grows)
+                  (set! completion-scroll-offset soff)
+                  lines))))
           (begin
             (set! completion-menu-lines 0)
             lines))))
@@ -1929,7 +2060,6 @@
               [gb (make-gap-buffer)]
               [es (make-editor-state gb editor-kill-ring prompt out-port 0 #f #f 'insert)]
               [finish! (lambda (result)
-                         (reset-search-state!)
                          (set! history-prefix #f)
                          (dismiss-completion!)
                          (reset-undo-state!)
@@ -1946,7 +2076,7 @@
          (set-cursor-bar out-port)
          (flush-output-port out-port)
          ;; Render initial edit line (last line of prompt + empty buffer)
-         (let ([initial-lines (render-line out-port prompt gb 0)])
+         (let ([initial-lines (render-line out-port prompt gb 0 (editor-query-terminal-cols))])
          ;; Command loop — prev-lines tracks screen lines for correct cursor-up
          (let loop ([prev-lines initial-lines])
            (let* ([mode (editor-state-mode es)]
@@ -1958,10 +2088,7 @@
                              (eof-object)
                              (gap-buffer->string gb)))]
                [else
-                ;; effective-prompt: search mode overrides the normal prompt
-                (let* ([ep (if search-active?
-                               (string-append "(reverse-i-search)'" search-query "': ")
-                               prompt)]
+                (let* ([ep prompt]
                        [compl-active? (not (null? completion-candidates))])
                   (cond
                     ;; ------- Completion menu intercepts (highest priority) -------
@@ -1969,6 +2096,12 @@
                           (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'backtab))
                      (cmd-complete-prev es)
+                     (loop (render-with-menu out-port ep gb prev-lines))]
+                    ;; Arrow keys during completion: grid navigation
+                    [(and compl-active?
+                          (eq? (key-event-type evt) 'special)
+                          (memq (key-event-value evt) '(up down left right)))
+                     (cmd-completion-navigate es (key-event-value evt))
                      (loop (render-with-menu out-port ep gb prev-lines))]
                     [(and compl-active?
                           (eq? (key-event-type evt) 'special)
@@ -1989,54 +2122,10 @@
                     [(and (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'paste-start))
                      (when compl-active? (dismiss-completion!) (set! completion-menu-lines 0))
-                     (when search-active? (exit-search-mode! es #f))
                      (handle-bracketed-paste es in-port)
                      (if (editor-state-done? es)
                          (finish! (editor-state-result es))
                          (loop (render-with-menu out-port ep gb prev-lines)))]
-
-                    ;; ------- Search mode -------
-                    [search-active?
-                     (cond
-                       [(and (eq? (key-event-type evt) 'ctrl)
-                             (eqv? (key-event-value evt) #\r))
-                        (cmd-reverse-search es)
-                        (loop (render-with-menu out-port ep gb prev-lines))]
-                       [(or (and (eq? (key-event-type evt) 'ctrl)
-                                 (eqv? (key-event-value evt) #\g))
-                            (and (eq? (key-event-type evt) 'special)
-                                 (eq? (key-event-value evt) 'escape)))
-                        (exit-search-mode! es #t)
-                        (loop (render-with-menu out-port prompt gb prev-lines))]
-                       [(and (eq? (key-event-type evt) 'char)
-                             (char? (key-event-value evt))
-                             (>= (char->integer (key-event-value evt)) 32))
-                        (search-self-insert! es (key-event-value evt))
-                        (loop (render-with-menu out-port ep gb prev-lines))]
-                       [(and (eq? (key-event-type evt) 'special)
-                             (eq? (key-event-value evt) 'backspace))
-                        (when (> (string-length search-query) 0)
-                          (set! search-query
-                            (substring search-query 0 (- (string-length search-query) 1)))
-                          (let ([entries (history-entries editor-history)])
-                            (let ([idx (history-search-backward editor-history search-query
-                                         (- (vector-length entries) 1))])
-                              (when idx
-                                (set! search-match-idx idx)
-                                (gap-buffer-set-from-string! gb
-                                  (vector-ref entries idx))))))
-                        (loop (render-with-menu out-port ep gb prev-lines))]
-                       [else
-                        (exit-search-mode! es #f)
-                        (let ([binding (keymap-lookup km evt)])
-                          (cond
-                            [(procedure? binding)
-                             (binding es)
-                             (if (editor-state-done? es)
-                                 (finish! (editor-state-result es))
-                                 (loop (render-with-menu out-port prompt gb prev-lines)))]
-                            [else
-                             (loop (render-with-menu out-port prompt gb prev-lines))]))])]
 
                     ;; ------- Normal dispatch -------
                     [else

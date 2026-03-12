@@ -5,7 +5,14 @@
 (library (hafod editor render)
   (export render-line flash-matching-paren tokenize display-colourised
           render-completion-menu render-completion-menu/highlight
-          render-line/suggestion)
+          render-completion-grid
+          render-line/suggestion
+          display-with-highlights
+          ;; Colour constants and helpers for external consumers (e.g. finder)
+          paren-colours num-paren-colours
+          string-colour comment-colour number-colour boolean-colour
+          fg-colour fg-colour-l
+          ident-colour-from-hash ident-hash)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
@@ -322,85 +329,131 @@
   ;; render-line
   ;; ======================================================================
 
+  ;; Count visual lines (screen rows) for text with prompt, accounting for
+  ;; line wrapping at terminal width. Returns total extra rows beyond the first.
+  (define (count-visual-lines prompt-width text term-cols)
+    (if (<= term-cols 0)
+        (count-newlines text)
+        (let ([len (string-length text)])
+          (let lp ([i 0] [col prompt-width] [extra 0])
+            (cond
+              [(>= i len) extra]
+              [(char=? (string-ref text i) #\newline)
+               ;; Newline: new physical line, column resets to 0 (no prompt on continuation)
+               (lp (+ i 1) 0 (+ extra 1))]
+              [else
+               (let* ([cw (char-display-width (string-ref text i))]
+                      [new-col (+ col cw)])
+                 (if (> new-col term-cols)
+                     ;; Wrap: extra visual line
+                     (lp (+ i 1) cw (+ extra 1))
+                     (lp (+ i 1) new-col extra)))])))))
+
+  ;; Count visual row of cursor position within text (for cursor-up after render).
+  (define (cursor-visual-row prompt-width before-text term-cols)
+    (if (<= term-cols 0)
+        (count-newlines before-text)
+        (let ([len (string-length before-text)])
+          (let lp ([i 0] [col prompt-width] [row 0])
+            (cond
+              [(>= i len) row]
+              [(char=? (string-ref before-text i) #\newline)
+               (lp (+ i 1) 0 (+ row 1))]
+              [else
+               (let* ([cw (char-display-width (string-ref before-text i))]
+                      [new-col (+ col cw)])
+                 (if (> new-col term-cols)
+                     (lp (+ i 1) cw (+ row 1))
+                     (lp (+ i 1) new-col row)))])))))
+
   ;; render-line: redraw prompt + buffer.  prev-lines is the number of
-  ;; lines that were on screen from the *previous* render (0 on first call).
+  ;; visual lines that were on screen from the *previous* render (0 on first call).
+  ;; term-cols: terminal width (0 = unknown, fall back to newline counting).
   ;; Returns the current total-lines count for passing to the next render.
-  (define (render-line port prompt gb prev-lines)
-    (let* ([before (gap-buffer-before-string gb)]
-           [after  (gap-buffer-after-string gb)]
-           [text (string-append before after)]
-           [cursor-pos (gap-buffer-cursor-pos gb)]
-           [total-lines (count-newlines text)]
-           [prompt-width (ansi-display-width prompt)]
-           [cursor-row (count-newlines before)]
-           [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
-                          (width-after-last-newline before)
-                          1)]
-           ;; Move up by whichever is larger: the previous or current line count
-           [move-up (max total-lines prev-lines)])
-      ;; Move up to prompt line if multi-line
-      (when (> move-up 0)
-        (display "\x1b;[" port)
-        (display move-up port)
-        (display "A" port))
-      ;; CR + clear to end of screen
-      (display "\r\x1b;[J" port)
-      ;; Display prompt
-      (display prompt port)
-      ;; Display colourised text
-      (let ([tokens (tokenize text)])
-        (display-colourised port text tokens cursor-pos))
-      ;; Position cursor
-      (let ([lines-after-cursor (- total-lines cursor-row)])
-        (when (> lines-after-cursor 0)
-          (display "\x1b;[" port)
-          (display lines-after-cursor port)
-          (display "A" port)))
-      (display "\x1b;[" port)
-      (display cursor-col port)
-      (display "G" port)
-      (flush-output-port port)
-      total-lines))
+  (define render-line
+    (case-lambda
+      [(port prompt gb prev-lines)
+       (render-line port prompt gb prev-lines 0)]
+      [(port prompt gb prev-lines term-cols)
+       (let* ([before (gap-buffer-before-string gb)]
+              [after  (gap-buffer-after-string gb)]
+              [text (string-append before after)]
+              [cursor-pos (gap-buffer-cursor-pos gb)]
+              [prompt-width (ansi-display-width prompt)]
+              [total-lines (count-visual-lines prompt-width text term-cols)]
+              [cursor-row (cursor-visual-row prompt-width before term-cols)]
+              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
+                             (width-after-last-newline before)
+                             1)]
+              ;; Move up by whichever is larger: the previous or current line count
+              [move-up (max total-lines prev-lines)])
+         ;; Move up to prompt line if multi-line
+         (when (> move-up 0)
+           (display "\x1b;[" port)
+           (display move-up port)
+           (display "A" port))
+         ;; CR + clear to end of screen
+         (display "\r\x1b;[J" port)
+         ;; Display prompt
+         (display prompt port)
+         ;; Display colourised text
+         (let ([tokens (tokenize text)])
+           (display-colourised port text tokens cursor-pos))
+         ;; Position cursor
+         (let ([lines-after-cursor (- total-lines cursor-row)])
+           (when (> lines-after-cursor 0)
+             (display "\x1b;[" port)
+             (display lines-after-cursor port)
+             (display "A" port)))
+         (display "\x1b;[" port)
+         (display cursor-col port)
+         (display "G" port)
+         (flush-output-port port)
+         total-lines)]))
 
   ;; render-line/suggestion: like render-line but appends dim ghost text after cursor
   ;; when cursor is at end-of-buffer.
-  (define (render-line/suggestion port prompt gb prev-lines suggestion)
-    (let* ([before (gap-buffer-before-string gb)]
-           [after  (gap-buffer-after-string gb)]
-           [text (string-append before after)]
-           [cursor-pos (gap-buffer-cursor-pos gb)]
-           [total-lines (count-newlines text)]
-           [prompt-width (ansi-display-width prompt)]
-           [cursor-row (count-newlines before)]
-           [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
-                          (width-after-last-newline before)
-                          1)]
-           [move-up (max total-lines prev-lines)])
-      (when (> move-up 0)
-        (display "\x1b;[" port)
-        (display move-up port)
-        (display "A" port))
-      (display "\r\x1b;[J" port)
-      (display prompt port)
-      (let ([tokens (tokenize text)])
-        (display-colourised port text tokens cursor-pos))
-      ;; Display ghost suggestion if cursor is at end
-      (when (and (= cursor-pos (string-length text))
-                 (> (string-length suggestion) 0))
-        (display "\x1b;[38;5;240m" port)  ; dim grey
-        (display suggestion port)
-        (display "\x1b;[39m" port))
-      ;; Position cursor
-      (let ([lines-after-cursor (- total-lines cursor-row)])
-        (when (> lines-after-cursor 0)
-          (display "\x1b;[" port)
-          (display lines-after-cursor port)
-          (display "A" port)))
-      (display "\x1b;[" port)
-      (display cursor-col port)
-      (display "G" port)
-      (flush-output-port port)
-      total-lines))
+  (define render-line/suggestion
+    (case-lambda
+      [(port prompt gb prev-lines suggestion)
+       (render-line/suggestion port prompt gb prev-lines suggestion 0)]
+      [(port prompt gb prev-lines suggestion term-cols)
+       (let* ([before (gap-buffer-before-string gb)]
+              [after  (gap-buffer-after-string gb)]
+              [text (string-append before after)]
+              [cursor-pos (gap-buffer-cursor-pos gb)]
+              [prompt-width (ansi-display-width prompt)]
+              [total-lines (count-visual-lines prompt-width text term-cols)]
+              [cursor-row (cursor-visual-row prompt-width before term-cols)]
+              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
+                             (width-after-last-newline before)
+                             1)]
+              [move-up (max total-lines prev-lines)])
+         (when (> move-up 0)
+           (display "\x1b;[" port)
+           (display move-up port)
+           (display "A" port))
+         (display "\r\x1b;[J" port)
+         (display prompt port)
+         (let ([tokens (tokenize text)])
+           (display-colourised port text tokens cursor-pos))
+         ;; Display ghost suggestion if cursor is at end
+         (when (and (= cursor-pos (string-length text))
+                    (> (string-length suggestion) 0))
+           (display "\x1b;[38;5;240m" port)  ; dim grey
+           (display suggestion port)
+           (display "\x1b;[39m" port))
+         ;; Position cursor
+         (let ([lines-after-cursor (- total-lines cursor-row)])
+           (when (> lines-after-cursor 0)
+             (display "\x1b;[" port)
+             (display lines-after-cursor port)
+             (display "A" port)))
+         (display "\x1b;[" port)
+         (display cursor-col port)
+         (display "G" port)
+         (flush-output-port port)
+         total-lines)]))
 
   ;; ======================================================================
   ;; flash-matching-paren
@@ -579,5 +632,164 @@
                     [(hashtable-ref pos-set i #f) (loop (+ i 1) #t)]
                     [else (loop (+ i 1) #f)]))
         (display "\x1b;[22;24m" port))))
+
+  ;; ======================================================================
+  ;; render-completion-grid — fish/zsh-style multi-column completion
+  ;; ======================================================================
+
+  ;; Selection colours (muted indigo background, light text)
+  (define sel-bg "\x1b;[48;2;56;62;87m")
+  (define sel-fg "\x1b;[38;2;195;202;230m")
+  (define dir-colour '(130 170 255))  ; blue for directories
+
+  ;; Truncate string to max display width, appending … if truncated.
+  (define (truncate-display str max-w)
+    (let ([len (string-length str)])
+      (let lp ([i 0] [w 0])
+        (cond
+          [(>= i len) str]
+          [else
+           (let ([cw (char-display-width (string-ref str i))])
+             (if (> (+ w cw) (- max-w 1))
+                 (string-append (substring str 0 i) "\x2026;")
+                 (lp (+ i 1) (+ w cw))))]))))
+
+  ;; Pad string to exactly target display width with spaces.
+  (define (pad-to-width str target-w)
+    (let ([w (string-display-width str)])
+      (if (>= w target-w)
+          str
+          (string-append str (make-string (- target-w w) #\space)))))
+
+  ;; Fish-style grid completion renderer.
+  ;; entries: list of (candidate positions [description])
+  ;; Returns (values menu-lines grid-cols grid-rows scroll-offset)
+  (define (render-completion-grid port entries selected-index term-cols max-visible)
+    (let* ([n (length entries)]
+           ;; Extract candidate names and check for descriptions
+           [names (map car entries)]
+           [has-descs? (and (pair? entries)
+                           (pair? (cdr (car entries)))
+                           (pair? (cddr (car entries)))
+                           (list? (cadar entries)))]
+           [descs (if has-descs? (map caddr entries) '())]
+           ;; Compute max candidate display width
+           [max-name-w (fold-left
+                         (lambda (mx s) (max mx (string-display-width s)))
+                         0 names)]
+           ;; Compute max description display width
+           [max-desc-w (if has-descs?
+                          (fold-left
+                            (lambda (mx d)
+                              (if (and d (string? d))
+                                  (max mx (string-display-width d))
+                                  mx))
+                            0 descs)
+                          0)]
+           ;; Column width: 2 indent + name + 2 gap (between cols)
+           ;; With descriptions: single column, name + 2 + desc
+           [cell-width (if has-descs?
+                          term-cols  ; single column when descriptions present
+                          (+ 2 (min max-name-w (quotient term-cols 2)) 2))]
+           ;; Grid columns
+           [grid-cols (if has-descs?
+                         1
+                         (max 1 (quotient term-cols cell-width)))]
+           ;; Grid rows
+           [grid-rows (let ([q (quotient n grid-cols)]
+                            [r (remainder n grid-cols)])
+                        (if (> r 0) (+ q 1) q))]
+           ;; Selected row
+           [sel-row (if (>= selected-index 0)
+                        (quotient selected-index grid-cols)
+                        0)]
+           ;; Scroll offset: keep selected row visible
+           [scroll-off (cond
+                         [(< sel-row max-visible)
+                          0]
+                         [else
+                          (- sel-row (- max-visible 1))])]
+           [vis-rows (min grid-rows max-visible)]
+           [name-col-w (min max-name-w (- (if has-descs?
+                                              (- term-cols 6)
+                                              (quotient term-cols 2))
+                                          0))])
+
+      ;; Output the grid
+      (display "\n" port)
+      (let row-loop ([row scroll-off] [lines 0])
+        (cond
+          [(or (>= row (+ scroll-off vis-rows)) (>= row grid-rows))
+           ;; Pager indicator if scrolled
+           (let ([total-lines
+                  (if (> grid-rows vis-rows)
+                      (begin
+                        (display "\x1b;[38;5;240m" port)
+                        (display "  " port)
+                        (display (+ sel-row 1) port)
+                        (display "/" port)
+                        (display grid-rows port)
+                        (display " rows" port)
+                        (display "\x1b;[39m" port)
+                        (display "\n" port)
+                        (+ lines 1))
+                      lines)])
+             (values total-lines grid-cols grid-rows scroll-off))]
+          [else
+           ;; Render one row of the grid
+           (let col-loop ([col 0])
+             (let ([idx (+ (* row grid-cols) col)])
+               (if (or (>= col grid-cols) (>= idx n))
+                   ;; End of row — newline and proceed to next row
+                   (begin
+                     (display "\n" port)
+                     (row-loop (+ row 1) (+ lines 1)))
+                   ;; Render one cell
+                   (let* ([entry (list-ref entries idx)]
+                          [candidate (car entry)]
+                          [positions (if (and (pair? (cdr entry))
+                                             (pair? (cddr entry))
+                                             (list? (cadr entry)))
+                                        (cadr entry)
+                                        (cdr entry))]
+                          [description (if (and (pair? (cdr entry))
+                                               (pair? (cddr entry))
+                                               (list? (cadr entry)))
+                                          (caddr entry)
+                                          #f)]
+                          [selected? (= idx selected-index)]
+                          [is-dir? (and (> (string-length candidate) 0)
+                                        (char=? (string-ref candidate
+                                                   (- (string-length candidate) 1))
+                                                #\/))]
+                          [disp-name (truncate-display candidate name-col-w)]
+                          [padded (if has-descs?
+                                     (pad-to-width disp-name (+ name-col-w 2))
+                                     (pad-to-width disp-name (- cell-width 2)))])
+                     ;; Selected background
+                     (when selected? (display sel-bg port) (display sel-fg port))
+                     ;; Indent
+                     (display "  " port)
+                     ;; Directory colour
+                     (when (and is-dir? (not selected?))
+                       (fg-colour-l port dir-colour))
+                     ;; Candidate with highlights
+                     (display-with-highlights port padded positions)
+                     ;; Reset directory colour
+                     (when (and is-dir? (not selected?))
+                       (display "\x1b;[39m" port))
+                     ;; Description (single-column mode)
+                     (when (and has-descs? description (string? description))
+                       (if selected?
+                           (display "\x1b;[38;2;140;145;170m" port)
+                           (display "\x1b;[38;5;240m" port))
+                       (display (truncate-display description
+                                  (max 10 (- term-cols name-col-w 6))) port)
+                       (if selected?
+                           (display sel-fg port)
+                           (display "\x1b;[39m" port)))
+                     ;; Reset selection
+                     (when selected? (display "\x1b;[0m" port))
+                     (col-loop (+ col 1))))))]))))
 
 ) ; end library
