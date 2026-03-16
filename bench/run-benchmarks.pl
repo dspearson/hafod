@@ -142,6 +142,23 @@ if (@compare_benches) {
         printf "  %s  %s  %s\n", '-' x 22, '-' x 9, '-' x 9;
     }
 
+    # Measure startup overhead first (bench 13) so we can subtract it
+    my ($h_startup, $s_startup) = (0, 0);
+    my $startup_script_h = "$BENCHDIR/13-startup-hafod.ss";
+    my $startup_script_s = "$BENCHDIR/13-startup-scsh.scm";
+    if (-f $startup_script_h) {
+        progress("startup baseline");
+        ($h_startup) = run_timed(qq{$HAFOD -s "$startup_script_h"}, $ITERATIONS);
+        if ($have_scsh && -f $startup_script_s) {
+            ($s_startup) = run_timed(qq{cd "$SCSH_DIR" && "$SCSH" -s "$startup_script_s"}, $ITERATIONS);
+        }
+        clear_progress();
+    }
+
+    printf "  \e[2mstartup baseline:  hafod=%s  scsh=%s  (subtracted below)\e[0m\n\n",
+        fmt_time($h_startup),
+        $have_scsh ? fmt_time($s_startup) : "n/a";
+
     my @ratios;
 
     for my $name (@compare_benches) {
@@ -152,13 +169,20 @@ if (@compare_benches) {
         my ($h_best, $h_med) = run_timed(qq{$HAFOD -s "$hafod_script"}, $ITERATIONS);
         save_row($name, $h_best, $h_med, 'hafod');
 
+        # Subtract startup overhead (floor at 0.001 to avoid division issues)
+        my $h_adj = $h_best - $h_startup;
+        $h_adj = 0.001 if $h_adj < 0.001;
+
         if ($have_scsh) {
             my ($s_best, $s_med) = run_timed(qq{cd "$SCSH_DIR" && "$SCSH" -s "$scsh_script"}, $ITERATIONS);
             clear_progress();
             save_row($name, $s_best, $s_med, 'scsh');
 
-            my $ratio = ($s_best > 0) ? $h_best / $s_best : 0;
-            push @ratios, $ratio if $ratio > 0;
+            my $s_adj = $s_best - $s_startup;
+            $s_adj = 0.001 if $s_adj < 0.001;
+
+            my $ratio = ($s_adj > 0) ? $h_adj / $s_adj : 0;
+            push @ratios, $ratio if $ratio > 0 && $name ne '13-startup';
             my $bar = ratio_bar($ratio);
 
             printf "  %-22s  %9s %9s   %9s %9s   %6.2fx %s\n",
@@ -182,7 +206,7 @@ if (@compare_benches) {
         printf "\n  %s\n", '-' x 72;
         printf "  %-22s  %39s   %6.2fx %s\n",
             "geometric mean", "", $geo_mean, ratio_bar($geo_mean);
-        print "\n  \e[2m< hafod faster    > scsh faster    (ratio = hafod/scsh)\e[0m\n";
+        print "\n  \e[2m< hafod faster    > scsh faster    (ratio = hafod/scsh, startup-adjusted)\e[0m\n";
     }
     print "\n";
 }

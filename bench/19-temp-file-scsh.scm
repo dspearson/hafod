@@ -2,7 +2,7 @@
 -s
 !#
 ;;; Benchmark 19: Temp file create/delete
-(define N 200)
+(define N 2000)
 (let loop ((i 0))
   (if (< i N)
       (begin

@@ -609,38 +609,53 @@ To port a scsh script to hafod:
 
 ## Performance
 
-hafod 1.4 (Chez Scheme 10.0) vs scsh 0.7 (Scheme48 1.9.2), best-of-7
-runs on x86_64 Linux.  Ratio < 1.0 means hafod is faster.
+hafod 1.4 (Chez Scheme 10.0) vs scsh 0.7 (Scheme48 1.9.2) on
+x86_64 Linux.  In-process timing (startup excluded) — each runtime
+is started once and all operations are measured within the process.
+Ratio < 1.0 means hafod is faster.
 
-| Benchmark | hafod (s) | scsh (s) | Ratio | Winner |
-|-----------|-----------|----------|-------|--------|
-| fork-exec (500 runs) | 0.810 | 1.654 | 0.49x | hafod |
-| pipeline (100 runs) | 0.544 | 1.253 | 0.43x | hafod |
-| string I/O (500 runs) | 0.428 | 1.099 | 0.39x | hafod |
-| regex match (10k runs) | 0.128 | 0.442 | 0.29x | hafod |
-| file ops (500 runs) | 0.126 | 0.345 | 0.36x | hafod |
-| computation | 0.804 | 1.333 | 0.60x | hafod |
-| env ops (10k runs) | 0.089 | 0.053 | 1.68x | scsh |
-| glob (100 runs) | 0.132 | 0.594 | 0.22x | hafod |
-| startup | 0.084 | 0.013 | 6.47x | scsh |
-| read-line (500 runs) | 0.126 | 0.389 | 0.32x | hafod |
-| field split (5k runs) | 0.109 | 0.882 | 0.12x | hafod |
-| AWK (200 runs) | 0.109 | 0.175 | 0.62x | hafod |
-| regex subst (5k runs) | 0.125 | 1.719 | 0.07x | hafod |
-| output capture (500 runs) | 0.852 | 1.861 | 0.46x | hafod |
-| temp file (200 runs) | 0.085 | 0.033 | 2.55x | scsh |
-| with-cwd (5k runs) | 0.090 | 0.093 | 0.96x | hafod |
+| Benchmark | N | hafod (ms) | scsh (ms) | Ratio | Winner |
+|-----------|---|-----------|-----------|-------|--------|
+| fork-exec | 500 | 1750 | 892 | 1.96x | scsh |
+| pipeline | 200 | 1726 | 1275 | 1.35x | scsh |
+| string I/O | 200 | 302 | 839 | 0.36x | hafod |
+| regex match | 10k | 5 | 237 | 0.02x | hafod |
+| file ops | 500 | 8 | 62 | 0.12x | hafod |
+| computation (fib 35) | 1 | 766 | 1406 | 0.54x | hafod |
+| env ops | 50k | 30 | 279 | 0.11x | hafod |
+| glob | 100 | 659 | 7849 | 0.08x | hafod |
+| read-line | 500 | 760 | 2494 | 0.30x | hafod |
+| field split | 5k | 22 | 1815 | 0.01x | hafod |
+| AWK | 200 | 302 | 990 | 0.31x | hafod |
+| regex subst | 5k | 11 | 430 | 0.03x | hafod |
+| output capture | 500 | 3029 | 1597 | 1.90x | scsh |
+| temp file | 2k | 22 | 204 | 0.11x | hafod |
+| with-cwd | 50k | 115 | 819 | 0.14x | hafod |
 
-**Summary:** hafod wins 13 of 16 benchmarks (geometric mean 0.52x).
-The largest gains are in regex substitution (14x faster), field
-splitting (8x faster), glob (4.5x faster), and pipeline throughput
-(2.3x faster).  scsh wins on startup time (Scheme48's image-based
-startup is faster than Chez's library loading), temp file creation
-(dominated by startup overhead), and env ops (Scheme48's simpler
-environment representation).
+**Summary:** hafod wins 12 of 15 benchmarks.  The largest gains are
+in field splitting (82x), regex matching (51x), regex substitution
+(39x), and glob (12x).  scsh wins fork-exec, pipeline, and output
+capture — all process-creation-heavy workloads where Scheme48's
+smaller address space makes `fork(2)` cheaper (less copy-on-write
+overhead).
 
-The benchmark suite is in `bench/`.  Run `perl bench/run-benchmarks.pl`
-to reproduce.
+Startup is not included in these numbers.  Chez Scheme's library-based
+startup (~84ms) is slower than Scheme48's image resume (~13ms); for
+short-lived scripts, use the standalone build (`make standalone`) which
+reduces startup via embedded boot files.
+
+hafod green threads (no scsh equivalent):
+
+| Benchmark | Description | Time (ms) |
+|-----------|-------------|----------|
+| threads-10k | spawn+join 10,000 threads | 24 |
+| channel-50k | 50,000 messages through buffered channel | 6 |
+| preempt-100x10k | 100 preempted threads, 10k work each | 40 |
+| ring-50x5k | 50-thread ring, 5,000 token passes | 314 |
+
+The in-process benchmark scripts are in `bench/all-hafod.ss` and
+`bench/all-scsh.scm`.  The process-level runner (including startup)
+is `perl bench/run-benchmarks.pl`.
 
 ## Relationship to scsh
 

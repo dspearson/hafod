@@ -103,6 +103,12 @@
   ;; Initialized from the C environ global at library load time.
   (define %environ (make-parameter (read-environ)))
 
+  ;; Dirty flag: #t when the Scheme alist has diverged from the OS
+  ;; environment via alist->env or with-total-env*.  setenv/getenv
+  ;; keep the OS in sync directly, so alignment is only needed when
+  ;; the alist was replaced wholesale.
+  (define %env-dirty? #f)
+
   ;; Fresh read from OS (for alignment checking)
   (define (read-environ-fresh) (read-environ))
 
@@ -133,7 +139,8 @@
   ;; alist->env: replace the Scheme-side environment with the given alist.
   ;; Does NOT immediately sync to OS -- use align-env! or with-resources-aligned.
   (define (alist->env alist)
-    (%environ alist))
+    (%environ alist)
+    (set! %env-dirty? #t))
 
   ;; ======================================================================
   ;; Dynamic scoping
@@ -154,11 +161,13 @@
       (dynamic-wind
         (lambda ()
           (%environ alist)
-          (sync-env-to-os! alist))
+          (sync-env-to-os! alist)
+          (set! %env-dirty? #f))
         thunk
         (lambda ()
           (%environ saved)
-          (sync-env-to-os! saved)))))
+          (sync-env-to-os! saved)
+          (set! %env-dirty? #f)))))
 
   ;; ======================================================================
   ;; OS synchronization
@@ -188,8 +197,12 @@
 
   ;; align-env!: sync OS environment to match Scheme-side alist.
   ;; Called by with-resources-aligned before fork/exec.
+  ;; Skips the expensive sync when the OS is already in sync (setenv/getenv
+  ;; update both the alist and the OS directly).
   (define (align-env!)
-    (sync-env-to-os! (%environ)))
+    (when %env-dirty?
+      (sync-env-to-os! (%environ))
+      (set! %env-dirty? #f)))
 
   ;; Resource descriptor for use with with-resources-aligned.
   ;; This is a cons pair (name . align-thunk) for v1 simplicity.

@@ -2,7 +2,7 @@
 -s
 !#
 ;;; Benchmark 20: with-cwd overhead
-(define N 5000)
+(define N 50000)
 (let loop ((i 0))
   (if (< i N)
       (begin
