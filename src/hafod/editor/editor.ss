@@ -2096,6 +2096,25 @@
                          (dismiss-completion!)
                          (reset-undo-state!)
                          (set! suggestion-text "")
+                         ;; Move cursor past all content lines before newline,
+                         ;; so the result prints below the full expression.
+                         (let* ([text (gap-buffer->string gb)]
+                                [total-lines (let lp ([i 0] [n 0])
+                                               (cond [(>= i (string-length text)) n]
+                                                     [(char=? (string-ref text i) #\newline)
+                                                      (lp (+ i 1) (+ n 1))]
+                                                     [else (lp (+ i 1) n)]))]
+                                [before (gap-buffer-before-string gb)]
+                                [cursor-row (let lp ([i 0] [n 0])
+                                              (cond [(>= i (string-length before)) n]
+                                                    [(char=? (string-ref before i) #\newline)
+                                                     (lp (+ i 1) (+ n 1))]
+                                                    [else (lp (+ i 1) n)]))]
+                                [lines-below (- total-lines cursor-row)])
+                           (when (> lines-below 0)
+                             (display "\x1b;[" out-port)
+                             (display lines-below out-port)
+                             (display "B" out-port)))
                          (display "\n" out-port)
                          (reset-cursor out-port)
                          (flush-output-port out-port)
