@@ -115,38 +115,45 @@
         (display "popd: directory stack empty\n" (console-error-port))
         (let ([target (car dir-stack-list)]
               [old (cwd)])
-          (set! dir-stack-list (cdr dir-stack-list))
-          (chdir target)
-          (setenv "OLDPWD" old)
-          (setenv "PWD" (cwd)))))
+          (guard (e [#t (display
+                          (format "popd: ~a: ~a\n"
+                                  target
+                                  (if (condition? e)
+                                      (condition-message e)
+                                      e))
+                          (console-error-port))])
+            (chdir target)
+            (set! dir-stack-list (cdr dir-stack-list))
+            (setenv "OLDPWD" old)
+            (setenv "PWD" (cwd))))))
 
   ;; --- export ---
   (define (builtin-export args)
     (when (pair? args)
-      (let ([arg (car args)])
-        (let ([eqpos (let loop ([i 0])
-                       (cond
-                         [(>= i (string-length arg)) #f]
-                         [(char=? (string-ref arg i) #\=) i]
-                         [else (loop (+ i 1))]))])
-          (if eqpos
-              (let ([var (substring arg 0 eqpos)]
-                    [val (substring arg (+ eqpos 1) (string-length arg))])
-                (setenv var val))
-              ;; No =, just mark for export (setenv with current value)
-              (let ([cur (getenv arg)])
-                (when cur (setenv arg cur))))))))
+      (let* ([arg (car args)]
+             [eqpos (let loop ([i 0])
+                      (cond
+                        [(>= i (string-length arg)) #f]
+                        [(char=? (string-ref arg i) #\=) i]
+                        [else (loop (+ i 1))]))])
+        (if eqpos
+            (let ([var (substring arg 0 eqpos)]
+                  [val (substring arg (+ eqpos 1) (string-length arg))])
+              (setenv var val))
+            ;; No =, just mark for export (setenv with current value)
+            (let ([cur (getenv arg)])
+              (when cur (setenv arg cur)))))))
 
   ;; --- Dispatcher ---
   (define (run-builtin! str)
-    (let ([args (parse-args str)])
-      ;; Extract command name (first token)
-      (let ([cmd (let loop ([i 0] [len (string-length str)])
-                   (cond
-                     [(>= i len) (substring str 0 len)]
-                     [(char-whitespace? (string-ref str i)) (substring str 0 i)]
-                     [else (loop (+ i 1) len)]))])
-        (cond
+    (let ([args (parse-args str)]
+          ;; Extract command name (first token)
+          [cmd (let loop ([i 0] [len (string-length str)])
+                 (cond
+                   [(>= i len) (substring str 0 len)]
+                   [(char-whitespace? (string-ref str i)) (substring str 0 i)]
+                   [else (loop (+ i 1) len)]))])
+      (cond
           [(string=? cmd "cd") (builtin-cd args)]
           [(string=? cmd "pushd") (builtin-pushd args)]
           [(string=? cmd "popd") (builtin-popd args)]
@@ -154,5 +161,5 @@
           [(string=? cmd "jobs") (list-jobs)]
           [(string=? cmd "fg") (job-fg! (if (null? args) "" (car args)))]
           [(string=? cmd "bg") (job-bg-resume! (if (null? args) "" (car args)))]
-          [else (display (format "~a: not a builtin\n" cmd) (console-error-port))]))))
+          [else (display (format "~a: not a builtin\n" cmd) (console-error-port))])))
 )

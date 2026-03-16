@@ -20,7 +20,8 @@
                 fg-colour fg-colour-l
                 ident-colour-from-hash ident-hash)
           (only (hafod interactive) query-terminal-size)
-          (only (hafod posix) SIGWINCH))
+          (only (hafod posix) SIGWINCH)
+          (only (hafod shell classifier) classify-input))
 
   ;; ======================================================================
   ;; fzf dark256 colour scheme (256-colour escapes)
@@ -68,7 +69,8 @@
       total-count              ;; integer: length of original items
       prompt                   ;; string: prompt text (e.g. "> ")
       display-items            ;; vector of flattened display strings
-      colorize?))              ;; boolean: apply Scheme syntax colouring
+      colorize?                ;; #f or procedure: (string -> boolean) — true means syntax-colour
+      show-numbers?))          ;; boolean: show 1-based index numbers beside candidates
 
   ;; ======================================================================
   ;; Multiline flattening
@@ -184,6 +186,33 @@
                          (if (fx< p olen) (vector-ref map-vec p) -1))
                        positions)))))
 
+  ;; Emit a single character with highlight toggling.
+  ;; Returns the new in-hl? state.
+  ;; hl-on/hl-off: escape strings for entering/leaving highlight.
+  ;; restore-after-newline: thunk called after ↵ to restore colours.
+  (define (emit-char-with-highlight buf ch want-hl? in-hl?
+                                    hl-on hl-off restore-after-newline)
+    (cond
+      ;; ↵ symbol rendered in dim
+      [(char=? ch #\x21b5)
+       (when in-hl? (display hl-off buf))
+       (display SGR-DIM buf)
+       (display ch buf)
+       (display SGR-RESET buf)
+       (restore-after-newline)
+       #f]
+      [(and want-hl? (not in-hl?))
+       (display hl-on buf)
+       (display ch buf)
+       #t]
+      [(and (not want-hl?) in-hl?)
+       (display hl-off buf)
+       (display ch buf)
+       #f]
+      [else
+       (display ch buf)
+       in-hl?]))
+
   ;; Display candidate text with fzf-style match highlighting.
   ;; on-selected? uses hl+ (151), otherwise hl (108).
   (define (display-candidate buf str positions on-selected?)
@@ -192,33 +221,18 @@
           [hl-on  (string-append SGR-BOLD (if on-selected? COL-HL+ COL-HL))]
           [hl-off (if on-selected?
                       (string-append SGR-RESET COL-BG+ SGR-BOLD COL-FG+)
-                      SGR-RESET)])
+                      SGR-RESET)]
+          [restore (lambda ()
+                     (when on-selected?
+                       (display (string-append COL-BG+ SGR-BOLD COL-FG+) buf)))])
       (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
       (let loop ([i 0] [in-hl? #f])
         (when (fx< i len)
           (let ([ch (string-ref str i)]
                 [want? (hashtable-ref pos-set i #f)])
-            (cond
-              ;; ↵ symbol rendered in dim
-              [(char=? ch #\x21b5)
-               (when in-hl? (display hl-off buf))
-               (display SGR-DIM buf)
-               (display ch buf)
-               (display SGR-RESET buf)
-               (when on-selected?
-                 (display (string-append COL-BG+ SGR-BOLD COL-FG+) buf))
-               (loop (fx1+ i) #f)]
-              [(and want? (not in-hl?))
-               (display hl-on buf)
-               (display ch buf)
-               (loop (fx1+ i) #t)]
-              [(and (not want?) in-hl?)
-               (display hl-off buf)
-               (display ch buf)
-               (loop (fx1+ i) #f)]
-              [else
-               (display ch buf)
-               (loop (fx1+ i) in-hl?)]))))
+            (loop (fx1+ i)
+                  (emit-char-with-highlight buf ch want? in-hl?
+                                            hl-on hl-off restore)))))
       (when (let loop ([i 0] [last #f])
               (cond [(fx>= i len) last]
                     [(hashtable-ref pos-set i #f) (loop (fx1+ i) #t)]
@@ -231,7 +245,9 @@
   (define (display-candidate/syntax buf str positions on-selected?)
     (let* ([tokens (tokenize str)]
            [len (string-length str)]
-           [pos-set (make-eq-hashtable)])
+           [pos-set (make-eq-hashtable)]
+           [hl-on  "\x1b;[1;4m"]
+           [hl-off "\x1b;[22;24m"])
       (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
       (for-each
         (lambda (tok)
@@ -239,54 +255,33 @@
                  [start (cadr tok)]
                  [end (caddr tok)]
                  [depth (cadddr tok)]
-                 [span (substring str start end)])
+                 [span (substring str start end)]
+                 [emit-tok-colour
+                   (lambda ()
+                     (case type
+                       [(paren)
+                        (fg-colour-l buf (vector-ref paren-colours
+                                           (modulo depth num-paren-colours)))]
+                       [(atom)
+                        (fg-colour-l buf (ident-colour-from-hash (ident-hash span)))]
+                       [(number)  (fg-colour-l buf number-colour)]
+                       [(boolean) (fg-colour-l buf boolean-colour)]
+                       [(string)  (fg-colour-l buf string-colour)]
+                       [(comment) (fg-colour-l buf comment-colour)]
+                       [else (void)]))]
+                 [restore (lambda ()
+                            (when on-selected? (display COL-BG+ buf))
+                            (emit-tok-colour))])
             ;; Set syntax foreground for this token
-            (case type
-              [(paren)
-               (fg-colour-l buf (vector-ref paren-colours
-                                  (modulo depth num-paren-colours)))]
-              [(atom)
-               (fg-colour-l buf (ident-colour-from-hash (ident-hash span)))]
-              [(number)  (fg-colour-l buf number-colour)]
-              [(boolean) (fg-colour-l buf boolean-colour)]
-              [(string)  (fg-colour-l buf string-colour)]
-              [(comment) (fg-colour-l buf comment-colour)]
-              [else (void)])  ; whitespace/other: default fg
+            (emit-tok-colour)
             ;; Render characters with match position overlay
             (let char-loop ([i start] [in-hl? #f])
               (when (fx< i end)
                 (let ([ch (string-ref str i)]
                       [want-hl? (hashtable-ref pos-set i #f)])
-                  (cond
-                    ;; ↵ symbol rendered dim
-                    [(char=? ch #\x21b5)
-                     (when in-hl? (display "\x1b;[22;24m" buf))
-                     (display SGR-DIM buf)
-                     (display ch buf)
-                     (display SGR-RESET buf)
-                     (when on-selected? (display COL-BG+ buf))
-                     ;; Re-apply token colour for remaining chars
-                     (case type
-                       [(paren) (fg-colour-l buf (vector-ref paren-colours
-                                                   (modulo depth num-paren-colours)))]
-                       [(atom) (fg-colour-l buf (ident-colour-from-hash (ident-hash span)))]
-                       [(number) (fg-colour-l buf number-colour)]
-                       [(boolean) (fg-colour-l buf boolean-colour)]
-                       [(string) (fg-colour-l buf string-colour)]
-                       [(comment) (fg-colour-l buf comment-colour)]
-                       [else (void)])
-                     (char-loop (fx1+ i) #f)]
-                    [(and want-hl? (not in-hl?))
-                     (display "\x1b;[1;4m" buf)
-                     (display ch buf)
-                     (char-loop (fx1+ i) #t)]
-                    [(and (not want-hl?) in-hl?)
-                     (display "\x1b;[22;24m" buf)
-                     (display ch buf)
-                     (char-loop (fx1+ i) #f)]
-                    [else
-                     (display ch buf)
-                     (char-loop (fx1+ i) in-hl?)]))))
+                  (char-loop (fx1+ i)
+                             (emit-char-with-highlight buf ch want-hl? in-hl?
+                                                      hl-on hl-off restore)))))
             ;; Reset bold/underline and fg after each token
             (display "\x1b;[22;24;39m" buf)
             (when on-selected? (display COL-BG+ buf))))
@@ -306,7 +301,8 @@
            [total (finder-state-total-count state)]
            [cand-bottom (fx- rows 2)]   ; row of best match
            [info-row (fx- rows 1)]      ; info/separator row
-           [colorize? (finder-state-colorize? state)])
+           [colorize? (finder-state-colorize? state)]
+           [show-nums? (finder-state-show-numbers? state)])
 
       ;; --- Candidate rows (bottom-up) ---
       ;; cand-bottom = index 0 (best match), going up for higher indices
@@ -324,7 +320,13 @@
                        [positions (cdr entry)]
                        [disp-str (display-version state original)]
                        [disp-positions (remap-positions original disp-str positions)]
-                       [text-width (fx- cols 2)]  ; 2 cols for gutter (pointer area)
+                       ;; Number gutter: "  123 " when show-nums? is true
+                       [num-str (if show-nums?
+                                    (string-append
+                                      (number->string (fx1+ idx)) " ")
+                                    "")]
+                       [num-width (string-length num-str)]
+                       [text-width (fx- cols (fx+ 2 num-width))]  ; 2 cols for pointer gutter + number
                        [truncated (truncate-to-width disp-str text-width)]
                        [tlen (string-length truncated)]
                        [vis-positions (filter (lambda (p) (fx< p tlen)) disp-positions)])
@@ -349,8 +351,13 @@
                         (display POINTER-CHAR buf)
                         ;; Space after pointer
                         (display " " buf)
+                        ;; Line number (dim)
+                        (when show-nums?
+                          (display SGR-DIM buf)
+                          (display num-str buf)
+                          (display SGR-BOLD buf))
                         ;; Candidate text in fg+ with hl+
-                        (if colorize?
+                        (if (and colorize? (colorize? original))
                             (begin
                               (display COL-BG+ buf)
                               (display-candidate/syntax buf truncated vis-positions #t))
@@ -361,9 +368,13 @@
                               (display-candidate buf truncated vis-positions #t)))
                         (display SGR-RESET buf))
                       (begin
-                        ;; Normal line: 2 space gutter, default fg
+                        ;; Normal line: 2 space gutter + optional number, default fg
                         (display "  " buf)
-                        (if colorize?
+                        (when show-nums?
+                          (display SGR-DIM buf)
+                          (display num-str buf)
+                          (display SGR-RESET buf))
+                        (if (and colorize? (colorize? original))
                             (display-candidate/syntax buf truncated vis-positions #f)
                             (display-candidate buf truncated vis-positions #f))
                         (display SGR-RESET buf))))
@@ -666,18 +677,30 @@
     (case-lambda
       [(items prompt) (run-finder items prompt #f)]
       [(items prompt colorize?)
-       (run-finder* items prompt colorize?)]))
+       (run-finder* items prompt colorize? #f #f)]
+      [(items prompt colorize? mode-map)
+       (run-finder* items prompt colorize? mode-map #f)]
+      [(items prompt colorize? mode-map show-numbers?)
+       (run-finder* items prompt colorize? mode-map show-numbers?)]))
 
-  (define (run-finder* items prompt colorize?)
+  (define (run-finder* items prompt colorize? mode-map show-numbers?)
     (let-values ([(rows cols) (query-terminal-size)])
       (let* ([item-vec (list->vector items)]
              [disp-vec (build-display-items item-vec)]
              [init-filtered (list->vector (map (lambda (s) (cons s '())) items))]
+             [color-fn (cond
+                        [(not colorize?) #f]
+                        [mode-map
+                         ;; Use stored mode: syntax-colour only if mode is 'scheme
+                         (lambda (s) (eq? 'scheme (hashtable-ref mode-map s 'scheme)))]
+                        [else
+                         ;; Default: use classifier
+                         (lambda (s) (eq? 'scheme (classify-input s)))])]
              [state (make-finder-state item-vec init-filtered
                                        "" 0 0 0
                                        rows cols
                                        (length items) prompt
-                                       disp-vec colorize?)]
+                                       disp-vec color-fn (and show-numbers? #t))]
              [resize-flag (make-flag)])
         (let ([saved-handler #f])
           (dynamic-wind

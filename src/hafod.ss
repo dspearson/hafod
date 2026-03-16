@@ -445,6 +445,7 @@
     shell-completions
     bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
     toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
+    show-keybindings run-tutorial
     editor-history-entries
     editor-finder-proc
     ;; Feature toggles from editor

@@ -45,9 +45,9 @@
                     [(char=? (string-ref params i) #\;) i]
                     [else (loop (+ i 1))]))])
       (if semi
-          (let ([mod-str (substring params (+ semi 1) (string-length params))])
-            (let ([n (string->number mod-str)])
-              (if n (- n 1) 0)))
+          (let* ([mod-str (substring params (+ semi 1) (string-length params))]
+                 [n (string->number mod-str)])
+            (if n (- n 1) 0))
           0)))
 
   ;; Extract key number from CSI params (part before semicolon).

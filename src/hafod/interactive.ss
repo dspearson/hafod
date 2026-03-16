@@ -32,7 +32,8 @@
           (only (hafod internal posix-constants) TIOCGWINSZ)
           (only (hafod environment) getenv setenv)
           (only (hafod procobj) background-job-count)
-          (only (hafod editor editor) read-expression with-raw-mode editor-history-entries)
+          (only (hafod editor editor) read-expression with-raw-mode
+                editor-history-entries editor-history-set-last-mode!)
           (only (hafod tty) tty?)
           (only (hafod editor render) tokenize display-colourised)
           (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
@@ -302,16 +303,16 @@
 
   ;; Compute elapsed milliseconds between two time-monotonic objects.
   (define (elapsed-milliseconds t0 t1)
-    (let ([s0 (time-second t0)]
-          [ns0 (time-nanosecond t0)]
-          [s1 (time-second t1)]
-          [ns1 (time-nanosecond t1)])
-      (let ([ds (- s1 s0)]
-            [dns (- ns1 ns0)])
-        ;; Handle nanosecond underflow by borrowing from seconds
-        (if (< dns 0)
-            (+ (* (- ds 1) 1000) (quotient (+ dns 1000000000) 1000000))
-            (+ (* ds 1000) (quotient dns 1000000))))))
+    (let* ([s0 (time-second t0)]
+           [ns0 (time-nanosecond t0)]
+           [s1 (time-second t1)]
+           [ns1 (time-nanosecond t1)]
+           [ds (- s1 s0)]
+           [dns (- ns1 ns0)])
+      ;; Handle nanosecond underflow by borrowing from seconds
+      (if (< dns 0)
+          (+ (* (- ds 1) 1000) (quotient (+ dns 1000000000) 1000000))
+          (+ (* ds 1000) (quotient dns 1000000)))))
 
   ;; Convert eval result to exit status code.
   ;; If result looks like a wait status (exact non-negative integer),
@@ -510,6 +511,9 @@
                               (let ([class (if (shell-mode?)
                                                (classify-input line)
                                                'scheme)])
+                                ;; Tag the history entry with its eval mode
+                                (editor-history-set-last-mode!
+                                  (if (memq class '(shell builtin)) 'shell 'scheme))
                                 (case class
                                   [(builtin)
                                    ;; Execute builtin directly, skip eval

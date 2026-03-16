@@ -97,8 +97,8 @@
   ;; ======================================================================
 
   (define hafod-major-version 1)
-  (define hafod-minor-version 3)
-  (define hafod-version-string "hafod 1.3.2")
+  (define hafod-minor-version 4)
+  (define hafod-version-string "hafod 1.4")
 
   ;; scsh-compatible version aliases
   (define scsh-major-version hafod-major-version)

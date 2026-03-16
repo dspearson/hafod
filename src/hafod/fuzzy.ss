@@ -783,9 +783,7 @@
           [pat (search-term-pattern term)]
           [cs? (search-term-case-sensitive? term)])
       (case type
-        [(fuzzy)  (let* ([p (if cs? pat pat)]
-                         [result (fuzzy-match-internal pat text cs?)])
-                    result)]
+        [(fuzzy)  (fuzzy-match-internal pat text cs?)]
         [(exact)  (exact-match-scored text pat cs?)]
         [(prefix) (prefix-match-scored text pat cs?)]
         [(suffix) (suffix-match-scored text pat cs?)]

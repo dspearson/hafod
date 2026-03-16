@@ -224,37 +224,37 @@
   ;; ======================================================================
 
   (define (kill-completer prefix context)
-    (let ([lines (command-output "ps" "-eo" "pid,comm" "--no-headers")])
-      (let ([entries
-             (filter (lambda (e) (> (string-length (car e)) 0))
-               (map (lambda (line)
-                      (let* ([trimmed (let skip ([i 0])
-                                        (if (and (< i (string-length line))
-                                                 (char-whitespace? (string-ref line i)))
-                                            (skip (+ i 1))
-                                            (substring line i (string-length line))))]
-                             [space (let scan ([i 0])
-                                      (cond
-                                        [(>= i (string-length trimmed)) #f]
-                                        [(char-whitespace? (string-ref trimmed i)) i]
-                                        [else (scan (+ i 1))]))])
-                        (if space
-                            (cons (substring trimmed 0 space)
-                                  (let skip ([i (+ space 1)])
-                                    (if (and (< i (string-length trimmed))
-                                             (char-whitespace? (string-ref trimmed i)))
-                                        (skip (+ i 1))
-                                        (substring trimmed i (string-length trimmed)))))
-                            (cons trimmed ""))))
-                    lines))])
-        (let ([pids (map car entries)]
-              [desc-ht (let ([ht (make-hashtable string-hash string=?)])
-                         (for-each (lambda (e) (hashtable-set! ht (car e) (cdr e))) entries)
-                         ht)])
-          (map (lambda (m)
-                 (list (car m) (cdr m)
-                       (hashtable-ref desc-ht (car m) #f)))
-               (fuzzy-filter/positions prefix pids))))))
+    (let* ([lines (command-output "ps" "-eo" "pid=" "-eo" "comm=")]
+           [entries
+            (filter (lambda (e) (> (string-length (car e)) 0))
+              (map (lambda (line)
+                     (let* ([trimmed (let skip ([i 0])
+                                       (if (and (< i (string-length line))
+                                                (char-whitespace? (string-ref line i)))
+                                           (skip (+ i 1))
+                                           (substring line i (string-length line))))]
+                            [space (let scan ([i 0])
+                                     (cond
+                                       [(>= i (string-length trimmed)) #f]
+                                       [(char-whitespace? (string-ref trimmed i)) i]
+                                       [else (scan (+ i 1))]))])
+                       (if space
+                           (cons (substring trimmed 0 space)
+                                 (let skip ([i (+ space 1)])
+                                   (if (and (< i (string-length trimmed))
+                                            (char-whitespace? (string-ref trimmed i)))
+                                       (skip (+ i 1))
+                                       (substring trimmed i (string-length trimmed)))))
+                           (cons trimmed ""))))
+                   lines))]
+           [pids (map car entries)]
+           [desc-ht (let ([ht (make-hashtable string-hash string=?)])
+                      (for-each (lambda (e) (hashtable-set! ht (car e) (cdr e))) entries)
+                      ht)])
+      (map (lambda (m)
+             (list (car m) (cdr m)
+                   (hashtable-ref desc-ht (car m) #f)))
+           (fuzzy-filter/positions prefix pids))))
 
   ;; ======================================================================
   ;; Make completer — targets from Makefile

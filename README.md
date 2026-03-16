@@ -354,7 +354,9 @@ Internal libraries (not intended for direct use):
 | `(hafod editor input-decode)` | Terminal input decoder, wcwidth display width |
 | `(hafod editor keymap)` | Trie-based keymap with composable layers |
 | `(hafod editor render)` | Line editor rendering with syntax colouring and feature toggles |
-| `(hafod editor history)` | SQLite-backed persistent history |
+| `(hafod editor history)` | SQLite-backed persistent history with mode tracking |
+| `(hafod editor vi)` | Full vim emulation (motions, operators, text objects, visual, search) |
+| `(hafod editor help)` | Keybinding reference and interactive tutorial |
 | `(hafod editor editor)` | Gap-buffer line editor with paredit |
 
 ## Examples
@@ -390,7 +392,7 @@ hafod -s examples/01-system-info.ss
 
 ## Tests
 
-The test suite comprises 68 Scheme test suites (2,300+ assertions) and a
+The test suite comprises 72 Scheme test suites (2,500+ assertions) and a
 91-test shell-based launcher test:
 
 ```sh
@@ -550,13 +552,21 @@ hafod adds several capabilities beyond the original scsh:
   comments, numbers, booleans), smart enter, bracketed paste,
   prefix-filtered Up/Down, undo/redo (C-/ and M-/), fish-style
   auto-suggestions, command timing display, terminal-wrap-aware
-  multiline rendering
+  multiline rendering, `(show-keybindings)` reference,
+  `(run-tutorial)` interactive walkthrough
+- **Full vim emulation** -- vi normal mode with motions (w/W/b/B/e/E,
+  f/F/t/T, 0/^/$, gg/G, %), operators (d/c/y with text objects),
+  visual mode (v/V), search (/pattern, n/N, */#), registers
+  ("\{reg}), marks (m{char}, '{char}), count prefixes ({n}{cmd}),
+  and dot-repeat.  State encapsulated in a single record for clean
+  session management
 - **fzf-style fuzzy finder** -- full-screen fuzzy picker on
   alternate screen buffer with real-time filtering:
-  - Ctrl-R: syntax-coloured history search (deduplicated,
-    rainbow parens and identifiers in candidates)
+  - Ctrl-R: history search with mode-aware colouring (Scheme
+    entries get rainbow parens/identifiers, shell entries render
+    plain), numbered candidates, history mode stored in SQLite
   - Ctrl-T: file picker (`git ls-files` in repos, recursive
-    walk outside)
+    walk outside); auto-inserts space before filename when needed
   - Alt-C: directory picker with `cd` on selection
   - Extended search syntax: `!negation`, `^prefix`, `.suffix`,
     `'exact`, terms separated by spaces (AND)
@@ -594,39 +604,40 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,100+ scsh-compatible symbols are
+5. Most scripts work unchanged -- 1,175+ scsh-compatible symbols are
    exported
 
 ## Performance
 
-hafod vs scsh 0.6.7 on Scheme48, best-of-3 runs.  Ratio < 1.0 means
-hafod is faster.
+hafod 1.4 (Chez Scheme 10.0) vs scsh 0.7 (Scheme48 1.9.2), best-of-7
+runs on x86_64 Linux.  Ratio < 1.0 means hafod is faster.
 
 | Benchmark | hafod (s) | scsh (s) | Ratio | Winner |
 |-----------|-----------|----------|-------|--------|
-| fork-exec (500 runs) | 0.993 | 1.714 | 0.58x | hafod |
-| pipeline (100 runs) | 0.785 | 1.163 | 0.67x | hafod |
-| string I/O (500 runs) | 0.451 | 1.077 | 0.42x | hafod |
-| regex match (10k runs) | 0.118 | 0.527 | 0.22x | hafod |
-| file ops (500 runs) | 0.142 | 0.419 | 0.34x | hafod |
-| computation | 0.743 | 1.600 | 0.46x | hafod |
-| env ops (10k runs) | 0.120 | 0.169 | 0.71x | hafod |
-| glob (100 runs) | 0.106 | 0.091 | 1.16x | scsh |
-| startup | 0.101 | 0.026 | 3.88x | scsh |
-| read-line (500 runs) | 0.142 | 0.538 | 0.26x | hafod |
-| field split (5k runs) | 0.126 | 1.004 | 0.13x | hafod |
-| AWK (200 runs) | 0.125 | 0.212 | 0.59x | hafod |
-| regex subst (5k runs) | 0.134 | 1.921 | 0.07x | hafod |
-| output capture (500 runs) | 0.918 | 1.797 | 0.51x | hafod |
-| temp file (200 runs) | 0.115 | 0.052 | 2.21x | scsh |
-| with-cwd (5k runs) | 0.114 | 0.121 | 0.94x | hafod |
+| fork-exec (500 runs) | 0.810 | 1.654 | 0.49x | hafod |
+| pipeline (100 runs) | 0.544 | 1.253 | 0.43x | hafod |
+| string I/O (500 runs) | 0.428 | 1.099 | 0.39x | hafod |
+| regex match (10k runs) | 0.128 | 0.442 | 0.29x | hafod |
+| file ops (500 runs) | 0.126 | 0.345 | 0.36x | hafod |
+| computation | 0.804 | 1.333 | 0.60x | hafod |
+| env ops (10k runs) | 0.089 | 0.053 | 1.68x | scsh |
+| glob (100 runs) | 0.132 | 0.594 | 0.22x | hafod |
+| startup | 0.084 | 0.013 | 6.47x | scsh |
+| read-line (500 runs) | 0.126 | 0.389 | 0.32x | hafod |
+| field split (5k runs) | 0.109 | 0.882 | 0.12x | hafod |
+| AWK (200 runs) | 0.109 | 0.175 | 0.62x | hafod |
+| regex subst (5k runs) | 0.125 | 1.719 | 0.07x | hafod |
+| output capture (500 runs) | 0.852 | 1.861 | 0.46x | hafod |
+| temp file (200 runs) | 0.085 | 0.033 | 2.55x | scsh |
+| with-cwd (5k runs) | 0.090 | 0.093 | 0.96x | hafod |
 
-**Summary:** hafod wins 14 of 16 benchmarks.  The largest gains are in
-regex substitution (14x faster), field splitting (8x faster), and
-read-line throughput (3.8x faster).  scsh wins on startup time
-(Scheme48's image-based startup is faster than Chez's library loading)
-and temp file creation (dominated by startup overhead -- hafod's
-per-operation time is actually faster).
+**Summary:** hafod wins 13 of 16 benchmarks (geometric mean 0.52x).
+The largest gains are in regex substitution (14x faster), field
+splitting (8x faster), glob (4.5x faster), and pipeline throughput
+(2.3x faster).  scsh wins on startup time (Scheme48's image-based
+startup is faster than Chez's library loading), temp file creation
+(dominated by startup overhead), and env ops (Scheme48's simpler
+environment representation).
 
 The benchmark suite is in `bench/`.  Run `perl bench/run-benchmarks.pl`
 to reproduce.

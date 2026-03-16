@@ -8,7 +8,8 @@
           history-prev history-next history-reset-nav!
           history-save-input! history-saved-input
           history-cursor history-cursor-set!
-          history-entries
+          history-entries history-entry-mode
+          history-set-last-mode!
           history-search-backward history-prefix-search-backward
           string-prefix?)
   (import (chezscheme)
@@ -17,17 +18,19 @@
 
   ;; History record:
   ;;   db      — SQLite database handle (or #f if unavailable)
-  ;;   entries — vector of past inputs, most recent last
+  ;;   entries — vector of past inputs (strings), most recent last
+  ;;   modes   — parallel vector of mode symbols ('scheme or 'shell), same length as entries
   ;;   cursor  — navigation index (-1 = at bottom / current input)
   ;;   saved   — saved current input when navigating away from bottom
   (define-record-type history
     (fields (mutable db)
             (mutable entries)
+            (mutable modes)
             (mutable cursor)
             (mutable saved))
     (protocol (lambda (new)
-                (lambda (db entries)
-                  (new db entries -1 "")))))
+                (lambda (db entries modes)
+                  (new db entries modes -1 "")))))
 
   (define max-history 10000)
 
@@ -50,29 +53,41 @@
                 input TEXT NOT NULL,
                 timestamp INTEGER NOT NULL DEFAULT (strftime('%s','now'))
               )")
-           (sqlite3-exec db "CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp)"))
-         (let ([entries (if db (load-entries db) '#())])
-           (make-history db entries)))]))
+           (sqlite3-exec db "CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp)")
+           ;; Migrate: add mode column if missing (idempotent — ALTER TABLE
+           ;; errors silently if column already exists)
+           (guard (e [#t (void)])
+             (sqlite3-exec db "ALTER TABLE history ADD COLUMN mode TEXT DEFAULT 'scheme'")))
+         (let-values ([(entries modes) (if db (load-entries db) (values '#() '#()))])
+           (make-history db entries modes)))]))
 
-  ;; Load recent entries from DB into a vector (oldest first).
+  ;; Load recent entries from DB into two vectors (oldest first):
+  ;; entries (strings) and modes (symbols).
   (define (load-entries db)
     (let ([stmt (sqlite3-prepare db
                   (string-append
-                    "SELECT input FROM history ORDER BY id DESC LIMIT "
+                    "SELECT input, mode FROM history ORDER BY id DESC LIMIT "
                     (number->string max-history)))])
       (if stmt
-          (let loop ([acc '()])
+          (let loop ([inputs '()] [modes '()])
             (let ([rc (sqlite3-step stmt)])
               (cond
                 [(= rc SQLITE_ROW)
-                 (loop (cons (sqlite3-column-text stmt 0) acc))]
+                 (let ([input (sqlite3-column-text stmt 0)]
+                       [mode-str (or (sqlite3-column-text stmt 1) "scheme")])
+                   (loop (cons input inputs)
+                         (cons (if (string=? mode-str "shell") 'shell 'scheme)
+                               modes)))]
                 [else
                  (sqlite3-finalize stmt)
-                 (list->vector acc)])))  ; acc is reversed, oldest first
-          '#())))
+                 (values (list->vector inputs)
+                         (list->vector modes))])))
+          (values '#() '#()))))
 
   ;; Add an entry to history (both DB and in-memory).
   ;; Skips empty strings and duplicates of the most recent entry.
+  ;; Mode defaults to 'scheme; interactive.ss calls history-set-last-mode!
+  ;; after classification to correct it.
   (define (history-add! h input)
     (when (and (string? input)
                (> (string-length input) 0))
@@ -83,21 +98,51 @@
           (let ([db (history-db h)])
             (when db
               (let ([stmt (sqlite3-prepare db
-                            "INSERT INTO history (input) VALUES (?1)")])
+                            "INSERT INTO history (input, mode) VALUES (?1, ?2)")])
                 (when stmt
                   (sqlite3-bind-text stmt 1 input)
+                  (sqlite3-bind-text stmt 2 "scheme")
                   (sqlite3-step stmt)
                   (sqlite3-finalize stmt)))))
-          ;; Append to in-memory vector
+          ;; Append to in-memory vectors
           (let* ([old (history-entries h)]
+                 [old-m (history-modes h)]
                  [len (vector-length old)]
-                 [new (make-vector (+ len 1))])
+                 [new (make-vector (+ len 1))]
+                 [new-m (make-vector (+ len 1))])
             (let copy ([i 0])
               (when (< i len)
                 (vector-set! new i (vector-ref old i))
+                (vector-set! new-m i (vector-ref old-m i))
                 (copy (+ i 1))))
             (vector-set! new len input)
-            (history-entries-set! h new))))))
+            (vector-set! new-m len 'scheme)
+            (history-entries-set! h new)
+            (history-modes-set! h new-m))))))
+
+  ;; Update the mode of the most recent history entry.
+  ;; Called by interactive.ss after input classification.
+  (define (history-set-last-mode! h mode)
+    (let* ([modes (history-modes h)]
+           [len (vector-length modes)])
+      (when (> len 0)
+        (vector-set! modes (- len 1) mode)
+        ;; Update DB
+        (let ([db (history-db h)])
+          (when db
+            (let ([stmt (sqlite3-prepare db
+                          "UPDATE history SET mode = ?1 WHERE id = (SELECT MAX(id) FROM history)")])
+              (when stmt
+                (sqlite3-bind-text stmt 1 (symbol->string mode))
+                (sqlite3-step stmt)
+                (sqlite3-finalize stmt))))))))
+
+  ;; Look up the mode for a given history entry index.
+  (define (history-entry-mode h idx)
+    (let ([modes (history-modes h)])
+      (if (and (>= idx 0) (< idx (vector-length modes)))
+          (vector-ref modes idx)
+          'scheme)))
 
   ;; Navigate to previous (older) entry.
   ;; Returns the history entry string, or #f if at the oldest.

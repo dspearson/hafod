@@ -494,6 +494,11 @@
                           [(pipe) " | "]
                           [(and-if) " && "]
                           [(or-if) " || "]
+                          [(redirect-out) " > "]
+                          [(redirect-append) " >> "]
+                          [(redirect-in) " < "]
+                          [(semi) "; "]
+                          [(background) " &"]
                           [else ""])
                         acc))))))
 
@@ -506,16 +511,16 @@
           '(run)
           (let ([forms
                  (map (lambda (seg)
-                        (let ([toks (car seg)]
-                              [sep (cdr seg)])
-                          (let ([form (build-and-or toks)])
-                            (if (eq? sep 'background)
+                        (let* ([toks (car seg)]
+                               [sep (cdr seg)]
+                               [form (build-and-or toks)])
+                          (if (eq? sep 'background)
                                 (let ([cmd-str (tokens->string toks)])
                                   `(job-bg! ,cmd-str
                                      (fork (lambda ()
                                              (set-process-group 0 0)
                                              ,form))))
-                                form))))
+                                form)))
                       segments)])
             (if (= (length forms) 1)
                 (car forms)

@@ -20,7 +20,8 @@
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
-          (hafod editor sexp-tracker))
+          (hafod editor sexp-tracker)
+          (only (hafod shell classifier) classify-input))
 
   ;; ======================================================================
   ;; ANSI display width (unchanged)
@@ -56,12 +57,12 @@
 
   ;; Get display width of text after the last newline.
   (define (width-after-last-newline s)
-    (let ([len (string-length s)])
-      (let ([start (let loop ([i (- len 1)])
-                     (cond [(< i 0) 0]
-                           [(char=? (string-ref s i) #\newline) (+ i 1)]
-                           [else (loop (- i 1))]))])
-        (string-display-width (substring s start len)))))
+    (let* ([len (string-length s)]
+           [start (let loop ([i (- len 1)])
+                    (cond [(< i 0) 0]
+                          [(char=? (string-ref s i) #\newline) (+ i 1)]
+                          [else (loop (- i 1))]))])
+      (string-display-width (substring s start len))))
 
   ;; ======================================================================
   ;; Colour palettes (Doom Emacs inspired)
@@ -310,11 +311,11 @@
     (let-values ([(open-idx close-idx) (find-enclosing-parens text cursor-pos)])
       (for-each
         (lambda (tok)
-          (let ([type (car tok)]
-                [start (cadr tok)]
-                [end (caddr tok)]
-                [depth (cadddr tok)])
-            (let ([span (substring text start end)])
+          (let* ([type (car tok)]
+                 [start (cadr tok)]
+                 [end (caddr tok)]
+                 [depth (cadddr tok)]
+                 [span (substring text start end)])
               (case type
                 [(paren)
                  (if (rainbow-parens?)
@@ -363,7 +364,7 @@
                             (display "\x1b;[39m" port))
                      (display span port))]
                 [else
-                 (display span port)]))))
+                 (display span port)])))
         tokens)))
 
   ;; ======================================================================
@@ -407,10 +408,10 @@
                      (lp (+ i 1) cw (+ row 1))
                      (lp (+ i 1) new-col row)))])))))
 
-  ;; render-line: redraw prompt + buffer.  prev-lines is the number of
-  ;; visual lines that were on screen from the *previous* render (0 on first call).
+  ;; render-line: redraw prompt + buffer.  prev-lines is the cursor row
+  ;; (0-indexed from prompt line) left by the *previous* render call (0 on first call).
   ;; term-cols: terminal width (0 = unknown, fall back to newline counting).
-  ;; Returns the current total-lines count for passing to the next render.
+  ;; Returns the cursor-row of this render for passing as prev-lines next time.
   (define render-line
     (case-lambda
       [(port prompt gb prev-lines)
@@ -425,21 +426,21 @@
               [cursor-row (cursor-visual-row prompt-width before term-cols)]
               [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
                              (width-after-last-newline before)
-                             1)]
-              ;; Move up by whichever is larger: the previous or current line count
-              [move-up (max total-lines prev-lines)])
-         ;; Move up to prompt line if multi-line
-         (when (> move-up 0)
+                             1)])
+         ;; Move up from cursor to prompt line (prev-lines = previous cursor-row)
+         (when (> prev-lines 0)
            (display "\x1b;[" port)
-           (display move-up port)
+           (display prev-lines port)
            (display "A" port))
-         ;; CR + clear to end of screen
+         ;; CR + clear to end of screen (wipes all old content below prompt line)
          (display "\r\x1b;[J" port)
          ;; Display prompt
          (display prompt port)
-         ;; Display colourised text
-         (let ([tokens (tokenize text)])
-           (display-colourised port text tokens cursor-pos))
+         ;; Display colourised text (Scheme only; shell/builtin inputs render plain)
+         (if (eq? (classify-input text) 'scheme)
+             (let ([tokens (tokenize text)])
+               (display-colourised port text tokens cursor-pos))
+             (display text port))
          ;; Position cursor
          (let ([lines-after-cursor (- total-lines cursor-row)])
            (when (> lines-after-cursor 0)
@@ -450,7 +451,7 @@
          (display cursor-col port)
          (display "G" port)
          (flush-output-port port)
-         total-lines)]))
+         cursor-row)]))
 
   ;; render-line/suggestion: like render-line but appends dim ghost text after cursor
   ;; when cursor is at end-of-buffer.
@@ -468,16 +469,17 @@
               [cursor-row (cursor-visual-row prompt-width before term-cols)]
               [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
                              (width-after-last-newline before)
-                             1)]
-              [move-up (max total-lines prev-lines)])
-         (when (> move-up 0)
+                             1)])
+         (when (> prev-lines 0)
            (display "\x1b;[" port)
-           (display move-up port)
+           (display prev-lines port)
            (display "A" port))
          (display "\r\x1b;[J" port)
          (display prompt port)
-         (let ([tokens (tokenize text)])
-           (display-colourised port text tokens cursor-pos))
+         (if (eq? (classify-input text) 'scheme)
+             (let ([tokens (tokenize text)])
+               (display-colourised port text tokens cursor-pos))
+             (display text port))
          ;; Display ghost suggestion if cursor is at end
          (when (and (= cursor-pos (string-length text))
                     (> (string-length suggestion) 0))
@@ -494,7 +496,7 @@
          (display cursor-col port)
          (display "G" port)
          (flush-output-port port)
-         total-lines)]))
+         cursor-row)]))
 
   ;; ======================================================================
   ;; flash-matching-paren

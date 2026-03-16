@@ -18,12 +18,15 @@
           bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
           ;; Paredit toggle
           toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
-          ;; History access (for history expansion)
-          editor-history-entries
+          ;; History access (for history expansion and mode tagging)
+          editor-history-entries editor-history-set-last-mode!
+          editor-history-entry-mode
           ;; Finder injection (set by umbrella to break circular dependency)
           editor-finder-proc
           ;; Feature toggles
-          fuzzy-finder? tab-completions?)
+          fuzzy-finder? tab-completions?
+          ;; Help
+          show-keybindings run-tutorial)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
@@ -32,6 +35,8 @@
           (hafod editor keymap)
           (hafod editor render)  ;; render-line, render-line/suggestion, etc.
           (hafod editor history)
+          (hafod editor vi)
+          (hafod editor help)
           (hafod fuzzy)
           (hafod tty)
           (only (hafod internal posix-constants) TIOCGWINSZ)
@@ -463,14 +468,14 @@
         (let* ([swap-pos (if (= pos len) (- pos 2) (- pos 1))]
                [text (gap-buffer->string gb)]
                [ch1 (string-ref text swap-pos)]
-               [ch2 (string-ref text (+ swap-pos 1))])
+               [ch2 (string-ref text (+ swap-pos 1))]
+               [delta (- swap-pos pos)])
           ;; Move to swap-pos, delete both chars, insert swapped
-          (let ([delta (- swap-pos pos)])
-            (gap-buffer-move-cursor! gb delta)
-            (gap-buffer-delete-forward! gb)
-            (gap-buffer-delete-forward! gb)
-            (gap-buffer-insert! gb ch2)
-            (gap-buffer-insert! gb ch1))))))
+          (gap-buffer-move-cursor! gb delta)
+          (gap-buffer-delete-forward! gb)
+          (gap-buffer-delete-forward! gb)
+          (gap-buffer-insert! gb ch2)
+          (gap-buffer-insert! gb ch1)))))
 
   ;; ======================================================================
   ;; Evil-mode: modal editing (normal / insert)
@@ -583,9 +588,19 @@
          (let ([depth (sexp-depth text)]
                [state (lexer-state-at text len)])
            (cond
-             ;; Balanced and in normal state: submit
+             ;; Balanced and in normal state: submit only if cursor is
+             ;; at or past the last non-whitespace character (i.e. on/after
+             ;; the final closing paren), otherwise insert newline.
              [(and (= depth 0) (eq? state 'normal))
-              (cmd-submit es)]
+              (let ([cursor-pos (gap-buffer-cursor-pos gb)]
+                    [last-non-ws (let lp ([k (- len 1)])
+                                   (cond [(< k 0) 0]
+                                         [(char-whitespace? (string-ref text k))
+                                          (lp (- k 1))]
+                                         [else k]))])
+                (if (>= cursor-pos last-non-ws)
+                    (cmd-submit es)
+                    (cmd-insert-newline es)))]
              ;; Unbalanced or in string/comment: insert newline
              [else
               (cmd-insert-newline es)]))])))
@@ -659,12 +674,16 @@
   ;; Iterate newest-to-oldest, skip duplicates.  cons builds the list
   ;; so that index 0 (= oldest unique) ends up at the head — then reverse
   ;; gives newest-first.
+  ;; Deduplicate history entries (most recent wins).
+  ;; Returns (values item-list mode-hashtable) where mode-hashtable maps
+  ;; entry-string -> mode-symbol for use by the finder's colouring logic.
   (define (deduplicate-history entries)
     (let* ([len (vector-length entries)]
-           [seen (make-hashtable string-hash string=?)])
+           [seen (make-hashtable string-hash string=?)]
+           [mode-ht (make-hashtable string-hash string=?)])
       (let loop ([i (fx- len 1)] [acc '()])
         (if (fx< i 0)
-            (reverse acc)
+            (values (reverse acc) mode-ht)
             (let ([entry (vector-ref entries i)])
               (if (or (not (string? entry))
                       (fx= (string-length entry) 0)
@@ -672,6 +691,8 @@
                   (loop (fx- i 1) acc)
                   (begin
                     (hashtable-set! seen entry #t)
+                    (hashtable-set! mode-ht entry
+                      (editor-history-entry-mode i))
                     (loop (fx- i 1) (cons entry acc)))))))))
 
   ;; Recursive file walk with depth limit, skipping hidden entries.
@@ -727,11 +748,11 @@
   (define (cmd-fuzzy-history es)
     (let ([finder (and (fuzzy-finder?) (editor-finder-proc))])
       (when finder
-        (let* ([gb (editor-state-gb es)]
-               [items (deduplicate-history (history-entries editor-history))]
-               [result (finder items "> " #t)])
-          (when result
-            (gap-buffer-set-from-string! gb result))))))
+        (let* ([gb (editor-state-gb es)])
+          (let-values ([(items mode-map) (deduplicate-history (history-entries editor-history))])
+            (let ([result (finder items "> " #t mode-map #t)])
+              (when result
+                (gap-buffer-set-from-string! gb result))))))))
 
   ;; File picker: Ctrl-T
   (define (cmd-file-picker es)
@@ -741,6 +762,12 @@
                [files (collect-files)]
                [result (finder files "> ")])
           (when result
+            ;; Insert a space before if cursor is adjacent to non-whitespace
+            (let ([pos (gap-buffer-cursor-pos gb)])
+              (when (and (> pos 0)
+                         (not (char-whitespace?
+                                (gap-buffer-char-at gb (- pos 1)))))
+                (gap-buffer-insert! gb #\space)))
             (gap-buffer-insert-string! gb result))))))
 
   ;; Directory picker: Alt-C
@@ -1459,25 +1486,22 @@
       ;; Escape -> normal mode
       (keymap-bind! km (list (make-key-event 'special 'escape 0)) cmd-enter-normal-mode)
 
+      ;; Ctrl+Left/Right: word movement in insert mode (overrides paredit slurp/barf)
+      (keymap-bind! km (list (make-key-event 'special 'left MOD_CTRL)) cmd-backward-word)
+      (keymap-bind! km (list (make-key-event 'special 'right MOD_CTRL)) cmd-forward-word)
+
       km))
 
-  ;; Build the normal-mode keymap (vim motions + lispy structural editing).
-  ;; Enter always submits for eval. Single-letter keys are commands, not self-insert.
+  ;; Build the normal-mode keymap.
+  ;; Vi motions, operators, count prefixes, text objects, visual mode,
+  ;; search, registers, marks are handled by vi.ss (called before keymap).
+  ;; This keymap covers: insert-mode entry, simple editing, structural,
+  ;; and keys that vi.ss falls through on.
   (define (make-normal-keymap)
     (let ([km (make-keymap)])
       (bind-common-keys! km)
 
-      ;; ---- Vim motions ----
-      (keymap-bind! km (list (make-key-event 'char #\h 0)) cmd-backward-char)
-      (keymap-bind! km (list (make-key-event 'char #\l 0)) cmd-forward-char)
-      (keymap-bind! km (list (make-key-event 'char #\w 0)) cmd-forward-word)
-      (keymap-bind! km (list (make-key-event 'char #\b 0)) cmd-backward-word)
-      (keymap-bind! km (list (make-key-event 'char #\e 0)) cmd-forward-word)
-      (keymap-bind! km (list (make-key-event 'char #\0 0)) cmd-beginning-of-line)
-      (keymap-bind! km (list (make-key-event 'char #\^ 0)) cmd-beginning-of-line)
-      (keymap-bind! km (list (make-key-event 'char #\$ 0)) cmd-end-of-line)
-
-      ;; ---- Sexp navigation (lispy-style) ----
+      ;; ---- Sexp navigation (lispy-style single keys) ----
       (keymap-bind! km (list (make-key-event 'char #\) 0)) cmd-forward-sexp)
       (keymap-bind! km (list (make-key-event 'char #\( 0)) cmd-backward-sexp)
       (keymap-bind! km (list (make-key-event 'char #\{ 0)) cmd-up-list)
@@ -1491,7 +1515,7 @@
       (keymap-bind! km (list (make-key-event 'char #\o 0)) cmd-open-below)
       (keymap-bind! km (list (make-key-event 'char #\O 0)) cmd-open-above)
 
-      ;; ---- Editing ----
+      ;; ---- Editing (not handled by vi.ss) ----
       (keymap-bind! km (list (make-key-event 'char #\x 0)) cmd-delete-char-no-eof)
       (keymap-bind! km (list (make-key-event 'char #\X 0)) cmd-delete-backward-char)
       (keymap-bind! km (list (make-key-event 'char #\D 0)) cmd-kill-line)
@@ -1503,26 +1527,13 @@
       (keymap-bind! km (list (make-key-event 'char #\P 0)) cmd-paste-before)
       (keymap-bind! km (list (make-key-event 'special 'backspace 0)) cmd-backward-char)
       (keymap-bind! km (list (make-key-event 'special 'delete 0)) cmd-delete-char-no-eof)
-
-      ;; ---- d prefix (delete operator) ----
-      (keymap-bind! km (list (make-key-event 'char #\d 0) (make-key-event 'char #\d 0))
-        cmd-kill-whole-line)
-      (keymap-bind! km (list (make-key-event 'char #\d 0) (make-key-event 'char #\w 0))
-        cmd-kill-word)
-      (keymap-bind! km (list (make-key-event 'char #\d 0) (make-key-event 'char #\e 0))
-        cmd-kill-word)
-      (keymap-bind! km (list (make-key-event 'char #\d 0) (make-key-event 'char #\$ 0))
-        cmd-kill-line)
-
-      ;; ---- c prefix (change operator = delete + insert mode) ----
-      (keymap-bind! km (list (make-key-event 'char #\c 0) (make-key-event 'char #\c 0))
-        (lambda (es) (cmd-kill-whole-line es) (cmd-enter-insert-mode es)))
-      (keymap-bind! km (list (make-key-event 'char #\c 0) (make-key-event 'char #\w 0))
-        (lambda (es) (cmd-kill-word es) (cmd-enter-insert-mode es)))
-      (keymap-bind! km (list (make-key-event 'char #\c 0) (make-key-event 'char #\e 0))
-        (lambda (es) (cmd-kill-word es) (cmd-enter-insert-mode es)))
-      (keymap-bind! km (list (make-key-event 'char #\c 0) (make-key-event 'char #\$ 0))
-        (lambda (es) (cmd-kill-line es) (cmd-enter-insert-mode es)))
+      (keymap-bind! km (list (make-key-event 'char #\Y 0))
+        (lambda (es)
+          (let* ([gb (editor-state-gb es)]
+                 [text (gap-buffer->string gb)]
+                 [pos (gap-buffer-cursor-pos gb)]
+                 [rest (substring text pos (string-length text))])
+            (kill-ring-push! editor-kill-ring rest))))
 
       ;; ---- Structural (lispy-style single keys) ----
       (keymap-bind! km (list (make-key-event 'char #\> 0)) cmd-forward-slurp)
@@ -1546,6 +1557,14 @@
   ;; Return the history entries vector (for history expansion in interactive.ss).
   (define (editor-history-entries)
     (history-entries editor-history))
+
+  ;; Tag the most recent history entry with its eval mode ('scheme or 'shell).
+  (define (editor-history-set-last-mode! mode)
+    (history-set-last-mode! editor-history mode))
+
+  ;; Look up the mode for a history entry by index.
+  (define (editor-history-entry-mode idx)
+    (history-entry-mode editor-history idx))
 
   ;; Finder procedure injection: set by umbrella (hafod) after loading (hafod finder)
   ;; to break the circular dependency editor -> finder -> editor.
@@ -1642,45 +1661,45 @@
                          (let ([home (or (getenv "HOME") "")])
                            (string-append home (substring prefix 1 (string-length prefix))))
                          prefix)]
-           [len (string-length expanded)])
-      ;; Split into directory and basename parts
-      (let* ([last-slash (let loop ([i (- len 1)])
-                           (cond
-                             [(< i 0) #f]
-                             [(char=? (string-ref expanded i) #\/) i]
-                             [else (loop (- i 1))]))]
-             [dir (if last-slash
-                      (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
-                      ".")]
-             [base-prefix (if last-slash
-                              (substring expanded (+ last-slash 1) len)
-                              expanded)]
-             [dir-prefix (if last-slash
-                             (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
-                             #f)]
-             [dir-prefix-len (if dir-prefix (string-length dir-prefix) 0)])
-        (guard (e [#t '()])  ; non-existent dir -> empty list
-          (let* ([entries (directory-list dir)]
-                 [visible (filter
-                            (lambda (entry)
-                              ;; Skip . and .. unless base-prefix starts with .
-                              (or (> (string-length base-prefix) 0)
-                                  (not (or (string=? entry ".") (string=? entry "..")))))
-                            entries)]
-                 [sorted (fuzzy-filter/positions base-prefix visible)])
-            (map (lambda (pair)
-                   (let* ([entry (car pair)]
-                          [positions (cdr pair)]
-                          [full-path (string-append dir "/" entry)]
-                          [is-dir? (guard (e [#t #f]) (file-directory? full-path))]
-                          [display-entry (if is-dir?
-                                             (string-append entry "/")
-                                             entry)])
-                     (if dir-prefix
-                         (cons (string-append dir-prefix display-entry)
-                               (map (lambda (p) (+ p dir-prefix-len)) positions))
-                         (cons display-entry positions))))
-                 sorted))))))
+           [len (string-length expanded)]
+           ;; Split into directory and basename parts
+           [last-slash (let loop ([i (- len 1)])
+                         (cond
+                           [(< i 0) #f]
+                           [(char=? (string-ref expanded i) #\/) i]
+                           [else (loop (- i 1))]))]
+           [dir (if last-slash
+                    (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                    ".")]
+           [base-prefix (if last-slash
+                            (substring expanded (+ last-slash 1) len)
+                            expanded)]
+           [dir-prefix (if last-slash
+                           (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                           #f)]
+           [dir-prefix-len (if dir-prefix (string-length dir-prefix) 0)])
+      (guard (e [#t '()])  ; non-existent dir -> empty list
+        (let* ([entries (directory-list dir)]
+               [visible (filter
+                          (lambda (entry)
+                            ;; Skip . and .. unless base-prefix starts with .
+                            (or (> (string-length base-prefix) 0)
+                                (not (or (string=? entry ".") (string=? entry "..")))))
+                          entries)]
+               [sorted (fuzzy-filter/positions base-prefix visible)])
+          (map (lambda (pair)
+                 (let* ([entry (car pair)]
+                        [positions (cdr pair)]
+                        [full-path (string-append dir "/" entry)]
+                        [is-dir? (guard (e [#t #f]) (file-directory? full-path))]
+                        [display-entry (if is-dir?
+                                           (string-append entry "/")
+                                           entry)])
+                   (if dir-prefix
+                       (cons (string-append dir-prefix display-entry)
+                             (map (lambda (p) (+ p dir-prefix-len)) positions))
+                       (cons display-entry positions))))
+               sorted)))))
 
   ;; shell-completions: fuzzy-match PATH executable names.
   ;; Returns list of (name . positions) pairs sorted by fuzzy score.
@@ -1931,17 +1950,17 @@
                          (if (>= next n) cur next))]
               [(up)    (let ([prev (- cur cols)])
                          (if (< prev 0) cur prev))]
-              [else cur])])
-      (let* ([candidate (list-ref completion-candidates new-idx)]
-             [text (gap-buffer->string gb)]
-             [pos (gap-buffer-cursor-pos gb)]
-             [new-text (string-append
-                         (substring text 0 completion-start)
-                         candidate
-                         (substring text pos (string-length text)))]
-             [new-pos (+ completion-start (string-length candidate))])
-        (set! completion-index new-idx)
-        (editor-replace-text! gb new-text new-pos))))
+              [else cur])]
+           [candidate (list-ref completion-candidates new-idx)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [new-text (string-append
+                       (substring text 0 completion-start)
+                       candidate
+                       (substring text pos (string-length text)))]
+           [new-pos (+ completion-start (string-length candidate))])
+      (set! completion-index new-idx)
+      (editor-replace-text! gb new-text new-pos)))
 
   ;; Track number of completion menu lines currently displayed
   (define completion-menu-lines 0)
@@ -1952,13 +1971,14 @@
     ;; Update suggestion on every render (cheap: just a prefix search)
     (when (null? completion-candidates)
       (update-suggestion! gb))
-    ;; render-line with ghost suggestion and extra lines for previous menu
+    ;; render-line with ghost suggestion (prev-lines is cursor-row from last render;
+    ;; \x1b[J from prompt line clears old content + old menu automatically)
     (let* ([term-cols (editor-query-terminal-cols)]
            [lines (if (and (null? completion-candidates)
                            (> (string-length suggestion-text) 0))
                       (render-line/suggestion port prompt gb
-                        (+ prev-lines completion-menu-lines) suggestion-text term-cols)
-                      (render-line port prompt gb (+ prev-lines completion-menu-lines) term-cols))])
+                        prev-lines suggestion-text term-cols)
+                      (render-line port prompt gb prev-lines term-cols))])
       (if (not (null? completion-candidates))
           ;; Save cursor, move to end of content, render menu, restore cursor
           (begin
@@ -2147,34 +2167,43 @@
                                           (eq? (key-event-value evt) 'tab))))
                        (dismiss-completion!)
                        (set! completion-menu-lines 0))
-                     (let ([binding (keymap-lookup km evt)])
-                       (cond
-                         [(procedure? binding)
-                          (binding es)
-                          (if (editor-state-done? es)
-                              (finish! (editor-state-result es))
-                              (loop (render-with-menu out-port prompt gb prev-lines)))]
-                         [(keymap? binding)
-                          (let ([next-evt (read-key-event in-port)])
-                            (if (eof-object? next-evt)
-                                (loop (render-with-menu out-port prompt gb prev-lines))
-                                (let ([sub-binding (keymap-lookup binding next-evt)])
-                                  (when (procedure? sub-binding)
-                                    (sub-binding es))
-                                  (if (editor-state-done? es)
-                                      (finish! (editor-state-result es))
-                                      (loop (render-with-menu out-port prompt gb prev-lines))))))]
-                         [(and (eq? mode 'insert)
-                               (eq? (key-event-type evt) 'char)
-                               (let ([ch (key-event-value evt)])
-                                 (and (char? ch)
-                                      (>= (char->integer ch) 32))))
-                          (cmd-self-insert es (key-event-value evt))
-                          (if (editor-state-done? es)
-                              (finish! (editor-state-result es))
-                              (loop (render-with-menu out-port prompt gb prev-lines)))]
-                         [else
-                          (loop prev-lines)]))])
+                     ;; Vi state machine gets first crack in normal mode
+                     (if (and (eq? mode 'normal)
+                              (vi-process-key es evt in-port out-port
+                                              gb editor-kill-ring))
+                         ;; Vi handled the key
+                         (if (editor-state-done? es)
+                             (finish! (editor-state-result es))
+                             (loop (render-with-menu out-port prompt gb prev-lines)))
+                         ;; Fall through to keymap
+                         (let ([binding (keymap-lookup km evt)])
+                           (cond
+                             [(procedure? binding)
+                              (binding es)
+                              (if (editor-state-done? es)
+                                  (finish! (editor-state-result es))
+                                  (loop (render-with-menu out-port prompt gb prev-lines)))]
+                             [(keymap? binding)
+                              (let ([next-evt (read-key-event in-port)])
+                                (if (eof-object? next-evt)
+                                    (loop (render-with-menu out-port prompt gb prev-lines))
+                                    (let ([sub-binding (keymap-lookup binding next-evt)])
+                                      (when (procedure? sub-binding)
+                                        (sub-binding es))
+                                      (if (editor-state-done? es)
+                                          (finish! (editor-state-result es))
+                                          (loop (render-with-menu out-port prompt gb prev-lines))))))]
+                             [(and (eq? mode 'insert)
+                                   (eq? (key-event-type evt) 'char)
+                                   (let ([ch (key-event-value evt)])
+                                     (and (char? ch)
+                                          (>= (char->integer ch) 32))))
+                              (cmd-self-insert es (key-event-value evt))
+                              (if (editor-state-done? es)
+                                  (finish! (editor-state-result es))
+                                  (loop (render-with-menu out-port prompt gb prev-lines)))]
+                             [else
+                              (loop prev-lines)])))])
                 ) ; close let*
               ]   ; close [else of eof/else cond
               )                          ; close eof/else cond
@@ -2188,5 +2217,15 @@
   ;; of library so all definitions precede expressions as R6RS requires).
   (keymap-bind! editor-insert-keymap
     (list (make-key-event 'special 'tab 0)) cmd-complete)
+
+  ;; Wire up vi.ss procedure hooks (must be after all cmd-* definitions)
+  (vi-snapshot!-proc (lambda (es) (editor-snapshot! (editor-state-gb es))))
+  (vi-undo!-proc (lambda (es) (cmd-undo es)))
+  (vi-redo!-proc (lambda (es) (cmd-redo es)))
+  (vi-enter-insert!-proc (lambda (es) (cmd-enter-insert-mode es)))
+  (vi-enter-normal!-proc (lambda (es) (cmd-enter-normal-mode es)))
+  (vi-history-prev!-proc (lambda (es) (cmd-history-prev es)))
+  (vi-history-next!-proc (lambda (es) (cmd-history-next es)))
+  (vi-submit!-proc (lambda (es) (cmd-submit es)))
 
 ) ; end library
