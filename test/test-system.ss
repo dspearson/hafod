@@ -96,11 +96,11 @@
   4 hafod-minor-version)
 
 (test-equal "hafod-version-string is correct"
-  "hafod 1.4.2" hafod-version-string)
+  "hafod 1.4.3" hafod-version-string)
 
 ;; scsh-compatible version aliases
 (test-equal "scsh-major-version alias" 1 scsh-major-version)
 (test-equal "scsh-minor-version alias" 4 scsh-minor-version)
-(test-equal "scsh-version-string alias" "hafod 1.4.2" scsh-version-string)
+(test-equal "scsh-version-string alias" "hafod 1.4.3" scsh-version-string)
 
 (test-end)

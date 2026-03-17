@@ -570,14 +570,31 @@
                    ;; Mark: we are now in eval (for keyboard-interrupt-handler)
                    (set! current-t0 (current-time 'time-monotonic))
 
+                   ;; During eval, use a non-escaping interrupt handler.
+                   ;; The default handler calls (reset) which abandons the
+                   ;; eval — breaking foreground child processes that are
+                   ;; still running.  Instead, raise a condition so the
+                   ;; guard below handles it normally.
+                   (keyboard-interrupt-handler
+                     (lambda ()
+                       (newline (console-output-port))
+                       (flush-output-port (console-output-port))
+                       (when current-t0
+                         (let ([t1 (current-time 'time-monotonic)])
+                           (last-duration (elapsed-milliseconds current-t0 t1)))
+                         (set! current-t0 #f)
+                         (last-status 130))
+                       (raise (make-message-condition "interrupted"))))
+
                    ;; 4. Eval with exception handling
                    (guard (exn
                             [#t
-                             ;; Set timing and status before post-eval hook
-                             (let ([t1 (current-time 'time-monotonic)])
-                               (last-duration (elapsed-milliseconds current-t0 t1))
-                               (set! current-t0 #f)
-                               (last-status 1))
+                             ;; Set timing and status (unless already set by interrupt handler)
+                             (when current-t0
+                               (let ([t1 (current-time 'time-monotonic)])
+                                 (last-duration (elapsed-milliseconds current-t0 t1))
+                                 (set! current-t0 #f)
+                                 (last-status 1)))
                              (display "\x1b;[31m" (console-error-port))
                              (display-condition exn (console-error-port))
                              (display "\x1b;[39m" (console-error-port))
