@@ -33,7 +33,7 @@
 ;; from (chezscheme); (hafod) provides its own versions of those.
 (import
   (except (chezscheme)
-    ;; 57 symbols that conflict with (hafod) -- exclude from (chezscheme)
+    ;; 57 original symbols that conflict with (hafod)
     bitwise-and bitwise-ior bitwise-not bitwise-xor
     call-with-input-file call-with-output-file call-with-string-output-port
     char->integer char-alphabetic? char-lower-case? char-numeric? char-ready?
@@ -45,7 +45,14 @@
     rename-file string->list string->number string-append string-copy
     string-downcase string-upcase substring thread-join thread? time
     truncate-file vector-append with-input-from-file with-output-to-file
-    write write-char)
+    write write-char
+    ;; SRFI-1 — (hafod) now provides these with SRFI-1 semantics
+    cons* make-list list-copy iota last-pair
+    filter find partition remove remove!
+    append! reverse! break assoc
+    fold-right
+    ;; SRFI-13 — (hafod) now provides these with SRFI-13 semantics
+    string-for-each string-copy! string-fill! string-hash)
   ;; Import Chez's command-line/command-line-arguments under prefixed names
   ;; so we can set them as parameters (hafod's versions are read-only).
   (only (rename (chezscheme)

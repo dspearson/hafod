@@ -52,8 +52,13 @@ seasonal shell.
 - **Script launcher** -- scsh-compatible CLI with `-s`, `-c`, `-e`, `--`,
   meta-argument processing, `!#` header stripping, auto-import of `(hafod)`,
   and `|` → `pipe` source preprocessing for scsh compatibility
+- **SRFI-1 and SRFI-13** -- the full SRFI-1 list library (88 procedures)
+  and SRFI-13 string library (67 procedures) are available at the top
+  level via `(import (hafod))`, matching scsh's environment.  All 35
+  SRFIs that scsh bundled via Scheme 48 are available as
+  `(import (hafod srfi-N))`
 - **Full scsh compatibility** -- 1:1 coverage of the scsh public API
-  (1,003 exported symbols); `(import (scsh))` works as an alias for
+  (1,338 exported symbols); `(import (scsh))` works as an alias for
   `(import (hafod))`; all scsh accessor names, predicates, char-sets,
   file-options, RE ADT layer, and version aliases
 
@@ -324,6 +329,9 @@ Individual subsystems can also be imported separately:
 | `(hafod finder)` | Full-screen fuzzy finder (fzf-style interactive picker) |
 | `(hafod dot-locking)` | Dot-file locking (obtain-dot-lock, with-dot-lock) |
 | `(hafod lib-dirs)` | Library directory search |
+| `(hafod srfi-1)` | SRFI-1 list library (re-exported by `(hafod)`) |
+| `(hafod srfi-13)` | SRFI-13 string library (re-exported by `(hafod)`) |
+| `(hafod srfi-N)` | All 35 SRFIs bundled by scsh (2, 4--9, 11, 16--17, 19, 23, 25--28, 31, 34, 37, 39--40, 42--43, 45, 60--61, 63, 66--67, 71, 74, 78, 95) |
 | `(scsh)` | Compatibility alias -- re-exports everything from `(hafod)` |
 
 Internal libraries (not intended for direct use):
@@ -604,8 +612,8 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,175+ scsh-compatible symbols are
-   exported
+5. Most scripts work unchanged -- 1,338 scsh-compatible symbols are
+   exported, including SRFI-1 and SRFI-13 at the top level
 
 ## Performance
 

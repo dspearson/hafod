@@ -11,7 +11,8 @@
 (library (hafod shell history-expand)
   (export history-expand)
 
-  (import (chezscheme))
+  (import (chezscheme)
+          (only (hafod srfi-13) string-prefix?))
 
   ;; Expand history references in str using entries (vector, most recent last).
   ;; Returns the expanded string, or str unchanged if no expansion needed.
@@ -104,12 +105,7 @@
           (loop (+ i 1) (cons (string-ref str i) chars))
           (values (list->string (reverse chars)) i))))
 
-  ;; Check if prefix is a prefix of str.
-  (define (string-prefix? prefix str)
-    (let ([plen (string-length prefix)]
-          [slen (string-length str)])
-      (and (<= plen slen)
-           (string=? prefix (substring str 0 plen)))))
+  ;; string-prefix? imported from (hafod srfi-13)
 
   ;; Extract the last whitespace-delimited argument from a command string.
   (define (last-argument str)

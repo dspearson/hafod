@@ -32,6 +32,57 @@
     char-set-copy char-set-adjoin char-set-adjoin! char-set-delete
     string->char-set
 
+    ;; === (hafod srfi-1) — SRFI-1 List Library ===
+    xcons cons* list-tabulate circular-list iota
+    proper-list? circular-list? dotted-list? not-pair? null-list? list=
+    first second third fourth fifth sixth seventh eighth ninth tenth
+    car+cdr take drop take-right drop-right take! drop-right! split-at split-at!
+    last last-pair length+
+    zip unzip1 unzip2 unzip3 unzip4 unzip5
+    count concatenate concatenate! append-reverse append-reverse!
+    fold fold-right unfold unfold-right
+    pair-fold pair-fold-right reduce reduce-right
+    append-map append-map! map! pair-for-each filter-map map-in-order
+    filter partition remove filter! partition! remove!
+    find any every list-index
+    take-while drop-while take-while!
+    span span! break break!
+    delete delete! delete-duplicates delete-duplicates!
+    assoc alist-cons alist-copy alist-delete alist-delete!
+    lset<= lset=
+    lset-union lset-union! lset-intersection lset-intersection!
+    lset-difference lset-difference! lset-xor lset-xor!
+    lset-diff+intersection lset-diff+intersection! lset-adjoin
+
+    ;; === (hafod srfi-13) — SRFI-13 String Library ===
+    string-null? string-every string-any
+    string-tabulate string-unfold string-unfold-right
+    string-take string-drop string-take-right string-drop-right
+    string-pad string-pad-right
+    string-trim string-trim-right string-trim-both
+    string-compare string-compare-ci
+    string= string<> string< string> string<= string>=
+    string-ci= string-ci<> string-ci< string-ci> string-ci<= string-ci>=
+    string-prefix-length string-suffix-length
+    string-prefix-length-ci string-suffix-length-ci
+    string-prefix? string-suffix?
+    string-prefix-ci? string-suffix-ci?
+    string-index string-index-right
+    string-skip string-skip-right
+    string-count string-contains string-contains-ci
+    string-reverse string-reverse!
+    string-concatenate string-concatenate-reverse
+    string-concatenate/shared string-concatenate-reverse/shared
+    string-append/shared
+    string-map string-for-each
+    string-fold string-fold-right
+    xsubstring string-xcopy!
+    string-replace string-tokenize
+    string-filter string-delete
+    string-map! string-hash string-hash-ci
+    substring/shared string-copy/shared
+    string-join
+
     ;; === (hafod fname) ===
     file-name-directory? file-name-non-directory?
     file-name-as-directory directory-as-file-name
@@ -473,6 +524,7 @@
     number->string string->number
     string-copy string-append substring
     string->list list->string
+    ;; Case mapping — from Chez (SRFI-13 re-exports same)
     string-upcase string-downcase)
 
   (import
@@ -494,6 +546,17 @@
       string->list list->string
       string-upcase string-downcase)
     (hafod compat)
+    (except (hafod srfi-1)
+      ;; alist-delete comes from (hafod environment) — string-specific version
+      alist-delete
+      ;; map, for-each — not exported by our SRFI-1 (use Chez's)
+      ;; assoc — SRFI-1 version takes optional = arg, keep it
+      )
+    (except (hafod srfi-13)
+      ;; These come from Chez re-exports above
+      string-upcase string-downcase string-titlecase
+      ;; string-copy! and string-fill! — SRFI-13 versions with start/end override Chez's
+      )
     (hafod fname)
     (hafod command-line)
     (hafod rdelim)
@@ -554,7 +617,7 @@
     (hafod editor sexp-tracker)
     (hafod editor render)
     (hafod editor sqlite3)
-    (hafod editor history)
+    (except (hafod editor history) string-prefix?)
     (hafod editor editor)
     (hafod config))
 

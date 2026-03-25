@@ -409,6 +409,9 @@
   ;; Used by keyboard-interrupt-handler to capture partial duration.
   (define current-t0 #f)
 
+  ;; Tag for multi-expression paste (unique vector, not eq? to any user value)
+  (define %multi-form-tag (vector 'hafod-multi-form))
+
   ;; === Script evaluation ===
 
   ;; Evaluate a string as a sequence of Scheme forms in the interaction environment.
@@ -543,7 +546,22 @@
                                                 (char-alphabetic? first-ch)
                                                 (not (memv first-ch '(#\( #\' #\` #\# #\, #\[))))
                                        (command-not-found-check line)))
-                                   (read (open-input-string line))])))])))
+                                   ;; Read all s-expressions from the input.
+                                   ;; Multiple expressions are tagged so the
+                                   ;; eval loop can process each one individually,
+                                   ;; printing results between them.
+                                   (let* ([p (open-input-string line)]
+                                          [first (read p)])
+                                     (if (eof-object? first)
+                                         first
+                                         (let ([second (read p)])
+                                           (if (eof-object? second)
+                                               first
+                                               (let gather ([acc (list second first)])
+                                                 (let ([next (read p)])
+                                                   (if (eof-object? next)
+                                                       (cons %multi-form-tag (reverse acc))
+                                                       (gather (cons next acc)))))))))])))])))
                          ;; Non-terminal mode: existing behaviour
                          (begin
                            ;; 1. Display right prompt (before left prompt)
@@ -563,6 +581,37 @@
                   [(eq? form (void))
                    ;; Builtin already executed, loop without eval
                    (loop)]
+                  [(and (pair? form) (eq? (car form) %multi-form-tag))
+                   ;; Multiple pasted expressions: eval each, print each result
+                   (let eval-each ([forms (cdr form)])
+                     (if (null? forms)
+                         (loop)
+                         (let ([f (car forms)]
+                               [more (cdr forms)])
+                           (guard (exn
+                                    [#t
+                                     (display "\x1b;[31m" (console-error-port))
+                                     (display-condition exn (console-error-port))
+                                     (display "\x1b;[39m" (console-error-port))
+                                     (newline (console-error-port))
+                                     ;; Stop on error (don't eval remaining forms)
+                                     (loop)])
+                             (call-with-values
+                               (lambda () (eval f (interaction-environment)))
+                               (lambda results
+                                 (cond
+                                   [(null? results) (void)]
+                                   [(and (null? (cdr results)) (eq? (car results) (void)))
+                                    (void)]
+                                   [(null? (cdr results))
+                                    (pretty-print-colourised (car results) (console-output-port))]
+                                   [else
+                                    (for-each
+                                      (lambda (v)
+                                        (unless (eq? v (void))
+                                          (pretty-print-colourised v (console-output-port))))
+                                      results)])
+                                 (eval-each more)))))))]
                   [else
                    ;; 3. Pre-eval hook
                    ((repl-pre-eval-hook) form)

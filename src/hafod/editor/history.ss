@@ -14,7 +14,8 @@
           string-prefix?)
   (import (chezscheme)
           (hafod editor sqlite3)
-          (hafod fuzzy))
+          (hafod fuzzy)
+          (only (hafod srfi-13) string-prefix?))
 
   ;; History record:
   ;;   db      — SQLite database handle (or #f if unavailable)
@@ -221,12 +222,7 @@
              [(string=? needle (substring haystack i (+ i nlen))) #t]
              [else (loop (+ i 1))]))])))
 
-  ;; Prefix check: return #t if str starts with prefix.
-  (define (string-prefix? prefix str)
-    (let ([plen (string-length prefix)]
-          [slen (string-length str)])
-      (and (<= plen slen)
-           (string=? prefix (substring str 0 plen)))))
+  ;; string-prefix? imported from (hafod srfi-13)
 
   ;; Search backward through history entries for a fuzzy match.
   ;; h: history object, query: search string, start-idx: index to start from (inclusive).

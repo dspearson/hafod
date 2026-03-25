@@ -614,56 +614,134 @@
       (editor-state-done?-set! es #t)
       (editor-state-result-set! es text)))
 
-  ;; History: navigate to previous (older) entry with optional prefix filtering
+  ;; Helper: find the line number (0-based) of a position in a string
+  (define (cursor-line text pos)
+    (let loop ([i 0] [line 0])
+      (cond
+        [(>= i pos) line]
+        [(char=? (string-ref text i) #\newline) (loop (+ i 1) (+ line 1))]
+        [else (loop (+ i 1) line)])))
+
+  ;; Helper: count total lines in text
+  (define (text-line-count text)
+    (let loop ([i 0] [n 0])
+      (cond
+        [(>= i (string-length text)) n]
+        [(char=? (string-ref text i) #\newline) (loop (+ i 1) (+ n 1))]
+        [else (loop (+ i 1) n)])))
+
+  ;; Helper: move cursor to equivalent column on previous line
+  (define (cmd-move-up es)
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           ;; Find start of current line
+           [line-start (let scan ([i (- pos 1)])
+                         (cond
+                           [(< i 0) 0]
+                           [(char=? (string-ref text i) #\newline) (+ i 1)]
+                           [else (scan (- i 1))]))]
+           [col (- pos line-start)]
+           ;; Find start of previous line
+           [prev-end (- line-start 1)]  ; position of newline ending prev line
+           [prev-start (let scan ([i (- prev-end 1)])
+                         (cond
+                           [(< i 0) 0]
+                           [(char=? (string-ref text i) #\newline) (+ i 1)]
+                           [else (scan (- i 1))]))]
+           [prev-len (- prev-end prev-start)]
+           [target (+ prev-start (min col prev-len))])
+      (gap-buffer-move-cursor! gb (- target pos))))
+
+  ;; Helper: move cursor to equivalent column on next line
+  (define (cmd-move-down es)
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [len (string-length text)]
+           ;; Find start of current line
+           [line-start (let scan ([i (- pos 1)])
+                         (cond
+                           [(< i 0) 0]
+                           [(char=? (string-ref text i) #\newline) (+ i 1)]
+                           [else (scan (- i 1))]))]
+           [col (- pos line-start)]
+           ;; Find start of next line
+           [next-start (let scan ([i pos])
+                         (cond
+                           [(>= i len) #f]
+                           [(char=? (string-ref text i) #\newline) (+ i 1)]
+                           [else (scan (+ i 1))]))])
+      (when next-start
+        (let* ([next-end (let scan ([i next-start])
+                           (cond
+                             [(>= i len) len]
+                             [(char=? (string-ref text i) #\newline) i]
+                             [else (scan (+ i 1))]))]
+               [next-len (- next-end next-start)]
+               [target (+ next-start (min col next-len))])
+          (gap-buffer-move-cursor! gb (- target pos))))))
+
+  ;; History: navigate to previous (older) entry with optional prefix filtering.
+  ;; In multi-line buffers, moves cursor up within the text instead of
+  ;; going to history, unless already on the first line.
   (define (cmd-history-prev es)
     (let* ([gb (editor-state-gb es)]
            [text (gap-buffer->string gb)]
-           [pos (gap-buffer-cursor-pos gb)])
-      ;; On first upward press, save input and determine if prefix search
-      (when (= (history-cursor editor-history) -1)
-        (history-save-input! editor-history text)
-        ;; If buffer has content and cursor > 0, use prefix search
-        (if (and (> (string-length text) 0) (> pos 0))
-            (set! history-prefix (substring text 0 pos))
-            (set! history-prefix #f)))
-      ;; Navigate
-      (if history-prefix
-          ;; Prefix-filtered search
-          (let* ([entries (history-entries editor-history)]
-                 [cur (history-cursor editor-history)]
-                 [start (if (= cur -1) (- (vector-length entries) 1) (- cur 1))]
-                 [idx (history-prefix-search-backward editor-history history-prefix start)])
-            (when idx
-              (history-cursor-set! editor-history idx)
-              (gap-buffer-set-from-string! gb (vector-ref entries idx))))
-          ;; Normal history navigation
-          (let ([entry (history-prev editor-history)])
-            (when entry
-              (gap-buffer-set-from-string! gb entry))))))
+           [pos (gap-buffer-cursor-pos gb)]
+           [line (cursor-line text pos)])
+      (if (> line 0)
+          ;; Not on first line: move up within buffer
+          (cmd-move-up es)
+          ;; On first line: history navigation
+          (begin
+            (when (= (history-cursor editor-history) -1)
+              (history-save-input! editor-history text)
+              (if (and (> (string-length text) 0) (> pos 0))
+                  (set! history-prefix (substring text 0 pos))
+                  (set! history-prefix #f)))
+            (if history-prefix
+                (let* ([entries (history-entries editor-history)]
+                       [cur (history-cursor editor-history)]
+                       [start (if (= cur -1) (- (vector-length entries) 1) (- cur 1))]
+                       [idx (history-prefix-search-backward editor-history history-prefix start)])
+                  (when idx
+                    (history-cursor-set! editor-history idx)
+                    (gap-buffer-set-from-string! gb (vector-ref entries idx))))
+                (let ([entry (history-prev editor-history)])
+                  (when entry
+                    (gap-buffer-set-from-string! gb entry))))))))
 
-  ;; History: navigate to next (newer) entry with optional prefix filtering
+  ;; History: navigate to next (newer) entry with optional prefix filtering.
+  ;; In multi-line buffers, moves cursor down within the text instead of
+  ;; going to history, unless already on the last line.
   (define (cmd-history-next es)
     (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [line (cursor-line text pos)]
+           [last-line (text-line-count text)]
            [cur (history-cursor editor-history)])
-      (if (and history-prefix (not (= cur -1)))
-          ;; Prefix-filtered forward search
-          (let* ([entries (history-entries editor-history)]
-                 [len (vector-length entries)])
-            (let loop ([i (+ cur 1)])
-              (cond
-                [(>= i len)
-                 ;; Past most recent: return to saved input
-                 (history-cursor-set! editor-history -1)
-                 (set! history-prefix #f)
-                 (gap-buffer-set-from-string! gb (history-saved-input editor-history))]
-                [(string-prefix? history-prefix (vector-ref entries i))
-                 (history-cursor-set! editor-history i)
-                 (gap-buffer-set-from-string! gb (vector-ref entries i))]
-                [else (loop (+ i 1))])))
-          ;; Normal history navigation
-          (let ([entry (history-next editor-history)])
-            (when entry
-              (gap-buffer-set-from-string! gb entry))))))
+      (if (< line last-line)
+          ;; Not on last line: move down within buffer
+          (cmd-move-down es)
+          ;; On last line: history navigation
+          (if (and history-prefix (not (= cur -1)))
+              (let* ([entries (history-entries editor-history)]
+                     [len (vector-length entries)])
+                (let loop ([i (+ cur 1)])
+                  (cond
+                    [(>= i len)
+                     (history-cursor-set! editor-history -1)
+                     (set! history-prefix #f)
+                     (gap-buffer-set-from-string! gb (history-saved-input editor-history))]
+                    [(string-prefix? history-prefix (vector-ref entries i))
+                     (history-cursor-set! editor-history i)
+                     (gap-buffer-set-from-string! gb (vector-ref entries i))]
+                    [else (loop (+ i 1))])))
+              (let ([entry (history-next editor-history)])
+                (when entry
+                  (gap-buffer-set-from-string! gb entry)))))))
 
   ;; ======================================================================
   ;; Fuzzy finder editor commands (history, file, directory pickers)
