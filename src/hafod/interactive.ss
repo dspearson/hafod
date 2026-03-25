@@ -34,7 +34,7 @@
           (only (hafod procobj) background-job-count)
           (only (hafod editor editor) read-expression with-raw-mode
                 editor-history-entries editor-history-set-last-mode!)
-          (only (hafod tty) tty?)
+          (only (hafod tty) tty? tty-info set-tty-info/now)
           (only (hafod editor render) tokenize display-colourised)
           (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
           (only (hafod shell parser) parse-shell-command)
@@ -653,7 +653,20 @@
                              (display-command-timing!)
                              (loop)])
                      (call-with-values
-                       (lambda () (eval form (interaction-environment)))
+                       (lambda ()
+                         ;; Save terminal state before eval so interactive
+                         ;; child processes (ssh, vim, etc.) get a clean
+                         ;; terminal.  Restore afterwards in case the child
+                         ;; left it in a dirty state.
+                         (let ([saved-tty (guard (e [#t #f])
+                                            (tty-info 0))])
+                           (dynamic-wind
+                             void
+                             (lambda () (eval form (interaction-environment)))
+                             (lambda ()
+                               (when saved-tty
+                                 (guard (e [#t (void)])
+                                   (set-tty-info/now 0 saved-tty)))))))
                        (lambda results
                          ;; Capture end time and clear eval marker
                          (let ([t1 (current-time 'time-monotonic)]

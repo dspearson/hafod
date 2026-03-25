@@ -2173,6 +2173,10 @@
                          (set! history-prefix #f)
                          (dismiss-completion!)
                          (reset-undo-state!)
+                         ;; Clear ghost suggestion text from screen
+                         (when (> (string-length suggestion-text) 0)
+                           (display "\x1b;[K" out-port)  ; erase to end of line
+                           (flush-output-port out-port))
                          (set! suggestion-text "")
                          ;; Move cursor past all content lines before newline,
                          ;; so the result prints below the full expression.
