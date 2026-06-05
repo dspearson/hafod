@@ -27,7 +27,7 @@ TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
 # Platform detection
 UNAME_S := $(shell uname -s)
 
-.PHONY: all compile compile-wpo native standalone test clean install uninstall test-launcher verify-umbrella platform-constants ffi-helpers $(TEST_TARGETS)
+.PHONY: all compile compile-wpo native standalone test clean install uninstall test-launcher verify-umbrella platform-constants version-source ffi-helpers $(TEST_TARGETS)
 
 all: native
 
@@ -46,6 +46,23 @@ platform-constants: tools/gen-platform-constants.c
 $(PLATFORM_STAMP):
 	@$(MAKE) platform-constants
 
+# Regenerate the version library from git tags (source of truth), falling back
+# to the VERSION file. Runs every build; gen-version.sh only rewrites the file
+# when the version actually changes, so incremental builds aren't disturbed.
+VERSION_SS = src/hafod/internal/version.ss
+version-source:
+	@sh tools/gen-version.sh
+
+# Man page: substitute the version (from git tags) and the HEAD commit date into
+# the .TH line of the template. Falls back to the VERSION file / a static year
+# when git is unavailable (release tarballs, nix sources without .git).
+doc/hafod.1: doc/hafod.1.in VERSION
+	@v=$$(sh tools/gen-version.sh --print); \
+	d=$$(git log -1 --format=%cd --date=format:'%B %Y' 2>/dev/null); \
+	[ -n "$$d" ] || d="2026"; \
+	sed -e "s/@VERSION@/$$v/g" -e "s/@DATE@/$$d/g" doc/hafod.1.in > doc/hafod.1; \
+	echo "gen-man: hafod $$v ($$d)"
+
 FFI_HELPERS_SRC = tools/hafod-ffi-helpers.c
 ifeq ($(UNAME_S),Darwin)
 FFI_HELPERS_OUT = src/hafod-ffi-helpers.dylib
@@ -59,7 +76,7 @@ ffi-helpers: $(FFI_HELPERS_OUT)
 $(FFI_HELPERS_OUT): $(FFI_HELPERS_SRC)
 	$(CC) $(CFLAGS) $(FFI_HELPERS_FLAGS) -o $@ $< $(LDFLAGS)
 
-compile: ffi-helpers $(PLATFORM_STAMP)
+compile: ffi-helpers $(PLATFORM_STAMP) version-source
 	@if [ -f "$(PLATFORM_STAMP)" ] && [ "$$(cat $(PLATFORM_STAMP))" != "$(PLATFORM_TAG)" ]; then \
 		$(MAKE) platform-constants; \
 	fi
@@ -126,9 +143,11 @@ clean:
 	rm -f bin/hafod.so bin/hafod.wpo bin/hafod-native bin/hafod-standalone
 	rm -f tools/gen-platform-constants
 	rm -f src/hafod/internal/.platform-stamp
+	rm -f $(VERSION_SS)
+	rm -f doc/hafod.1
 	rm -f src/hafod-ffi-helpers.so src/hafod-ffi-helpers.dylib
 
-install:
+install: doc/hafod.1
 	install -d $(DESTDIR)$(BINDIR)
 	rm -rf $(DESTDIR)$(LIBDIR)/src
 	install -d $(DESTDIR)$(LIBDIR)/src
@@ -140,8 +159,14 @@ install:
 	done
 	install -m 644 bin/hafod.sps $(DESTDIR)$(LIBDIR)/hafod.sps
 	install -m 644 bin/hafod.so $(DESTDIR)$(LIBDIR)/hafod.so
-	ln -sf $(CHEZ_LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/petite.boot
-	ln -sf $(CHEZ_LIBDIR)/scheme.boot $(DESTDIR)$(LIBDIR)/scheme.boot
+	# Copy boot files (not symlink) so the install is self-contained: the
+	# native binary's libkernel.a is version-locked to these boot files at
+	# build time, and copying avoids depending on the build-time Chez prefix
+	# (e.g. a transient /nix/store path) at runtime. rm -f first in case a
+	# previous install left a read-only symlink into a read-only store.
+	rm -f $(DESTDIR)$(LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/scheme.boot
+	install -m 644 $(CHEZ_LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/petite.boot
+	install -m 644 $(CHEZ_LIBDIR)/scheme.boot $(DESTDIR)$(LIBDIR)/scheme.boot
 	@if [ -f bin/hafod-native ]; then \
 		install -m 755 bin/hafod-native $(DESTDIR)$(BINDIR)/hafod; \
 	elif [ -f bin/hafod-standalone ]; then \

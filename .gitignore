@@ -22,6 +22,16 @@ tools/gen-platform-constants
 src/hafod-ffi-helpers.so
 src/hafod-ffi-helpers.dylib
 
+# Generated version library (regenerated from git tags each build via
+# tools/gen-version.sh). The VERSION file is the tracked fallback.
+src/hafod/internal/version.ss
+
+# Generated man page (rendered from doc/hafod.1.in at build time)
+doc/hafod.1
+
+# Local platform stamp (records which platform platform-constants.ss is built for)
+src/hafod/internal/.platform-stamp
+
 # Build artefacts
 a.out
 tmpfile

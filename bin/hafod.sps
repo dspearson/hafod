@@ -412,7 +412,10 @@
       "  (define (main args) ...)\n")))
 
 (define (show-version)
-  (display "hafod 1.1 (scsh on Chez Scheme)\n"))
+  ;; hafod-version-string comes from (hafod) -> (hafod system), which derives it
+  ;; from the build-time generated (hafod internal version). Single source of truth.
+  (display hafod-version-string)
+  (display " (scsh on Chez Scheme)\n"))
 
 ;; ======================================================================
 ;; Argument parsing (scsh-compatible)

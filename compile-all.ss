@@ -7,7 +7,7 @@
         (hafod internal re-records) (hafod internal re-posixstr)
         (hafod fname) (hafod rdelim) (hafod command-line)
         (hafod internal errno)
-        (hafod internal platform-constants)
+        (hafod internal platform-constants) (hafod internal version)
         (hafod internal posix-constants) (hafod internal posix-core)
         (hafod internal posix-file) (hafod internal posix-identity)
         (hafod internal posix-user) (hafod internal posix-time)

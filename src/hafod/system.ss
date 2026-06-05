@@ -22,7 +22,8 @@
     system-name)
 
   (import (chezscheme)
-          (hafod posix))
+          (hafod posix)
+          (hafod internal version))
 
   ;; ======================================================================
   ;; uname -- system identification record
@@ -96,9 +97,12 @@
   ;; Version constants
   ;; ======================================================================
 
-  (define hafod-major-version 1)
-  (define hafod-minor-version 4)
-  (define hafod-version-string "hafod 1.4.3")
+  ;; Version constants are derived from (hafod internal version), which is
+  ;; generated at build time from git tags (tools/gen-version.sh). This is the
+  ;; single source of truth -- do not hardcode versions here.
+  (define hafod-major-version hafod-version-major)
+  (define hafod-minor-version hafod-version-minor)
+  (define hafod-version-string (string-append "hafod " hafod-version))
 
   ;; scsh-compatible version aliases
   (define scsh-major-version hafod-major-version)

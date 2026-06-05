@@ -1,4 +1,4 @@
-.TH HAFOD 1 "March 2026" "hafod 1.2" "User Commands"
+.TH HAFOD 1 "@DATE@" "hafod @VERSION@" "User Commands"
 .SH NAME
 hafod \- Scheme shell (scsh on Chez Scheme)
 .SH SYNOPSIS

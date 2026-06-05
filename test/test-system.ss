@@ -89,18 +89,24 @@
 
 ;; ---- version constants ----
 
-(test-equal "hafod-major-version is 1"
-  1 hafod-major-version)
+;; Versions are generated from git tags at build time (tools/gen-version.sh),
+;; so assert their *shape* rather than a hardcoded literal that would need
+;; editing on every release.
+(test-assert "hafod-major-version is a non-negative integer"
+  (and (integer? hafod-major-version) (>= hafod-major-version 0)))
 
-(test-equal "hafod-minor-version is 4"
-  4 hafod-minor-version)
+(test-assert "hafod-minor-version is a non-negative integer"
+  (and (integer? hafod-minor-version) (>= hafod-minor-version 0)))
 
-(test-equal "hafod-version-string is correct"
-  "hafod 1.4.3" hafod-version-string)
+(test-assert "hafod-version-string is \"hafod <version>\""
+  (let ([s hafod-version-string])
+    (and (string? s)
+         (> (string-length s) 6)
+         (string=? "hafod " (substring s 0 6)))))
 
-;; scsh-compatible version aliases
-(test-equal "scsh-major-version alias" 1 scsh-major-version)
-(test-equal "scsh-minor-version alias" 4 scsh-minor-version)
-(test-equal "scsh-version-string alias" "hafod 1.4.3" scsh-version-string)
+;; scsh-compatible version aliases mirror the hafod values
+(test-equal "scsh-major-version alias" hafod-major-version scsh-major-version)
+(test-equal "scsh-minor-version alias" hafod-minor-version scsh-minor-version)
+(test-equal "scsh-version-string alias" hafod-version-string scsh-version-string)
 
 (test-end)

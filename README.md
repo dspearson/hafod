@@ -71,8 +71,8 @@ seasonal shell.
 ## Building
 
 ```sh
-make                    # compile all libraries
-make test               # run the full test suite (2,500+ tests)
+make                    # build the native binary (libraries are compiled first)
+make test               # run the full test suite
 ```
 
 If `scheme` is not on your PATH or is named differently:
@@ -81,45 +81,81 @@ If `scheme` is not on your PATH or is named differently:
 make SCHEME=/path/to/chez-scheme
 ```
 
+If you have [`just`](https://github.com/casey/just) installed (it ships in the
+Nix dev shell), the common workflows are available as recipes:
+
+```sh
+just                    # list all recipes
+just build              # build the native binary
+just test               # run the test suite, hang-proofed (per-test timeout)
+just install            # build and install to /usr/local (uses sudo)
+just version            # print the version resolved from git tags
+```
+
 ### Build modes
 
 hafod supports three build modes:
 
 | Mode | Command | Output | Size | Startup | Runtime dependencies |
 |------|---------|--------|------|---------|---------------------|
-| Library | `make` | `bin/hafod` | n/a | ~87ms | `scheme` on PATH |
-| Native | `make native` | `bin/hafod-native` | ~50KB | ~85ms | petite.boot, compiled libs |
+| Native (default) | `make` | `bin/hafod-native` | ~850KB | ~85ms | boot files + compiled libs (copied in on install) |
+| Library | `make compile` | `bin/hafod` | n/a | ~87ms | `scheme` on PATH |
 | Standalone | `make standalone` | `bin/hafod-standalone` | ~5.1MB | ~62ms | none |
 
-**Library** (default) compiles all libraries and produces a shell wrapper
-that invokes `scheme`.  No C compiler needed.
+**Native** (default) links against Chez's `libkernel.a` for a small native
+binary.  In the build tree it loads `petite.boot`/`scheme.boot` and the
+compiled `.so` libraries from the install directory; `make install` *copies*
+those in (see [Installation](#installation)), so the installed binary is
+self-contained and needs no Chez Scheme on the target.
 
-**Native** links against Chez's `libkernel.a` for a small native binary
-that still requires `petite.boot` and the compiled `.so` libraries at
-runtime.  Useful for installed deployments where Chez is available.
+**Library** compiles all libraries and uses the `bin/hafod` shell wrapper that
+invokes `scheme`.  No C compiler needed; handy for development.
 
 **Standalone** embeds LZ4-compressed vfasl boot files and the launcher
 program into a single self-contained binary.  No external files needed
-at runtime — recommended for distribution.
+at runtime — recommended for single-file distribution.
 
 ### Nix
 
-A `flake.nix` is provided for development:
+A `flake.nix` is provided for development.  The dev shell includes Chez Scheme
+and [`just`](https://github.com/casey/just):
 
 ```sh
-nix develop             # enter a shell with Chez Scheme available
-make && make test
+nix develop             # enter a shell with Chez Scheme + just on PATH
+make && make test       # or: just build && just test
+```
+
+> Build and install from inside the dev shell (or otherwise with a single
+> `SCHEME`) so every artefact uses the same Chez version.  Mixing Chez
+> versions across the binary, boot files, and compiled `.so`s causes
+> "incompatible fasl-object version" errors at load time.
+
+### Versioning
+
+The version has a single source of truth — **git tags** — so there is nothing
+to hand-edit per release.  `tools/gen-version.sh` runs at build time and
+resolves the version from `git describe --tags`, falling back to the tracked
+`VERSION` file for builds without a `.git` (release tarballs, Nix sources).
+To cut a release:
+
+```sh
+git tag v1.6            # what `hafod --version` and the man page report
+echo 1.6 > VERSION      # keep the fallback in step for tarball/Nix builds
 ```
 
 ## Installation
 
-For a self-contained binary with no runtime dependencies, use the
-standalone build:
+The native install is self-contained: `make install` copies `petite.boot`,
+`scheme.boot`, and the compiled libraries into the install directory, so the
+installed `hafod` needs no Chez Scheme on the target system.
 
 ```sh
-make standalone
-make install                          # installs to /usr/local
+make                                  # build the native binary
+sudo make install                     # installs to /usr/local
 ```
+
+For a single-file binary instead, build standalone first
+(`make standalone && make install`).
 
 Other install options:
 
@@ -404,13 +440,22 @@ The test suite comprises 72 Scheme test suites (2,500+ assertions) and a
 91-test shell-based launcher test:
 
 ```sh
-make test                       # run all Scheme tests
+make test                       # run all Scheme tests + launcher + umbrella
 sh test/test-launcher.sh        # run launcher/CLI tests
 
 # Run a single test suite:
 make test-re                    # regex tests
 make test-syntax                # process notation tests
 make test-awk                   # AWK macro tests
+```
+
+Some suites exercise the interactive editor, PTYs, and signals.  Run them via
+`just test`, which gives each suite a timeout and `/dev/null` stdin so an
+interactive test can never hang the run:
+
+```sh
+just test                       # hang-proofed full run (recommended)
+just test-one editor            # a single suite by name
 ```
 
 ## Differences from scsh

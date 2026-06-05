@@ -16,7 +16,9 @@
       packages = forAllSystems ({ pkgs }: {
         default = pkgs.stdenv.mkDerivation {
           pname = "hafod";
-          version = "1.1.0";
+          # Single source of truth: the tracked VERSION file (git tags drive
+          # this for non-nix builds; nix sources have no .git so they read it).
+          version = pkgs.lib.fileContents ./VERSION;
 
           src = ./.;
 
@@ -33,6 +35,10 @@
 
           buildPhase = ''
             make compile-wpo SCHEME=${pkgs.chez}/bin/scheme
+            # doc/hafod.1 is generated from doc/hafod.1.in (not tracked), so the
+            # installPhase below has a man page to install. No .git here, so the
+            # version comes from the VERSION file fallback.
+            make doc/hafod.1
           '';
 
           installPhase = ''
@@ -83,7 +89,8 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
         in {
         default = pkgs.mkShell {
-          packages = [ pkgs.chez ] ++ libs;
+          # just: task runner exposing common build/test/install recipes (justfile)
+          packages = [ pkgs.chez pkgs.just ] ++ libs;
           LDFLAGS = builtins.concatStringsSep " " (map (p: "-L${p}/lib") libs);
           CFLAGS = builtins.concatStringsSep " " (map (p: "-I${p}/include") libs);
         };
