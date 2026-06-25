@@ -117,17 +117,27 @@ standalone: compile-wpo
 # We use a static pattern rule (not an implicit pattern rule) because GNU Make
 # skips implicit rule search for targets declared .PHONY. Static pattern rules
 # are explicit rules and work correctly with .PHONY.
+#
+# stdin is redirected from /dev/null so a test never blocks on the terminal.
+# interactive-repl picks the line editor vs. bare read via (tty? 0), so
+# test-interactive would otherwise hang waiting for keystrokes when `make test`
+# inherits a real terminal (e.g. in an interactive shell). Matches `just test`.
 $(TEST_TARGETS): test-%: compile
-	$(SCHEME) $(TESTDIRS) --script test/test-$*.ss
+	$(SCHEME) $(TESTDIRS) --script test/test-$*.ss </dev/null
 
 # Special case: test-launcher uses bash, not Scheme.
 # This explicit rule overrides the static pattern rule above.
-test-launcher: compile
-	sh test/test-launcher.sh
+# Depends on compile-wpo (not just compile): the launcher exercises the
+# bin/hafod wrapper, which loads bin/hafod.so -- built by compile-wpo, NOT by
+# compile (that only builds src/*.so). Without this, the test runs against a
+# stale/version-mismatched bin/hafod.so and fails with an incompatible
+# fasl-object / "cannot compile foreign-procedure" error.
+test-launcher: compile-wpo
+	sh test/test-launcher.sh </dev/null
 
 # Umbrella verification: confirm all 791+ symbols are accessible via (import (hafod))
 verify-umbrella: compile
-	$(SCHEME) $(LIBDIRS) --script tools/verify-umbrella.ss
+	$(SCHEME) $(LIBDIRS) --script tools/verify-umbrella.ss </dev/null
 
 test: compile $(TEST_TARGETS) test-launcher verify-umbrella
 
