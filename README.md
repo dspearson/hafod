@@ -52,7 +52,7 @@ seasonal shell.
 - **Script launcher** -- scsh-compatible CLI with `-s`, `-c`, `-e`, `--`,
   meta-argument processing, `!#` header stripping, auto-import of `(hafod)`,
   and `|` → `pipe` source preprocessing for scsh compatibility
-- **SRFI-1 and SRFI-13** -- the full SRFI-1 list library (88 procedures)
+- **SRFI-1 and SRFI-13** -- the full SRFI-1 list library (97 procedures)
   and SRFI-13 string library (67 procedures) are available at the top
   level via `(import (hafod))`, matching scsh's environment.  All 35
   SRFIs that scsh bundled via Scheme 48 are available as
@@ -449,9 +449,11 @@ make test-syntax                # process notation tests
 make test-awk                   # AWK macro tests
 ```
 
-Some suites exercise the interactive editor, PTYs, and signals.  Run them via
-`just test`, which gives each suite a timeout and `/dev/null` stdin so an
-interactive test can never hang the run:
+Some suites exercise the interactive editor, PTYs, and signals.  Both `make
+test` and `just test` redirect every suite's stdin from `/dev/null`, so an
+interactive suite can never block waiting for keystrokes.  `just test`
+additionally gives each suite a per-test timeout, so even a genuine hang or
+infinite loop can't stall the run:
 
 ```sh
 just test                       # hang-proofed full run (recommended)
