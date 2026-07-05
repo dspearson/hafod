@@ -58,7 +58,7 @@ seasonal shell.
   SRFIs that scsh bundled via Scheme 48 are available as
   `(import (hafod srfi-N))`
 - **Full scsh compatibility** -- 1:1 coverage of the scsh public API
-  (1,338 exported symbols); `(import (scsh))` works as an alias for
+  (1,342 exported symbols); `(import (scsh))` works as an alias for
   `(import (hafod))`; all scsh accessor names, predicates, char-sets,
   file-options, RE ADT layer, and version aliases
 
@@ -128,7 +128,10 @@ make && make test       # or: just build && just test
 > Build and install from inside the dev shell (or otherwise with a single
 > `SCHEME`) so every artefact uses the same Chez version.  Mixing Chez
 > versions across the binary, boot files, and compiled `.so`s causes
-> "incompatible fasl-object version" errors at load time.
+> "incompatible fasl-object version" errors at load time.  The build records
+> the Chez version it used and the launcher asserts it, refusing a mismatched,
+> Rosetta, or cross build with an actionable message rather than a raw fasl
+> error.
 
 ### Versioning
 
@@ -139,8 +142,8 @@ resolves the version from `git describe --tags`, falling back to the tracked
 To cut a release:
 
 ```sh
-git tag v1.6            # what `hafod --version` and the man page report
-echo 1.6 > VERSION      # keep the fallback in step for tarball/Nix builds
+git tag v1.7               # what `hafod --version` and the man page report
+printf '1.7\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
 ```
 
 ## Installation
@@ -436,8 +439,8 @@ hafod -s examples/01-system-info.ss
 
 ## Tests
 
-The test suite comprises 72 Scheme test suites (2,500+ assertions) and a
-91-test shell-based launcher test:
+The test suite comprises 75 Scheme test suites (2,500+ assertions) and a
+92-test shell-based launcher test:
 
 ```sh
 make test                       # run all Scheme tests + launcher + umbrella
@@ -593,7 +596,8 @@ hafod adds several capabilities beyond the original scsh:
 - **Library directory search** -- `(hafod lib-dirs)` for finding files
   along a search path
 - **Enhanced launcher** -- `-l` preload files, `-e` entry point,
-  `--` REPL mode, `|` preprocessing
+  `--` REPL mode, `|` preprocessing, and `--batch` (or the `HAFOD_BATCH`
+  environment variable) to force the plain non-editor REPL path
 - **Shell mode** -- bare command execution in the REPL, input
   classifier, pipes, redirects, globs, env vars, builtins (cd,
   pushd, popd, export), `&&`/`||`/`;` chaining, `&` background,
@@ -648,6 +652,18 @@ hafod adds several capabilities beyond the original scsh:
 - **Config system** -- XDG-compliant `~/.config/hafod/init.ss`,
   `set-prompt!`, `bind-key!` with Emacs-style key descriptions,
   `--no-config` flag
+- **Terminal & environment awareness** -- the interactive UI degrades
+  gracefully when the output is not a capable terminal: colour, cursor
+  control, editor escapes, the paren flash, completion menus and the
+  keybinding cheatsheet are each gated on the actual target, `NO_COLOR`
+  and `TERM=dumb` are honoured, and the line editor engages only when
+  *both* stdin and stdout are terminals -- so `hafod | cat`,
+  `hafod > log`, and `hafod < script` produce clean, escape-free output
+  (a broken downstream pipe exits quietly, matching a normal filter).
+  `--batch` / `HAFOD_BATCH` forces the plain non-editor path.  The
+  terminal is always restored to cooked mode on exit, on an uncaught
+  error, on a fatal signal, and across a Ctrl-Z suspend, so a crash or
+  `^Z` never leaves the shell wedged in raw mode.
 
 ### Quick migration checklist
 
@@ -659,7 +675,7 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,338 scsh-compatible symbols are
+5. Most scripts work unchanged -- 1,342 scsh-compatible symbols are
    exported, including SRFI-1 and SRFI-13 at the top level
 
 ## Performance

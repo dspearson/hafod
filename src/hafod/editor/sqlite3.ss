@@ -9,7 +9,7 @@
           sqlite3-step sqlite3-column-text sqlite3-column-int64
           sqlite3-column-count sqlite3-errmsg
           SQLITE_OK SQLITE_ROW SQLITE_DONE)
-  (import (chezscheme))
+  (import (chezscheme) (hafod internal platform))
 
   ;; Status codes
   (define SQLITE_OK   0)
@@ -24,8 +24,8 @@
     (let ([try (lambda (name)
                  (guard (e [#t #f])
                    (load-shared-object name) #t))])
-      (or (case (machine-type)
-            [(ta6osx tarm64osx ti3osx a6osx arm64osx i3osx)
+      (or (case os-family
+            [(macos)
              (or (try "libsqlite3.dylib")
                  (try "/usr/lib/libsqlite3.dylib")
                  (try "/opt/homebrew/lib/libsqlite3.dylib"))]

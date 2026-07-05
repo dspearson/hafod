@@ -40,6 +40,7 @@
   (let ([inp (open-input-string input-string)]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    ;; Reset hooks to defaults to isolate tests
@@ -66,6 +67,7 @@
         [inp (open-input-string "(+ 1 2)\n(+ 3 4)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (set! count (+ count 1)))]
@@ -81,6 +83,7 @@
         [inp (open-input-string "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -96,6 +99,7 @@
         [inp (open-input-string "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -133,6 +137,7 @@
         [inp (open-input-string input-string)]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -213,6 +218,7 @@
   (let ([inp (open-input-string "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -246,6 +252,7 @@
   (let ([inp (open-input-string "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda ()
@@ -282,10 +289,11 @@
 
 ;; === REPL-06c: Right prompt output contains ANSI save/restore cursor ===
 
-(test-assert "REPL-06c: right prompt contains ANSI save/restore and text"
+(test-assert "REPL-06c: right prompt to a non-TTY is plain text with no cursor escapes"
   (let ([inp (open-input-string "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [terminal-width 80]
@@ -296,20 +304,23 @@
                    [repl-post-eval-hook (lambda (form result) (void))])
       (interactive-repl))
     (let ([output (get-output-string out)])
-      (and (string-contains output "\x1b;7")
+      ;; Non-terminal target: the cursor save (ESC 7) and restore (ESC 8) are
+      ;; gated off, but the right-prompt text is still emitted plain.
+      (and (not (string-contains output "\x1b;7"))
            (string-contains output "rprompt")
-           (string-contains output "\x1b;8")))))
+           (not (string-contains output "\x1b;8"))))))
 
 ;; === REPL-06d: Right prompt suppressed on narrow terminal ===
 
-(test-assert "REPL-06d: right prompt suppressed when terminal too narrow"
-  ;; First expression sets terminal-width to 5, second expression triggers a prompt
-  ;; cycle where the right prompt should be suppressed (rprompt=7 chars > width=5).
-  ;; We check that the output after the width change does not contain save cursor.
+(test-assert "REPL-06d: right prompt to a non-TTY emits no cursor save in any cycle"
+  ;; Two prompt cycles run (before and after a terminal-width change). Against a
+  ;; non-terminal target the cursor save (ESC 7) is gated off in both cycles, so
+  ;; it must appear zero times regardless of the width.
   (let ([inp (open-input-string "(terminal-width 5)\n(+ 1 2)\n")]
         [out (open-output-string)]
         [saw-narrow-rprompt #f])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -318,13 +329,12 @@
                    [repl-pre-eval-hook (lambda (form) (void))]
                    [repl-post-eval-hook (lambda (form result) (void))])
       (interactive-repl))
-    ;; The first prompt cycle (before terminal-width 5) will have the right prompt.
-    ;; After setting width to 5, the second prompt cycle should suppress it.
-    ;; Count occurrences of ESC 7 -- should be exactly 1 (from the first prompt cycle only).
+    ;; Both prompt cycles are plain against the non-terminal target, so the
+    ;; count of ESC 7 across the whole output must be zero.
     (let ([output (get-output-string out)])
       (let count-esc7 ([i 0] [n 0])
         (cond
-          [(> (+ i 1) (string-length output)) (= n 1)]
+          [(> (+ i 1) (string-length output)) (= n 0)]
           [(and (char=? (string-ref output i) (integer->char #x1b))
                 (< (+ i 1) (string-length output))
                 (char=? (string-ref output (+ i 1)) #\7))
@@ -345,6 +355,7 @@
   (let ([inp (make-slow-input-port "(define x\n  42)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -362,6 +373,7 @@
   (let ([inp (make-slow-input-port "(+ 1 2)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -382,6 +394,7 @@
     (let ([inp (open-input-string "(getenv \"SHLVL\")\n")]
           [out (open-output-string)])
       (parameterize ([console-input-port inp]
+                     [batch-mode? #t]
                      [console-output-port out]
                      [console-error-port out]
                      [repl-prompt-hook (lambda () (void))]
@@ -401,6 +414,7 @@
     (let ([inp (open-input-string "(getenv \"SHLVL\")\n")]
           [out (open-output-string)])
       (parameterize ([console-input-port inp]
+                     [batch-mode? #t]
                      [console-output-port out]
                      [console-error-port out]
                      [repl-prompt-hook (lambda () (void))]
@@ -425,6 +439,7 @@
   (let ([inp (open-input-string "(background-job-count)\n")]
         [out (open-output-string)])
     (parameterize ([console-input-port inp]
+                   [batch-mode? #t]
                    [console-output-port out]
                    [console-error-port out]
                    [repl-prompt-hook (lambda () (void))]
@@ -485,15 +500,19 @@
 
 ;; === REPL-OUT-02: pretty-print-colourised in REPL output ===
 
-(test-assert "REPL-OUT-02a: REPL output contains ANSI escapes for coloured output"
+(test-assert "REPL-OUT-02a: REPL value output to a non-TTY contains zero escape bytes"
   (let ([output (test-repl-with-input "(list 1 2 3)\n")])
-    ;; Output should contain ANSI colour codes from syntax highlighting
-    (string-contains output "\x1b;[")))
+    ;; The captured string port is a non-terminal target, so colour is gated
+    ;; off: the value renders as plain text with no ESC bytes at all.
+    (and (string-contains output "1 2 3")
+         (not (string-contains output "\x1b;")))))
 
-(test-assert "REPL-OUT-02b: REPL output for multi-value contains ANSI escapes"
+(test-assert "REPL-OUT-02b: REPL multi-value output to a non-TTY contains zero escape bytes"
   (let ([output (test-repl-with-input "(values 1 2 3)\n")])
-    ;; Each value should be colourised
-    (string-contains output "\x1b;[")))
+    ;; Each value is emitted plain to the non-terminal target.
+    (and (string-contains output "1")
+         (string-contains output "3")
+         (not (string-contains output "\x1b;")))))
 
 (test-assert "REPL-OUT-02c: REPL void suppression still works with colourised output"
   (let ([output (test-repl-with-input "(values)\n")])
@@ -502,10 +521,11 @@
 
 ;; === REPL-OUT-03: Error display in red ===
 
-(test-assert "REPL-OUT-03a: error output contains red ANSI escape"
+(test-assert "REPL-OUT-03a: error output to a non-TTY is plain with the message intact"
   (let ([output (test-repl-with-input "(error 'test \"boom\")\n(+ 1 2)\n")])
-    ;; Error should be wrapped in red (ESC[31m)
-    (and (string-contains output "\x1b;[31m")
+    ;; The red SGR is gated off for the non-terminal target; the plain error
+    ;; message must still survive.
+    (and (not (string-contains output "\x1b;[31m"))
          (string-contains output "boom"))))
 
 ;; === REPL-OUT-04: repl-prompt-string parameter ===
@@ -525,5 +545,18 @@
       (let ([val (repl-prompt-string)])
         (repl-prompt-string old)
         (string=? val "my> ")))))
+
+;; === use-editor?* precedence (pure, no pseudo-terminal) ===
+;; The line editor is chosen only when BOTH ends are a real terminal and neither
+;; --batch nor HAFOD_BATCH is in force; either batch signal wins, and if either
+;; end is not a terminal (piped stdin OR piped/redirected stdout) there is never
+;; an editor.  Inputs are (fd0-tty? fd1-tty? forced-batch? env-batch?).
+;; Exercising the pure helper keeps the precedence honest without a pty.
+(test-equal "editor when both ends are a tty, no batch" #t (use-editor?* #t #t #f #f))
+(test-equal "no editor when stdout is piped/redirected" #f (use-editor?* #t #f #f #f))
+(test-equal "no editor when stdin is not a tty" #f (use-editor?* #f #t #f #f))
+(test-equal "--batch overrides two ttys" #f (use-editor?* #t #t #t #f))
+(test-equal "HAFOD_BATCH overrides two ttys" #f (use-editor?* #t #t #f #t))
+(test-equal "never an editor off a tty" #f (use-editor?* #f #f #f #f))
 
 (test-end)

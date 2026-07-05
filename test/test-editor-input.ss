@@ -50,6 +50,13 @@
     (and (eq? (key-event-type ev) 'ctrl)
          (eqv? (key-event-value ev) #\d))))
 
+;; C-z (char 26) decodes to ctrl #\z -- the byte VSUSP-disabled raw mode
+;; delivers for Ctrl-Z, which the editor binds to suspend (cmd-suspend).
+(test-assert "C-z (char 26)"
+  (let ([ev (read-key-event (open-input-string (string (integer->char 26))))])
+    (and (eq? (key-event-type ev) 'ctrl)
+         (eqv? (key-event-value ev) #\z))))
+
 ;;; Special control chars: tab, return, newline
 
 (test-assert "tab (char 9)"

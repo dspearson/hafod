@@ -14,7 +14,7 @@
           (only (hafod procobj) proc? proc:pid proc:finished? proc:status
                 wait reap-zombies wait/poll wait/stopped-children)
           (only (hafod posix) status:exit-val status:stop-sig status:term-sig)
-          (only (hafod signal) signal-process-group)
+          (only (hafod signal) signal-process-group set-signal-handler!)
           (only (hafod process-state) set-process-group))
 
   ;; ======================================================================
@@ -240,9 +240,11 @@
   ;; Shell ignores SIGTSTP, SIGTTIN, SIGTTOU.
   ;; SIGCHLD triggers zombie reaping.
   (define (install-job-signals!)
-    ;; Ignore job-control signals in the shell itself
-    (register-signal-handler SIGTSTP (lambda (sig) (void)))
-    (register-signal-handler SIGTTIN (lambda (sig) (void)))
-    (register-signal-handler SIGTTOU (lambda (sig) (void))))
+    ;; Ignore job-control signals in the shell itself.  Record the no-ops
+    ;; through the disposition registry so a scoped raw-mode owner can restore
+    ;; the real job-control disposition when it exits its Ctrl-Z dance.
+    (set-signal-handler! SIGTSTP (lambda (sig) (void)))
+    (set-signal-handler! SIGTTIN (lambda (sig) (void)))
+    (set-signal-handler! SIGTTOU (lambda (sig) (void))))
 
 ) ; end library

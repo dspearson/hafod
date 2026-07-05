@@ -19,12 +19,17 @@ lib/
 
 # Generated binaries/libraries
 tools/gen-platform-constants
+tools/probe-platform-constants
 src/hafod-ffi-helpers.so
 src/hafod-ffi-helpers.dylib
 
 # Generated version library (regenerated from git tags each build via
 # tools/gen-version.sh). The VERSION file is the tracked fallback.
 src/hafod/internal/version.ss
+
+# Generated build-Chez-version library (regenerated each build via
+# tools/gen-chez-version.sh, recording the build Chez version triple).
+src/hafod/internal/chez-version.ss
 
 # Generated man page (rendered from doc/hafod.1.in at build time)
 doc/hafod.1

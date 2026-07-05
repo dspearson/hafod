@@ -378,4 +378,32 @@
 (unless stdin-is-tty?
   (test-assert "TTY-dependent tests skipped (stdin is not a terminal)" #t))
 
+;; ======================================================================
+;; terminal-size -- the shared window-size helper
+;; ======================================================================
+;; These assertions cover the shape and the non-terminal fallback only. The
+;; fallback is exercised against a freshly opened /dev/null fd -- a guaranteed
+;; non-terminal -- so the result is deterministic no matter what fds 0/1/2 are.
+;; A bare no-arg (terminal-size) instead reads the REAL size whenever any of
+;; stdout/stdin/stderr is a terminal (e.g. an interactive `make test`, whose
+;; recipe redirects only stdin), so it must not be used to assert the fallback.
+;; We never assert a specific real size: it differs between platforms; the live
+;; match against `stty size` is a manual check.
+
+(test-assert "terminal-size is a procedure"
+  (procedure? terminal-size))
+
+(test-assert "terminal-size returns two integer values"
+  (call-with-values terminal-size
+    (lambda (rows cols) (and (integer? rows) (integer? cols)))))
+
+(test-assert "terminal-size on a non-terminal fd falls back to 24x80"
+  (let ([fd (posix-open "/dev/null" O_RDONLY 0)])
+    (dynamic-wind
+      void
+      (lambda ()
+        (call-with-values (lambda () (terminal-size fd))
+          (lambda (rows cols) (and (= rows 24) (= cols 80)))))
+      (lambda () (posix-close fd)))))
+
 (test-end)

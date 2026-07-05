@@ -15,8 +15,20 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
+      - name: Check platform constants
+        run: nix develop --command make check-platform
+
+      - name: Cross-check constants against an independent C probe
+        run: nix develop --command make check-c-probe
+
+      - name: Check structural portability invariants
+        run: nix develop --command make check-portability
+
       - name: Build (compile-wpo)
         run: nix develop --command make compile-wpo
+
+      - name: Record platform
+        run: uname -srm
 
       - name: Run tests
         run: nix develop --command make test
@@ -56,6 +68,18 @@ jobs:
 
       - name: Build (compile-wpo)
         run: nix develop --command make compile-wpo
+
+      - name: Check platform constants
+        run: nix develop --command make check-platform
+
+      - name: Cross-check constants against an independent C probe
+        run: nix develop --command make check-c-probe
+
+      - name: Check structural portability invariants
+        run: nix develop --command make check-portability
+
+      - name: Record platform
+        run: uname -srm
 
       - name: Run tests
         run: nix develop --command make test

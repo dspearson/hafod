@@ -16,7 +16,8 @@
     posix-uname)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
-          (hafod internal platform-constants) (hafod internal posix-core))
+          (hafod internal platform-constants) (hafod internal posix-core)
+          (hafod internal platform))
 
   ;; ======================================================================
   ;; Directory iteration
@@ -57,16 +58,18 @@
   ;; fcntl
   ;; ======================================================================
 
-  ;; Non-variadic wrappers for fcntl (variadic in C).
-  (define c-fcntl-void (foreign-procedure "hafod_fcntl_void" (int int) int))
-  (define c-fcntl-int (foreign-procedure "hafod_fcntl_int" (int int int) int))
+  ;; One native binding serves both fcntl arities: n = 2 (fd + cmd fixed),
+  ;; the optional arg is the single variadic. The no-arg commands ignore the
+  ;; harmless dummy 0 the wrapper passes for the unused vararg.
+  (define c-fcntl
+    (foreign-procedure (__varargs_after 2) "fcntl" (int int int) int))
 
   ;; posix-fcntl: file descriptor control.
   ;; (posix-fcntl fd cmd) or (posix-fcntl fd cmd arg)
   (define (posix-fcntl fd cmd . args)
     (if (null? args)
-        (posix-call fcntl (c-fcntl-void fd cmd))
-        (posix-call fcntl (c-fcntl-int fd cmd (car args)))))
+        (posix-call fcntl (c-fcntl fd cmd 0))
+        (posix-call fcntl (c-fcntl fd cmd (car args)))))
 
   ;; ======================================================================
   ;; Supplementary groups
@@ -234,8 +237,8 @@
   (define UTSNAME_SIZE (* 6 UTSNAME_FIELD_LEN))
 
   (define c-uname
-    (case (machine-type)
-      [(ta6fb tarm64fb ti3fb a6fb arm64fb i3fb)
+    (case os-family
+      [(freebsd)
        ;; FreeBSD: call __xuname(field_len, buf)
        (let ([xuname (foreign-procedure "__xuname" (int u8*) int)])
          (lambda (buf) (xuname UTSNAME_FIELD_LEN buf)))]

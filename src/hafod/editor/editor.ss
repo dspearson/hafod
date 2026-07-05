@@ -39,61 +39,48 @@
           (hafod editor help)
           (hafod fuzzy)
           (hafod tty)
-          (only (hafod internal posix-constants) TIOCGWINSZ)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod shell classifier) path-cache scheme-prefix-chars)
           (only (hafod shell completers) lookup-completer)
           (only (hafod collect) run/strings*)
           (only (hafod process) exec-path))
 
   ;; ======================================================================
-  ;; Terminal size query (local to editor, avoids circular dep with interactive)
+  ;; Terminal size query
   ;; ======================================================================
 
-  (define editor-query-terminal-cols
-    (let ([c-ioctl (foreign-procedure "hafod_ioctl_ptr" (int unsigned-long void*) int)])
-      (lambda ()
-        (let ([buf (foreign-alloc 8)])
-          (let try-fd ([fds '(1 0 2)])
-            (cond
-              [(null? fds) (foreign-free buf) 80]
-              [else
-               (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
-                 (if (zero? rc)
-                     (let ([cols (foreign-ref 'unsigned-16 buf 2)])
-                       (foreign-free buf)
-                       (if (> cols 0) cols 80))
-                     (try-fd (cdr fds))))]))))))
+  ;; Query the terminal column count, falling back to 80 off a terminal.
+  ;; Delegates to the shared tty helper.
+  (define (editor-query-terminal-cols)
+    (let-values ([(rows cols) (terminal-size)]) cols))
 
   ;; ======================================================================
   ;; Raw mode
   ;; ======================================================================
 
   ;; with-raw-mode: enter raw mode on fd, run thunk, restore on exit.
-  ;; Uses dynamic-wind so terminal is restored even on non-local exit (SIGINT, exceptions).
-  ;; Keeps ttyl/enable-signals so SIGINT is delivered as a signal, not raw byte.
+  ;; A thin wrapper over the terminal owner's with-raw-mode*, which owns the
+  ;; termios save/set/restore and the suspend handling for the extent of the raw
+  ;; session (and keeps signals enabled, so Ctrl-C / Ctrl-Z still arrive as
+  ;; signals while editing).  This wrapper adds only the bracketed-paste
+  ;; enable/disable pair, gated on the console's capability so the enter and its
+  ;; matching leave stay balanced and no escape leaks to a non-capable target.
   (define (with-raw-mode fd thunk)
-    (let ([saved (tty-info fd)])
-      (dynamic-wind
-        (lambda ()
-          (let ([raw (copy-tty-info saved)])
-            (set-tty-info:local-flags raw
-              (bitwise-and (tty-info:local-flags raw)
-                           (bitwise-not (bitwise-ior ttyl/canonical ttyl/echo))))
-            (set-tty-info:input-flags raw
-              (bitwise-and (tty-info:input-flags raw)
-                           (bitwise-not ttyin/cr->nl)))
-            (set-tty-info:min raw 1)
-            (set-tty-info:time raw 0)
-            (set-tty-info/now fd raw))
-          ;; Enable bracketed paste mode
-          (display "\x1b;[?2004h" (console-output-port))
-          (flush-output-port (console-output-port)))
-        thunk
-        (lambda ()
-          ;; Disable bracketed paste mode
-          (display "\x1b;[?2004l" (console-output-port))
-          (flush-output-port (console-output-port))
-          (set-tty-info/now fd saved)))))
+    (with-raw-mode* fd
+      (lambda ()
+        (dynamic-wind
+          (lambda ()
+            ;; Enable bracketed paste mode (only when the console is a capable terminal)
+            (when (ansi-ok? (console-output-port))
+              (display "\x1b;[?2004h" (console-output-port)))
+            (flush-output-port (console-output-port)))
+          thunk
+          (lambda ()
+            ;; Disable bracketed paste mode -- gated on the same predicate as the
+            ;; enable above so the enter/leave pair stays balanced.
+            (when (ansi-ok? (console-output-port))
+              (display "\x1b;[?2004l" (console-output-port)))
+            (flush-output-port (console-output-port)))))))
 
   ;; ======================================================================
   ;; Editor state record
@@ -420,7 +407,8 @@
   (define (cmd-clear-screen es)
     (let ([port (editor-state-out-port es)])
       ;; Clear screen and move cursor to top-left
-      (display "\x1b;[2J\x1b;[H" port)
+      (when (ansi-ok? port)
+        (display "\x1b;[2J\x1b;[H" port))
       (flush-output-port port)))
 
   ;; Yank commands
@@ -483,15 +471,25 @@
 
   ;; Cursor shape + colour via ANSI (shape) and OSC 12 (colour)
   ;; Doom Emacs palette: insert=#51afef (blue), normal=#ECBE7B (yellow)
+  ;; Shape is cursor control (gated on ansi-ok?); the colour tint is an OSC-12
+  ;; sequence (gated on colour-ok?), so a capable terminal with colour disabled
+  ;; keeps the vi-mode shape but drops the tint.  set/reset gate on matching
+  ;; predicates so a suppressed set has a harmless suppressed reset.
   (define (set-cursor-block port)
-    (display "\x1b;[2 q" port)            ; steady block
-    (display "\x1b;]12;#ECBE7B\x7;" port))  ; yellow cursor colour
+    (when (ansi-ok? port)
+      (display "\x1b;[2 q" port))            ; steady block
+    (when (colour-ok? port)
+      (display "\x1b;]12;#ECBE7B\x7;" port)))  ; yellow cursor colour
   (define (set-cursor-bar port)
-    (display "\x1b;[6 q" port)            ; steady bar
-    (display "\x1b;]12;#51afef\x7;" port))  ; blue cursor colour
+    (when (ansi-ok? port)
+      (display "\x1b;[6 q" port))            ; steady bar
+    (when (colour-ok? port)
+      (display "\x1b;]12;#51afef\x7;" port)))  ; blue cursor colour
   (define (reset-cursor port)
-    (display "\x1b;]112\x7;" port)           ; reset cursor colour to terminal default
-    (display "\x1b;[0 q" port))              ; reset cursor shape to terminal default
+    (when (colour-ok? port)
+      (display "\x1b;]112\x7;" port))           ; reset cursor colour to terminal default
+    (when (ansi-ok? port)
+      (display "\x1b;[0 q" port)))              ; reset cursor shape to terminal default
 
   ;; Enter normal mode (Escape from insert)
   (define (cmd-enter-normal-mode es)
@@ -1404,6 +1402,17 @@
           (cmd-accept-suggestion es)
           (cmd-end-of-line es))))
 
+  ;; Ctrl-Z: drop to the shell. VSUSP is disabled in raw mode, so Ctrl-Z reaches
+  ;; the editor as byte 0x1A rather than a SIGTSTP the blocking read would defer;
+  ;; the terminal owner publishes the suspend dance as current-suspend-hook for
+  ;; the raw extent. Calling it restores cooked mode, stops the process, and
+  ;; re-enters raw on resume -- the command loop then repaints the line. A no-op
+  ;; when no hook is set (outside a raw session), which cannot happen on a real
+  ;; keystroke. The editor stays out of the signal machinery: the owner owns it.
+  (define (cmd-suspend es)
+    (let ([suspend (current-suspend-hook)])
+      (when suspend (suspend))))
+
   ;; ======================================================================
   ;; Default keymap
   ;; ======================================================================
@@ -1452,7 +1461,10 @@
 
     ;; Undo/Redo
     (keymap-bind! km (list (make-key-event 'ctrl #\_ 0)) cmd-undo)
-    (keymap-bind! km (list (make-key-event 'meta #\/ 0)) cmd-redo))
+    (keymap-bind! km (list (make-key-event 'meta #\/ 0)) cmd-redo)
+
+    ;; Job control (Ctrl-Z suspend; see cmd-suspend)
+    (keymap-bind! km (list (make-key-event 'ctrl #\z 0)) cmd-suspend))
 
   ;; Paredit key sequences -- stored for unbind iteration
   (define paredit-key-sequences
@@ -2060,7 +2072,8 @@
       (if (not (null? completion-candidates))
           ;; Save cursor, move to end of content, render menu, restore cursor
           (begin
-            (display "\x1b;7" port)  ; save cursor position
+            (when (ansi-ok? port)
+              (display "\x1b;7" port))  ; save cursor position
             ;; Move cursor to end of buffer content (past all lines)
             (let* ([text (string-append (gap-buffer-before-string gb)
                                         (gap-buffer-after-string gb))]
@@ -2076,13 +2089,14 @@
                                        (lp (+ i 1) (if (char=? (string-ref before i) #\newline)
                                                        (+ n 1) n)))))]
                    [lines-after (- total-lines cursor-row)])
-              ;; Move down to end of content
-              (when (> lines-after 0)
-                (display "\x1b;[" port)
-                (display lines-after port)
-                (display "B" port))
-              ;; Move to beginning of next line
-              (display "\r" port)
+              ;; Move down to end of content, then to the beginning of the next
+              ;; line -- cursor positioning, gated on the render target.
+              (when (ansi-ok? port)
+                (when (> lines-after 0)
+                  (display "\x1b;[" port)
+                  (display lines-after port)
+                  (display "B" port))
+                (display "\r" port))
               ;; Render menu (fish-style grid)
               (let ([term-cols (editor-query-terminal-cols)])
                 (let-values ([(menu-lines gcols grows soff)
@@ -2094,7 +2108,8 @@
                                 term-cols
                                 10)])
                   ;; Restore cursor to edit position
-                  (display "\x1b;8" port)
+                  (when (ansi-ok? port)
+                    (display "\x1b;8" port))
                   (flush-output-port port)
                   (set! completion-menu-lines menu-lines)
                   (set! completion-grid-cols gcols)
@@ -2175,7 +2190,8 @@
                          (reset-undo-state!)
                          ;; Clear ghost suggestion text from screen
                          (when (> (string-length suggestion-text) 0)
-                           (display "\x1b;[K" out-port)  ; erase to end of line
+                           (when (ansi-ok? out-port)
+                             (display "\x1b;[K" out-port))  ; erase to end of line
                            (flush-output-port out-port))
                          (set! suggestion-text "")
                          ;; Move cursor past all content lines before newline,
@@ -2193,7 +2209,7 @@
                                                      (lp (+ i 1) (+ n 1))]
                                                     [else (lp (+ i 1) n)]))]
                                 [lines-below (- total-lines cursor-row)])
-                           (when (> lines-below 0)
+                           (when (and (ansi-ok? out-port) (> lines-below 0))
                              (display "\x1b;[" out-port)
                              (display lines-below out-port)
                              (display "B" out-port)))

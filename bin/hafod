@@ -20,6 +20,60 @@ HAFOD_ROOT="$(cd "$BINDIR/.." && pwd)"
 # Scripts don't need the compiler; fall back to scheme if petite unavailable.
 CHEZ="${HAFOD_SCHEME:-$(command -v petite 2>/dev/null || echo scheme)}"
 
+# Pre-flight version guard.  The whole point is to fail with a friendly,
+# actionable message BEFORE the dispatch below loads bin/hafod.so or compiles
+# the source path -- by which point a Chez mismatch surfaces as a cryptic
+# "incompatible fasl-object" crash (or, worse, a silent exit 0 under petite).
+#
+# The recorded build Chez version lives in this generated module (written at
+# build time from the build interpreter's own (scheme-version-number)).
+CHEZVER_SS="$HAFOD_ROOT/src/hafod/internal/chez-version.ss"
+
+# (G1) Version mismatch -- recorded build Chez vs the running interpreter.
+# Catches the fasl path (a mismatched bin/hafod.so the loader would reject) and
+# any wrong-version interpreter before it ever sees the .so.  Both values are
+# digits-and-dots only -- the recorded one extracted with an anchored sed from
+# a controlled in-repo file, the running one printed by the interpreter -- and
+# feed only printf and the string test below; neither is ever eval'd or built
+# into a command.  (scheme-version-number) returns THREE values, so read it
+# with call-with-values and a three-argument lambda, never as a list.
+expected="$(sed -n "s/.*build-chez-version-number '(\([0-9][0-9]*\) \([0-9][0-9]*\) \([0-9][0-9]*\)).*/\1.\2.\3/p" "$CHEZVER_SS" 2>/dev/null)"
+running="$(printf '%s' '(call-with-values (lambda () (scheme-version-number)) (lambda (a b c) (display a)(display ".")(display b)(display ".")(display c)))' | "$CHEZ" -q 2>/dev/null)"
+if [ -n "$expected" ] && [ -n "$running" ] && [ "$expected" != "$running" ]; then
+  printf 'hafod: Chez Scheme %s required, but %s is running %s.\n' "$expected" "$CHEZ" "$running" >&2
+  printf "hafod: run 'nix develop' (or set HAFOD_SCHEME), then 'make compile-wpo' to rebuild.\n" >&2
+  exit 1
+fi
+
+# (G1b) Fail-safe when the recorded version is unreadable but a compiled .so is
+# present.  bin/hafod.so is a whole-program artefact tied to one Chez; loading it
+# under a mismatched interpreter is exactly the raw "incompatible fasl-object"
+# crash this guard exists to prevent.  If the recorded version cannot be read
+# (chez-version.ss missing or malformed) we cannot prove the .so matches, so
+# refuse with a clear message rather than silently loading it.  This never fires
+# in a normal dev or installed tree, where chez-version.ss is always present.
+if [ -z "$expected" ] && [ -f "$BINDIR/hafod.so" ]; then
+  printf 'hafod: cannot verify the required Chez Scheme version (%s is unreadable).\n' "$CHEZVER_SS" >&2
+  printf "hafod: run 'nix develop' (or set HAFOD_SCHEME), then 'make compile-wpo' to rebuild.\n" >&2
+  exit 1
+fi
+
+# (G2) Source path under an interpreter that cannot compile FFI.  Petite has no
+# compiler, so interpreting bin/hafod.sps (which imports the FFI-bearing (hafod)
+# library) raises "cannot compile foreign-procedure" -- and petite exits 0 on
+# that, so the failure is otherwise silent.  Only relevant when no bin/hafod.so
+# is present (a matched .so runs fine under petite).  Petite and full scheme are
+# indistinguishable by version or machine type, so probe the compiler directly:
+# full scheme prints "yes", petite raises and prints nothing.
+if [ ! -f "$BINDIR/hafod.so" ]; then
+  has_compiler="$(printf '%s' '(call/cc (lambda (k) (with-exception-handler (lambda (e) (k (void))) (lambda () (compile (quote (+ 1 2))) (display "yes")))))' | "$CHEZ" -q 2>/dev/null)"
+  if [ "$has_compiler" != "yes" ]; then
+    printf 'hafod: %s cannot compile the source path (no bin/hafod.so present).\n' "$CHEZ" >&2
+    printf "hafod: run 'make compile-wpo' to build bin/hafod.so, or use full 'scheme'.\n" >&2
+    exit 1
+  fi
+fi
+
 # Use pre-compiled native program if available, otherwise interpret source
 if [ -f "$BINDIR/hafod.so" ]; then
   exec "$CHEZ" --libdirs "$HAFOD_ROOT/src" --program "$BINDIR/hafod.so" "$@"

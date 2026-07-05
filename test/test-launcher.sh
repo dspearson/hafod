@@ -98,8 +98,7 @@ assert_eq "-c evaluates arithmetic" "6" "$out"
 
 # -c with hafod API available
 out=$("$HAFOD" -c '(display (pid))' 2>&1)
-assert_contains "-c has hafod API (pid)" "" ""  # just shouldn't error
-# Actually check it's a number
+# Check it's a number
 case "$out" in
     *[0-9]*) pass "-c has hafod API (pid returns number)" ;;
     *) fail "-c has hafod API (pid returns number)" "a number" "$out" ;;
@@ -417,19 +416,19 @@ assert_eq "meta-arg multi-switch line 2" "3" "$out"
 section "-- REPL mode"
 # ======================================================================
 
-out=$(echo '(display "repl-ok")' | "$HAFOD" -- 2>&1)
+out=$(echo '(display "repl-ok")' | "$HAFOD" --batch -- 2>&1)
 assert_contains "-- starts REPL" "repl-ok" "$out"
 
 # -- with remaining args
-out=$(echo '(display (command-line-arguments))' | "$HAFOD" -- foo bar 2>&1)
+out=$(echo '(display (command-line-arguments))' | "$HAFOD" --batch -- foo bar 2>&1)
 assert_contains "-- passes remaining args" "(foo bar)" "$out"
 
 # -- REPL has last-status (interactive-repl feature, not available in new-cafe)
-out=$(echo '(last-status)' | "$HAFOD" -- 2>&1)
+out=$(echo '(last-status)' | "$HAFOD" --batch -- 2>&1)
 assert_contains "-- REPL has last-status" "0" "$out"
 
 # no-args REPL has last-status
-out=$(echo '(last-status)' | "$HAFOD" 2>&1)
+out=$(echo '(last-status)' | "$HAFOD" --batch 2>&1)
 assert_contains "no-args REPL has last-status" "0" "$out"
 
 # -c mode unaffected (regression guard)
@@ -584,14 +583,14 @@ section "REPL auto-import (LNCH-01)"
 # ======================================================================
 
 # -- REPL has (hafod) pre-imported -- can use pid without import
-out=$(echo '(display (pid))' | "$HAFOD" -- 2>&1)
+out=$(echo '(display (pid))' | "$HAFOD" --batch -- 2>&1)
 case "$out" in
     *[0-9]*) pass "-- REPL has hafod auto-imported (pid works)" ;;
     *) fail "-- REPL has hafod auto-imported (pid works)" "a number" "$out" ;;
 esac
 
 # -- REPL can use run/string without import
-out=$(echo '(display (run/string (echo "auto-import-ok")))' | "$HAFOD" -- 2>&1)
+out=$(echo '(display (run/string (echo "auto-import-ok")))' | "$HAFOD" --batch -- 2>&1)
 assert_contains "-- REPL can use run/string" "auto-import-ok" "$out"
 
 # ======================================================================
@@ -659,7 +658,7 @@ cat > "$TMPDIR/xdg-config/hafod/init.ss" << 'EOF'
 (set-prompt! "test> ")
 EOF
 
-out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "XDG config loads init.ss" "test> " "$out"
 
 # Config definitions are visible in REPL
@@ -667,17 +666,17 @@ cat > "$TMPDIR/xdg-config/hafod/init.ss" << 'EOF'
 (define *config-marker* "hello-from-config")
 EOF
 
-out=$(echo '(display *config-marker*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display *config-marker*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-config" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "Config definitions available in REPL" "hello-from-config" "$out"
 
 # Config error handling (CONF-03): errors display filename, REPL continues
 mkdir -p "$TMPDIR/xdg-bad/hafod"
 echo '(this-is-broken' > "$TMPDIR/xdg-bad/hafod/init.ss"
 
-out=$(echo '(display "ok")' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display "ok")' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "Config error does not prevent startup" "ok" "$out"
 
-STDERR=$(echo '(void)' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" -- 2>&1 >/dev/null || true)
+STDERR=$(echo '(void)' | XDG_CONFIG_HOME="$TMPDIR/xdg-bad" "$HAFOD" --batch -- 2>&1 >/dev/null || true)
 assert_contains "Config error mentions filename" "init.ss" "$STDERR"
 
 # --no-config flag (CONF-04): skips init.ss loading
@@ -686,16 +685,16 @@ cat > "$TMPDIR/xdg-skip/hafod/init.ss" << 'EOF'
 (set-prompt! "custom> ")
 EOF
 
-out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --no-config -- 2>/dev/null)
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --no-config --batch -- 2>/dev/null)
 assert_contains "--no-config skips init.ss" "> " "$out"
 
 # --norc backward compat alias also skips config
-out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --norc -- 2>/dev/null)
+out=$(echo '(display (repl-prompt-string))' | XDG_CONFIG_HOME="$TMPDIR/xdg-skip" "$HAFOD" --norc --batch -- 2>/dev/null)
 assert_contains "--norc alias skips init.ss" "> " "$out"
 
 # Missing config file is silently skipped (no error)
 mkdir -p "$TMPDIR/xdg-empty/hafod"
-out=$(echo '(display "works")' | XDG_CONFIG_HOME="$TMPDIR/xdg-empty" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display "works")' | XDG_CONFIG_HOME="$TMPDIR/xdg-empty" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "Missing config file silently skipped" "works" "$out"
 
 # Config not loaded for -c mode
@@ -721,7 +720,7 @@ cat > "$TMPDIR/xdg-dash/hafod/init.ss" << 'EOF'
 (define *config-via-dash-dash* #t)
 EOF
 
-out=$(echo '(display *config-via-dash-dash*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-dash" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display *config-via-dash-dash*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-dash" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "-- terminator loads config" "#t" "$out"
 
 # --help mentions --no-config and init.ss
@@ -730,6 +729,7 @@ assert_contains "--help mentions --login" "--login" "$out"
 assert_contains "--help mentions --no-config" "--no-config" "$out"
 assert_contains "--help mentions --norc" "--norc" "$out"
 assert_contains "--help mentions init.ss" "init.ss" "$out"
+assert_contains "--help mentions --batch" "--batch" "$out"
 
 # Multi-file config (CONF-07): init.ss can load other files
 mkdir -p "$TMPDIR/xdg-multi/hafod"
@@ -740,29 +740,47 @@ cat > "$TMPDIR/xdg-multi/hafod/init.ss" << 'INITEOF'
 (load (string-append (hafod-config-dir) "/extra.ss"))
 INITEOF
 
-out=$(echo '(display *extra-loaded*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-multi" "$HAFOD" -- 2>/dev/null)
+out=$(echo '(display *extra-loaded*)' | XDG_CONFIG_HOME="$TMPDIR/xdg-multi" "$HAFOD" --batch -- 2>/dev/null)
 assert_contains "Multi-file config loads without error" "#t" "$out"
 
 # ======================================================================
 section "INTG-02: Piped input fallback (no raw mode)"
 # ======================================================================
 
-# Piped input uses bare read, produces correct output
+# This first case deliberately runs without the batch flag: piped stdin is not a
+# tty, so it exercises the natural (tty? 0)-driven fallback to the bare-read
+# path, and a regression in that auto-detection would surface here. The remaining
+# piped cases below force the batch flag to stay deterministic however stdin is
+# wired.
 out=$(echo '(display (+ 1 2))' | "$HAFOD" 2>/dev/null)
 assert_contains "piped input produces correct output" "3" "$out"
 
 # Piped eval with pretty-printed output
-out=$(echo '(+ 40 2)' | "$HAFOD" 2>/dev/null)
+out=$(echo '(+ 40 2)' | "$HAFOD" --batch 2>/dev/null)
 assert_contains "piped eval output" "42" "$out"
 
 # Multiple piped expressions -- each display produces output interspersed with prompts
-out=$(printf '(display 1)\n(display 2)\n' | "$HAFOD" 2>/dev/null)
+out=$(printf '(display 1)\n(display 2)\n' | "$HAFOD" --batch 2>/dev/null)
 # Verify both values appear in the output (prompts may appear between them)
 echo "$out" | grep -q "1" && echo "$out" | grep -q "2" && pass "multiple piped expressions" || fail "multiple piped expressions"
 
 # Piped input with define + reference
-out=$(printf '(define x 99)\n(display x)\n' | "$HAFOD" 2>/dev/null)
+out=$(printf '(define x 99)\n(display x)\n' | "$HAFOD" --batch 2>/dev/null)
 assert_contains "piped define and reference" "99" "$out"
+
+# Broken downstream pipe: a large output into a reader that closes after one
+# byte must terminate hafod quietly (SIGPIPE default disposition), not surface
+# an i/o exception. Bounded by timeout so a regression cannot hang the suite.
+bp_err="$TMPDIR/broken-pipe.err"
+printf '(display (make-string 200000 #\\x))(newline)\n' \
+    | timeout 10 "$HAFOD" --batch 2>"$bp_err" \
+    | head -c 1 >/dev/null 2>&1
+if grep -qiE 'exception|broken pipe' "$bp_err" 2>/dev/null; then
+    fail "broken pipe terminates quietly (no i/o exception)"
+else
+    pass "broken pipe terminates quietly (no i/o exception)"
+fi
+rm -f "$bp_err"
 
 # ======================================================================
 # Summary

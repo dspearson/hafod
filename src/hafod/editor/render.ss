@@ -21,7 +21,8 @@
           (hafod editor gap-buffer)
           (hafod editor input-decode)
           (hafod editor sexp-tracker)
-          (only (hafod shell classifier) classify-input))
+          (only (hafod shell classifier) classify-input)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?))
 
   ;; ======================================================================
   ;; ANSI display width (unchanged)
@@ -307,65 +308,74 @@
   ;; Colourised display
   ;; ======================================================================
 
-  (define (display-colourised port text tokens cursor-pos)
-    (let-values ([(open-idx close-idx) (find-enclosing-parens text cursor-pos)])
-      (for-each
-        (lambda (tok)
-          (let* ([type (car tok)]
-                 [start (cadr tok)]
-                 [end (caddr tok)]
-                 [depth (cadddr tok)]
-                 [span (substring text start end)])
-              (case type
-                [(paren)
-                 (if (rainbow-parens?)
-                     (let ([col (vector-ref paren-colours
-                                  (modulo depth num-paren-colours))]
-                           [bold? (or (eqv? start open-idx)
-                                      (eqv? start close-idx))])
-                       (when bold? (display "\x1b;[1m" port))
-                       (fg-colour-l port col)
-                       (display span port)
-                       (display "\x1b;[0m" port))
-                     (let ([bold? (or (eqv? start open-idx)
-                                      (eqv? start close-idx))])
-                       (when bold? (display "\x1b;[1m" port))
-                       (display span port)
-                       (when bold? (display "\x1b;[22m" port))))]
-                [(atom)
-                 (if (and (rainbow-identifiers?) (> depth 0))
-                     (let ([col (ident-colour-from-hash (ident-hash span))])
-                       (fg-colour-l port col)
-                       (display span port)
-                       (display "\x1b;[39m" port))
-                     (display span port))]
-                [(number)
-                 (if (syntax-highlight?)
-                     (begin (fg-colour-l port number-colour)
-                            (display span port)
-                            (display "\x1b;[39m" port))
-                     (display span port))]
-                [(boolean)
-                 (if (syntax-highlight?)
-                     (begin (fg-colour-l port boolean-colour)
-                            (display span port)
-                            (display "\x1b;[39m" port))
-                     (display span port))]
-                [(string)
-                 (if (syntax-highlight?)
-                     (begin (fg-colour-l port string-colour)
-                            (display span port)
-                            (display "\x1b;[39m" port))
-                     (display span port))]
-                [(comment)
-                 (if (syntax-highlight?)
-                     (begin (fg-colour-l port comment-colour)
-                            (display span port)
-                            (display "\x1b;[39m" port))
-                     (display span port))]
-                [else
-                 (display span port)])))
-        tokens)))
+  ;; display-colourised takes an optional trailing colour? (default #t).  When
+  ;; colour? is #f every coloured branch falls through to its plain arm, so the
+  ;; output carries zero escape bytes; the four-argument callers keep the prior
+  ;; behaviour unchanged.
+  (define display-colourised
+    (case-lambda
+      [(port text tokens cursor-pos)
+       (display-colourised port text tokens cursor-pos #t)]
+      [(port text tokens cursor-pos colour?)
+       (let-values ([(open-idx close-idx) (find-enclosing-parens text cursor-pos)])
+         (for-each
+           (lambda (tok)
+             (let* ([type (car tok)]
+                    [start (cadr tok)]
+                    [end (caddr tok)]
+                    [depth (cadddr tok)]
+                    [span (substring text start end)])
+               (case type
+                 [(paren)
+                  (if (and colour? (rainbow-parens?))
+                      (let ([col (vector-ref paren-colours
+                                   (modulo depth num-paren-colours))]
+                            [bold? (or (eqv? start open-idx)
+                                       (eqv? start close-idx))])
+                        (when bold? (display "\x1b;[1m" port))
+                        (fg-colour-l port col)
+                        (display span port)
+                        (display "\x1b;[0m" port))
+                      (let ([bold? (and colour?
+                                        (or (eqv? start open-idx)
+                                            (eqv? start close-idx)))])
+                        (when bold? (display "\x1b;[1m" port))
+                        (display span port)
+                        (when bold? (display "\x1b;[22m" port))))]
+                 [(atom)
+                  (if (and colour? (rainbow-identifiers?) (> depth 0))
+                      (let ([col (ident-colour-from-hash (ident-hash span))])
+                        (fg-colour-l port col)
+                        (display span port)
+                        (display "\x1b;[39m" port))
+                      (display span port))]
+                 [(number)
+                  (if (and colour? (syntax-highlight?))
+                      (begin (fg-colour-l port number-colour)
+                             (display span port)
+                             (display "\x1b;[39m" port))
+                      (display span port))]
+                 [(boolean)
+                  (if (and colour? (syntax-highlight?))
+                      (begin (fg-colour-l port boolean-colour)
+                             (display span port)
+                             (display "\x1b;[39m" port))
+                      (display span port))]
+                 [(string)
+                  (if (and colour? (syntax-highlight?))
+                      (begin (fg-colour-l port string-colour)
+                             (display span port)
+                             (display "\x1b;[39m" port))
+                      (display span port))]
+                 [(comment)
+                  (if (and colour? (syntax-highlight?))
+                      (begin (fg-colour-l port comment-colour)
+                             (display span port)
+                             (display "\x1b;[39m" port))
+                      (display span port))]
+                 [else
+                  (display span port)])))
+           tokens))]))
 
   ;; ======================================================================
   ;; render-line
@@ -426,30 +436,38 @@
               [cursor-row (cursor-visual-row prompt-width before term-cols)]
               [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
                              (width-after-last-newline before)
-                             1)])
+                             1)]
+              ;; Decide once from the output target: colour on colour-ok?, and
+              ;; cursor/movement on ansi-ok?.  A non-terminal target (a pipe or a
+              ;; file) yields #f for both, so editing degrades to plain text with
+              ;; no escape bytes.
+              [colour? (colour-ok? port)]
+              [ansi? (ansi-ok? port)])
          ;; Move up from cursor to prompt line (prev-lines = previous cursor-row)
-         (when (> prev-lines 0)
+         (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
            (display prev-lines port)
            (display "A" port))
          ;; CR + clear to end of screen (wipes all old content below prompt line)
-         (display "\r\x1b;[J" port)
+         (when ansi?
+           (display "\r\x1b;[J" port))
          ;; Display prompt
          (display prompt port)
          ;; Display colourised text (Scheme only; shell/builtin inputs render plain)
          (if (eq? (classify-input text) 'scheme)
              (let ([tokens (tokenize text)])
-               (display-colourised port text tokens cursor-pos))
+               (display-colourised port text tokens cursor-pos colour?))
              (display text port))
          ;; Position cursor
-         (let ([lines-after-cursor (- total-lines cursor-row)])
-           (when (> lines-after-cursor 0)
-             (display "\x1b;[" port)
-             (display lines-after-cursor port)
-             (display "A" port)))
-         (display "\x1b;[" port)
-         (display cursor-col port)
-         (display "G" port)
+         (when ansi?
+           (let ([lines-after-cursor (- total-lines cursor-row)])
+             (when (> lines-after-cursor 0)
+               (display "\x1b;[" port)
+               (display lines-after-cursor port)
+               (display "A" port)))
+           (display "\x1b;[" port)
+           (display cursor-col port)
+           (display "G" port))
          (flush-output-port port)
          cursor-row)]))
 
@@ -469,32 +487,40 @@
               [cursor-row (cursor-visual-row prompt-width before term-cols)]
               [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
                              (width-after-last-newline before)
-                             1)])
-         (when (> prev-lines 0)
+                             1)]
+              [colour? (colour-ok? port)]
+              [ansi? (ansi-ok? port)])
+         (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
            (display prev-lines port)
            (display "A" port))
-         (display "\r\x1b;[J" port)
+         (when ansi?
+           (display "\r\x1b;[J" port))
          (display prompt port)
          (if (eq? (classify-input text) 'scheme)
              (let ([tokens (tokenize text)])
-               (display-colourised port text tokens cursor-pos))
+               (display-colourised port text tokens cursor-pos colour?))
              (display text port))
-         ;; Display ghost suggestion if cursor is at end
-         (when (and (= cursor-pos (string-length text))
+         ;; Display ghost suggestion if cursor is at end.  The ghost is a dim
+         ;; overlay the cursor is then drawn back over, so it only makes sense
+         ;; when colour and cursor movement are both live; gate it on colour?
+         ;; (which implies ansi?), leaving zero escapes on a plain target.
+         (when (and colour?
+                    (= cursor-pos (string-length text))
                     (> (string-length suggestion) 0))
            (display "\x1b;[38;5;240m" port)  ; dim grey
            (display suggestion port)
            (display "\x1b;[39m" port))
          ;; Position cursor
-         (let ([lines-after-cursor (- total-lines cursor-row)])
-           (when (> lines-after-cursor 0)
-             (display "\x1b;[" port)
-             (display lines-after-cursor port)
-             (display "A" port)))
-         (display "\x1b;[" port)
-         (display cursor-col port)
-         (display "G" port)
+         (when ansi?
+           (let ([lines-after-cursor (- total-lines cursor-row)])
+             (when (> lines-after-cursor 0)
+               (display "\x1b;[" port)
+               (display lines-after-cursor port)
+               (display "A" port)))
+           (display "\x1b;[" port)
+           (display cursor-col port)
+           (display "G" port))
          (flush-output-port port)
          cursor-row)]))
 
@@ -502,29 +528,33 @@
   ;; flash-matching-paren
   ;; ======================================================================
 
+  ;; The flash is a pure cursor-save/reverse-video/cursor-restore effect, so the
+  ;; whole thing (including the pause and the clearing re-render) only runs on a
+  ;; terminal target; a non-terminal target has nothing to flash and stays silent.
   (define (flash-matching-paren port prompt gb match-idx prev-lines)
-    (let* ([text (gap-buffer->string gb)]
-           [prefix (if (> match-idx 0) (substring text 0 match-idx) "")]
-           [prompt-width (ansi-display-width prompt)]
-           [col (+ prompt-width (string-display-width prefix) 1)]
-           [match-ch (string-ref text match-idx)])
-      ;; Save cursor
-      (display "\x1b;7" port)
-      ;; Move to column of matching paren
-      (display "\x1b;[" port)
-      (display col port)
-      (display "G" port)
-      ;; Reverse video
-      (display "\x1b;[7m" port)
-      (display match-ch port)
-      (display "\x1b;[0m" port)
-      ;; Restore cursor
-      (display "\x1b;8" port)
-      (flush-output-port port)
-      ;; Sleep ~120ms
-      (sleep (make-time 'time-duration 120000000 0))
-      ;; Re-render to clear the highlight
-      (render-line port prompt gb prev-lines)))
+    (when (ansi-ok? port)
+      (let* ([text (gap-buffer->string gb)]
+             [prefix (if (> match-idx 0) (substring text 0 match-idx) "")]
+             [prompt-width (ansi-display-width prompt)]
+             [col (+ prompt-width (string-display-width prefix) 1)]
+             [match-ch (string-ref text match-idx)])
+        ;; Save cursor
+        (display "\x1b;7" port)
+        ;; Move to column of matching paren
+        (display "\x1b;[" port)
+        (display col port)
+        (display "G" port)
+        ;; Reverse video
+        (display "\x1b;[7m" port)
+        (display match-ch port)
+        (display "\x1b;[0m" port)
+        ;; Restore cursor
+        (display "\x1b;8" port)
+        (flush-output-port port)
+        ;; Sleep ~120ms
+        (sleep (make-time 'time-duration 120000000 0))
+        ;; Re-render to clear the highlight
+        (render-line port prompt gb prev-lines))))
 
   ;; ======================================================================
   ;; render-completion-menu
@@ -546,7 +576,10 @@
                               [(< selected-index max-items) 0]
                               [else (- selected-index (- max-items 1))])]
               [window-end (+ window-start visible-count)]
-              [overflow (> n max-items)])
+              [overflow (> n max-items)]
+              ;; Colour the selection only on a colour-capable target; the list
+              ;; itself (indents, candidates, overflow line) always renders.
+              [colour? (colour-ok? port)])
          ;; Move to next line and emit menu entries
          (display "\n" port)
          (let loop ([i window-start] [lines 0])
@@ -564,11 +597,11 @@
              [else
               (let ([candidate (list-ref candidates i)])
                 ;; Highlight selected candidate with reverse video
-                (when (= i selected-index)
+                (when (and colour? (= i selected-index))
                   (display "\x1b;[7m" port))
                 (display "  " port)
                 (display candidate port)
-                (when (= i selected-index)
+                (when (and colour? (= i selected-index))
                   (display "\x1b;[0m" port))
                 (display "\n" port)
                 (loop (+ i 1) (+ lines 1)))])))]))
@@ -592,10 +625,11 @@
                               [(< selected-index max-items) 0]
                               [else (- selected-index (- max-items 1))])]
               [window-end (+ window-start visible-count)]
-              [overflow (> n max-items)])
+              [overflow (> n max-items)]
+              [colour? (colour-ok? port)])
          (display "\n" port)
          ;; Match count indicator
-         (display "\x1b;[38;5;240m" port)  ; dim grey
+         (when colour? (display "\x1b;[38;5;240m" port))  ; dim grey
          (display "  " port)
          (if (>= selected-index 0)
              (begin (display (+ selected-index 1) port)
@@ -604,7 +638,7 @@
              (begin (display n port)
                     (display " match" port)
                     (when (not (= n 1)) (display "es" port))))
-         (display "\x1b;[39m" port)
+         (when colour? (display "\x1b;[39m" port))
          (display "\n" port)
          (let loop ([i window-start] [lines 1])  ; 1 for the count line
            (cond
@@ -631,50 +665,57 @@
                                            (list? (cadr entry)))
                                       (caddr entry)
                                       #f)])
-                (when (= i selected-index)
+                (when (and colour? (= i selected-index))
                   (display "\x1b;[7m" port))
                 (display "  " port)
-                (display-with-highlights port candidate positions)
+                (display-with-highlights port candidate positions colour?)
                 ;; Show description in dim grey after candidate
                 (when (and description (string? description))
-                  (when (not (= i selected-index))
+                  (when (and colour? (not (= i selected-index)))
                     (display "\x1b;[38;5;240m" port))
                   (display "  " port)
                   (display description port)
-                  (when (not (= i selected-index))
+                  (when (and colour? (not (= i selected-index)))
                     (display "\x1b;[39m" port)))
-                (when (= i selected-index)
+                (when (and colour? (= i selected-index))
                   (display "\x1b;[0m" port))
                 (display "\n" port)
                 (loop (+ i 1) (+ lines 1)))])))]))
 
   ;; Display a string with certain character positions highlighted (bold+underline).
-  (define (display-with-highlights port str positions)
-    (let ([len (string-length str)]
-          [pos-set (make-eq-hashtable)])
-      ;; Build a set of positions for O(1) lookup
-      (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
-      (let loop ([i 0] [in-highlight? #f])
-        (when (< i len)
-          (let ([want-hl? (hashtable-ref pos-set i #f)])
-            (cond
-              [(and want-hl? (not in-highlight?))
-               (display "\x1b;[1;4m" port)  ; bold + underline
-               (display (string-ref str i) port)
-               (loop (+ i 1) #t)]
-              [(and (not want-hl?) in-highlight?)
-               (display "\x1b;[22;24m" port)  ; reset bold + underline
-               (display (string-ref str i) port)
-               (loop (+ i 1) #f)]
-              [else
-               (display (string-ref str i) port)
-               (loop (+ i 1) in-highlight?)]))))
-      ;; Reset if we ended in highlight
-      (when (let loop ([i 0] [last #f])
-              (cond [(>= i len) last]
-                    [(hashtable-ref pos-set i #f) (loop (+ i 1) #t)]
-                    [else (loop (+ i 1) #f)]))
-        (display "\x1b;[22;24m" port))))
+  ;; The optional trailing colour? (default #t) suppresses the highlight escapes
+  ;; when #f, so the string still renders as plain text.
+  (define display-with-highlights
+    (case-lambda
+      [(port str positions)
+       (display-with-highlights port str positions #t)]
+      [(port str positions colour?)
+       (let ([len (string-length str)]
+             [pos-set (make-eq-hashtable)])
+         ;; Build a set of positions for O(1) lookup
+         (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
+         (let loop ([i 0] [in-highlight? #f])
+           (when (< i len)
+             (let ([want-hl? (hashtable-ref pos-set i #f)])
+               (cond
+                 [(and want-hl? (not in-highlight?))
+                  (when colour? (display "\x1b;[1;4m" port))  ; bold + underline
+                  (display (string-ref str i) port)
+                  (loop (+ i 1) #t)]
+                 [(and (not want-hl?) in-highlight?)
+                  (when colour? (display "\x1b;[22;24m" port))  ; reset bold + underline
+                  (display (string-ref str i) port)
+                  (loop (+ i 1) #f)]
+                 [else
+                  (display (string-ref str i) port)
+                  (loop (+ i 1) in-highlight?)]))))
+         ;; Reset if we ended in highlight
+         (when (and colour?
+                    (let loop ([i 0] [last #f])
+                      (cond [(>= i len) last]
+                            [(hashtable-ref pos-set i #f) (loop (+ i 1) #t)]
+                            [else (loop (+ i 1) #f)])))
+           (display "\x1b;[22;24m" port)))]))
 
   ;; ======================================================================
   ;; render-completion-grid — fish/zsh-style multi-column completion
@@ -756,7 +797,10 @@
            [name-col-w (min max-name-w (- (if has-descs?
                                               (- term-cols 6)
                                               (quotient term-cols 2))
-                                          0))])
+                                          0))]
+           ;; Colour the selection, directory names, descriptions and pager on a
+           ;; colour-capable target only; the grid layout always renders.
+           [colour? (colour-ok? port)])
 
       ;; Output the grid
       (display "\n" port)
@@ -767,13 +811,13 @@
            (let ([total-lines
                   (if (> grid-rows vis-rows)
                       (begin
-                        (display "\x1b;[38;5;240m" port)
+                        (when colour? (display "\x1b;[38;5;240m" port))
                         (display "  " port)
                         (display (+ sel-row 1) port)
                         (display "/" port)
                         (display grid-rows port)
                         (display " rows" port)
-                        (display "\x1b;[39m" port)
+                        (when colour? (display "\x1b;[39m" port))
                         (display "\n" port)
                         (+ lines 1))
                       lines)])
@@ -810,29 +854,32 @@
                                      (pad-to-width disp-name (+ name-col-w 2))
                                      (pad-to-width disp-name (- cell-width 2)))])
                      ;; Selected background
-                     (when selected? (display sel-bg port) (display sel-fg port))
+                     (when (and colour? selected?)
+                       (display sel-bg port) (display sel-fg port))
                      ;; Indent
                      (display "  " port)
                      ;; Directory colour
-                     (when (and is-dir? (not selected?))
+                     (when (and colour? is-dir? (not selected?))
                        (fg-colour-l port dir-colour))
                      ;; Candidate with highlights
-                     (display-with-highlights port padded positions)
+                     (display-with-highlights port padded positions colour?)
                      ;; Reset directory colour
-                     (when (and is-dir? (not selected?))
+                     (when (and colour? is-dir? (not selected?))
                        (display "\x1b;[39m" port))
                      ;; Description (single-column mode)
                      (when (and has-descs? description (string? description))
-                       (if selected?
-                           (display "\x1b;[38;2;140;145;170m" port)
-                           (display "\x1b;[38;5;240m" port))
+                       (when colour?
+                         (if selected?
+                             (display "\x1b;[38;2;140;145;170m" port)
+                             (display "\x1b;[38;5;240m" port)))
                        (display (truncate-display description
                                   (max 10 (- term-cols name-col-w 6))) port)
-                       (if selected?
-                           (display sel-fg port)
-                           (display "\x1b;[39m" port)))
+                       (when colour?
+                         (if selected?
+                             (display sel-fg port)
+                             (display "\x1b;[39m" port))))
                      ;; Reset selection
-                     (when selected? (display "\x1b;[0m" port))
+                     (when (and colour? selected?) (display "\x1b;[0m" port))
                      (col-loop (+ col 1))))))]))))
 
 ) ; end library

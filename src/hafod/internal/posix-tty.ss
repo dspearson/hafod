@@ -9,7 +9,8 @@
     posix-tcgetattr posix-tcsetattr
     posix-isatty posix-ttyname posix-ctermid
     posix-tcsendbreak posix-tcdrain posix-tcflush posix-tcflow
-    posix-tcsetpgrp posix-tcgetpgrp)
+    posix-tcsetpgrp posix-tcgetpgrp
+    c-ioctl)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
           (hafod internal platform-constants) (hafod internal posix-core))
@@ -47,6 +48,13 @@
   (define c-tcflow     (foreign-procedure "tcflow"     (int int) int))
   (define c-tcsetpgrp  (foreign-procedure "tcsetpgrp"  (int int) int))
   (define c-tcgetpgrp  (foreign-procedure "tcgetpgrp"  (int) int))
+
+  ;; Shared variadic ioctl. The compiler emits the per-platform variadic call
+  ;; frame; the trailing argument is typed uptr so the one binding serves both
+  ;; an integer request (e.g. TIOCSCTTY 0) and a pointer request (a winsize
+  ;; buffer for TIOCGWINSZ) without a Scheme-side type error.
+  (define c-ioctl
+    (foreign-procedure (__varargs_after 2) "ioctl" (int unsigned-long uptr) int))
 
   ;; posix-tcgetattr: retrieve terminal attributes.
   ;; Returns (values iflag oflag cflag lflag cc-bytevector ispeed-code ospeed-code)

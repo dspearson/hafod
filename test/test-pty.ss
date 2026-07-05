@@ -52,17 +52,34 @@
 (test-assert "data written to master can be read from slave"
   (let-values ([(master slave-name) (open-pty)])
     (let ([master-out (dup->outport master)]
-          [slave-in (open-file slave-name open/read+write)])
+          ;; Open the slave read-only so it is a genuine input port: writing to
+          ;; the master delivers the bytes to the slave's input queue, and
+          ;; reading the slave reads them straight back.
+          [slave-in (open-file slave-name open/read)])
       ;; Write to master side
       (display "hello\n" master-out)
       (flush-output-port master-out)
-      ;; Read from slave side -- slave echoes back by default,
-      ;; and also receives data from master
-      ;; On Linux, terminal echo is on by default so writing to master
-      ;; sends data to slave's input. Reading from slave reads the data.
-      (let ([result (guard (e [#t #t])  ; may timeout in some envs, accept
-                      (let ([ch (read-char slave-in)])
-                        (char? ch)))])
+      ;; Read from the slave side.  Writing "hello\n" to the master delivers
+      ;; those bytes to the slave's input queue, and reading the slave returns
+      ;; them directly -- the first byte is #\h.  Echo is not involved on this
+      ;; read path: echo would affect the slave's output (the master read side),
+      ;; not the slave's input that we read here, so the read behaves the same
+      ;; with echo on or off.
+      ;; A dead or broken PTY now fails loudly: any read error or EOF yields #f,
+      ;; and only that first byte (#\h), seen within a bounded number of reads,
+      ;; counts as success.  Read latency is tolerated up to that bound (the
+      ;; suite kill-timeout caps any residual stall); reading stops the instant
+      ;; the sentinel arrives so no further read-char can block.
+      (let ([result
+             (guard (e [#t #f])
+               (let loop ([count 0])
+                 (if (>= count 16)
+                     #f
+                     (let ([ch (read-char slave-in)])
+                       (cond
+                         [(eof-object? ch) #f]
+                         [(char=? ch #\h) #t]
+                         [else (loop (+ count 1))])))))])
         (close master-out)
         (close slave-in)
         (close master)

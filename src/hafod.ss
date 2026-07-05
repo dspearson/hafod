@@ -367,6 +367,7 @@
     ttyl/alt-delete-word ttyl/no-kernel-status ttyl/case-map
     encode-baud-rate decode-baud-rate baud-rates
     tty? tty-file-name control-tty-file-name
+    terminal-size
     send-tty-break drain-tty flush-tty/input flush-tty/output
     flush-tty/both start-tty-output stop-tty-output
     start-tty-input stop-tty-input
@@ -418,7 +419,10 @@
     ;; Shell mode re-exports from interactive
     rebuild-path-cache! classify-input
     ;; Feature toggles from interactive
-    shell-mode? history-expansion?
+    shell-mode? history-expansion? batch-mode?
+
+    ;; === (hafod terminal-caps) ===
+    ansi-ok? colour-ok?
 
     ;; === (hafod shell classifier) ===
     path-cache scheme-prefix-chars
@@ -602,6 +606,7 @@
     (hafod lib-dirs)
     (hafod threads)
     (hafod interactive)
+    (hafod terminal-caps)
     (except (hafod shell classifier) classify-input rebuild-path-cache!)
     (hafod shell parser)
     (hafod shell history-expand)

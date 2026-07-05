@@ -6,7 +6,8 @@
         (hafod editor keymap)
         (hafod editor kill-ring)
         (hafod editor history)
-        (hafod editor sexp-tracker))
+        (hafod editor sexp-tracker)
+        (only (hafod tty) current-suspend-hook))
 
 ;; Helper: construct control character
 (define (ctrl ch)
@@ -271,5 +272,26 @@
   (let ([path (path-at-cursor gb)])
     (test-equal "path-at-cursor extracts path fragment"
       "src/ha" path)))
+
+;; ---- Ctrl-Z suspend wiring ----
+;; In VSUSP-disabled raw mode Ctrl-Z arrives as a byte and is bound (in both
+;; keymaps) to a command that calls the terminal owner's current-suspend-hook.
+;; We drive the bound command with a RECORDING hook standing in for the real
+;; suspend dance, so no signal is raised and the process is never stopped --
+;; this exercises the wiring alone, and stays hang-safe.
+(test-assert "Ctrl-Z is bound to a command in both insert and normal keymaps"
+  (and (procedure? (keymap-lookup editor-insert-keymap (make-key-event 'ctrl #\z 0)))
+       (procedure? (keymap-lookup editor-normal-keymap (make-key-event 'ctrl #\z 0)))))
+
+(test-assert "the Ctrl-Z command invokes current-suspend-hook"
+  (let ([called #f])
+    (parameterize ([current-suspend-hook (lambda () (set! called #t))])
+      ((keymap-lookup editor-insert-keymap (make-key-event 'ctrl #\z 0)) #f))
+    called))
+
+(test-assert "the Ctrl-Z command is a harmless no-op when no suspend hook is set"
+  (parameterize ([current-suspend-hook #f])
+    ((keymap-lookup editor-insert-keymap (make-key-event 'ctrl #\z 0)) #f)
+    #t))
 
 (test-end)

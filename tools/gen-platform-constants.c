@@ -10,6 +10,9 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <stddef.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -21,6 +24,7 @@
 #include <sys/times.h>
 #include <regex.h>
 #include <glob.h>
+#include <fnmatch.h>
 #include <fcntl.h>
 #include <pwd.h>
 #include <grp.h>
@@ -30,13 +34,58 @@
 #include <sys/utsname.h>
 #include <locale.h>
 
-#define EMIT(name, val) printf("  (define %s %d)\n", name, (int)(val))
+/* Width-correct emission with a self-proving round-trip.
+ *
+ * Every numeric platform fact is emitted as a decimal literal and then
+ * re-parsed from that very literal; if the parse-back does not equal the
+ * native C value the generator aborts (non-zero exit), naming the constant,
+ * so a lossy transcription fails the build before any Scheme compiles.
+ *
+ * Two families differ in conversion AND in the parse-back used to prove it:
+ *   EMIT_S -- signed   (%ld / strtol):  offsets, sizes, signal numbers,
+ *                                        cc indices, action enums, -1 sentinels.
+ *   EMIT_U -- unsigned (%lu / strtoul): ioctl requests and flag/bitmask values
+ *                                        where a high bit may be set (emitting
+ *                                        these signed would sign-extend in Chez).
+ *
+ * A -1 sentinel must never go through EMIT_U: strtoul would wrap it to
+ * ULONG_MAX. Sentinels stay on EMIT_S.
+ */
+static void die_mismatch(const char *name, long long want, long long got) {
+    fprintf(stderr,
+        "gen-platform-constants: TRUNCATION/ROUND-TRIP FAILURE for %s: "
+        "native=%lld emitted-decimal-parsed-back=%lld\n", name, want, got);
+    exit(1);                       /* non-zero -> fails `make platform-constants` */
+}
+
+/* SIGNED category: offsets, sizes, signal numbers, sentinels (-1 allowed). */
+#define EMIT_S(name, val) do {                                            \
+    long _v = (long)(val);                                                \
+    printf("  (define %s %ld)\n", name, _v);                              \
+    char _buf[32]; snprintf(_buf, sizeof _buf, "%ld", _v);                \
+    errno = 0; char *_end = NULL;                                         \
+    long _rt = strtol(_buf, &_end, 10);                                   \
+    if (errno || *_end != '\0' || _rt != _v) die_mismatch(name, _v, _rt);\
+} while (0)
+
+/* UNSIGNED category: ioctl requests, flag masks (bit 31 may be set). */
+#define EMIT_U(name, val) do {                                            \
+    unsigned long _v = (unsigned long)(val);                              \
+    printf("  (define %s %lu)\n", name, _v);                              \
+    char _buf[32]; snprintf(_buf, sizeof _buf, "%lu", _v);                \
+    errno = 0; char *_end = NULL;                                         \
+    unsigned long _rt = strtoul(_buf, &_end, 10);                         \
+    if (errno || *_end != '\0' || _rt != _v)                             \
+        die_mismatch(name, (long long)_v, (long long)_rt);                \
+} while (0)
+
+/* Offsets and sizes are nonnegative and small: thin wrappers over EMIT_S. */
 #define EMIT_OFFSET(name, type, field) \
-    printf("  (define %s %d)\n", name, (int)offsetof(type, field))
+    EMIT_S(name, (long)offsetof(type, field))
 #define EMIT_SIZEOF(name, type) \
-    printf("  (define %s %d)\n", name, (int)sizeof(type))
+    EMIT_S(name, (long)sizeof(type))
 #define EMIT_FIELD_SIZEOF(name, type, field) \
-    printf("  (define %s %d)\n", name, (int)sizeof(((type *)0)->field))
+    EMIT_S(name, (long)sizeof(((type *)0)->field))
 
 int main(void) {
     printf(";;; (hafod internal platform-constants) -- Auto-generated, do not edit\n");
@@ -92,6 +141,7 @@ int main(void) {
     printf("    PLAT-SIGCONT PLAT-SIGSTOP PLAT-SIGTSTP PLAT-SIGTTIN PLAT-SIGTTOU\n");
     printf("    PLAT-SIGURG PLAT-SIGXCPU PLAT-SIGXFSZ PLAT-SIGVTALRM\n");
     printf("    PLAT-SIGPROF PLAT-SIGWINCH PLAT-SIGIO PLAT-SIGSYS\n");
+    printf("    PLAT-SIGPWR PLAT-SIGINFO\n");
 
     /* TTY flag values */
     printf("    PLAT-IGNBRK PLAT-BRKINT PLAT-IGNPAR PLAT-PARMRK\n");
@@ -121,6 +171,9 @@ int main(void) {
     /* ioctl */
     printf("    PLAT-TIOCSCTTY\n");
     printf("    PLAT-TIOCGWINSZ\n");
+
+    /* struct winsize layout */
+    printf("    SIZEOF-WINSZ WINSZ-WS-ROW WINSZ-WS-COL\n");
 
     /* utsname */
     printf("    PLAT-UTSNAME-FIELD-LEN\n");
@@ -180,7 +233,7 @@ int main(void) {
     EMIT_OFFSET("DIRENT-D-OFF", struct dirent, d_off);
 #else
     /* macOS/BSD don't have d_off in struct dirent */
-    EMIT("DIRENT-D-OFF", -1);
+    EMIT_S("DIRENT-D-OFF", -1);
 #endif
     EMIT_OFFSET("DIRENT-D-RECLEN", struct dirent, d_reclen);
     EMIT_OFFSET("DIRENT-D-TYPE", struct dirent, d_type);
@@ -260,155 +313,180 @@ int main(void) {
 
     /* ============================================================ */
     printf("  ;; Open flags\n");
-    EMIT("PLAT-O-CREAT", O_CREAT);
-    EMIT("PLAT-O-EXCL", O_EXCL);
-    EMIT("PLAT-O-TRUNC", O_TRUNC);
-    EMIT("PLAT-O-APPEND", O_APPEND);
-    EMIT("PLAT-O-NONBLOCK", O_NONBLOCK);
+    EMIT_U("PLAT-O-CREAT", O_CREAT);
+    EMIT_U("PLAT-O-EXCL", O_EXCL);
+    EMIT_U("PLAT-O-TRUNC", O_TRUNC);
+    EMIT_U("PLAT-O-APPEND", O_APPEND);
+    EMIT_U("PLAT-O-NONBLOCK", O_NONBLOCK);
     printf("\n");
 
     /* ============================================================ */
     printf("  ;; Signal constants\n");
-    EMIT("PLAT-SIGBUS", SIGBUS);
-    EMIT("PLAT-SIGUSR1", SIGUSR1);
-    EMIT("PLAT-SIGUSR2", SIGUSR2);
-    EMIT("PLAT-SIGCHLD", SIGCHLD);
-    EMIT("PLAT-SIGCONT", SIGCONT);
-    EMIT("PLAT-SIGSTOP", SIGSTOP);
-    EMIT("PLAT-SIGTSTP", SIGTSTP);
-    EMIT("PLAT-SIGTTIN", SIGTTIN);
-    EMIT("PLAT-SIGTTOU", SIGTTOU);
-    EMIT("PLAT-SIGURG", SIGURG);
-    EMIT("PLAT-SIGXCPU", SIGXCPU);
-    EMIT("PLAT-SIGXFSZ", SIGXFSZ);
-    EMIT("PLAT-SIGVTALRM", SIGVTALRM);
-    EMIT("PLAT-SIGPROF", SIGPROF);
-    EMIT("PLAT-SIGWINCH", SIGWINCH);
-    EMIT("PLAT-SIGIO", SIGIO);
-    EMIT("PLAT-SIGSYS", SIGSYS);
+    EMIT_S("PLAT-SIGBUS", SIGBUS);
+    EMIT_S("PLAT-SIGUSR1", SIGUSR1);
+    EMIT_S("PLAT-SIGUSR2", SIGUSR2);
+    EMIT_S("PLAT-SIGCHLD", SIGCHLD);
+    EMIT_S("PLAT-SIGCONT", SIGCONT);
+    EMIT_S("PLAT-SIGSTOP", SIGSTOP);
+    EMIT_S("PLAT-SIGTSTP", SIGTSTP);
+    EMIT_S("PLAT-SIGTTIN", SIGTTIN);
+    EMIT_S("PLAT-SIGTTOU", SIGTTOU);
+    EMIT_S("PLAT-SIGURG", SIGURG);
+    EMIT_S("PLAT-SIGXCPU", SIGXCPU);
+    EMIT_S("PLAT-SIGXFSZ", SIGXFSZ);
+    EMIT_S("PLAT-SIGVTALRM", SIGVTALRM);
+    EMIT_S("PLAT-SIGPROF", SIGPROF);
+    EMIT_S("PLAT-SIGWINCH", SIGWINCH);
+    EMIT_S("PLAT-SIGIO", SIGIO);
+    EMIT_S("PLAT-SIGSYS", SIGSYS);
+    printf("\n");
+
+    /* ============================================================ */
+    printf("  ;; platform-varying signals (sentinel -1 where unavailable)\n");
+#ifdef SIGPWR
+    EMIT_S("PLAT-SIGPWR", SIGPWR);     /* Linux: 30 */
+#else
+    EMIT_S("PLAT-SIGPWR", -1);         /* macOS/BSD: absent */
+#endif
+#ifdef SIGINFO
+    EMIT_S("PLAT-SIGINFO", SIGINFO);   /* BSD/macOS: present */
+#else
+    EMIT_S("PLAT-SIGINFO", -1);        /* Linux glibc: absent */
+#endif
     printf("\n");
 
     /* ============================================================ */
     printf("  ;; TTY input flags\n");
-    EMIT("PLAT-IGNBRK", IGNBRK);
-    EMIT("PLAT-BRKINT", BRKINT);
-    EMIT("PLAT-IGNPAR", IGNPAR);
-    EMIT("PLAT-PARMRK", PARMRK);
-    EMIT("PLAT-INPCK", INPCK);
-    EMIT("PLAT-ISTRIP", ISTRIP);
-    EMIT("PLAT-INLCR", INLCR);
-    EMIT("PLAT-IGNCR", IGNCR);
-    EMIT("PLAT-ICRNL", ICRNL);
-    EMIT("PLAT-IXON", IXON);
-    EMIT("PLAT-IXOFF", IXOFF);
-    EMIT("PLAT-IXANY", IXANY);
+    EMIT_U("PLAT-IGNBRK", IGNBRK);
+    EMIT_U("PLAT-BRKINT", BRKINT);
+    EMIT_U("PLAT-IGNPAR", IGNPAR);
+    EMIT_U("PLAT-PARMRK", PARMRK);
+    EMIT_U("PLAT-INPCK", INPCK);
+    EMIT_U("PLAT-ISTRIP", ISTRIP);
+    EMIT_U("PLAT-INLCR", INLCR);
+    EMIT_U("PLAT-IGNCR", IGNCR);
+    EMIT_U("PLAT-ICRNL", ICRNL);
+    EMIT_U("PLAT-IXON", IXON);
+    EMIT_U("PLAT-IXOFF", IXOFF);
+    EMIT_U("PLAT-IXANY", IXANY);
     printf("\n");
 
     printf("  ;; TTY output flags\n");
-    EMIT("PLAT-OPOST", OPOST);
-    EMIT("PLAT-ONLCR", ONLCR);
+    EMIT_U("PLAT-OPOST", OPOST);
+    EMIT_U("PLAT-ONLCR", ONLCR);
     printf("\n");
 
     printf("  ;; TTY control flags\n");
-    EMIT("PLAT-CSIZE", CSIZE);
-    EMIT("PLAT-CS5", CS5);
-    EMIT("PLAT-CS6", CS6);
-    EMIT("PLAT-CS7", CS7);
-    EMIT("PLAT-CS8", CS8);
-    EMIT("PLAT-CSTOPB", CSTOPB);
-    EMIT("PLAT-CREAD", CREAD);
-    EMIT("PLAT-PARENB", PARENB);
-    EMIT("PLAT-PARODD", PARODD);
-    EMIT("PLAT-HUPCL", HUPCL);
-    EMIT("PLAT-CLOCAL", CLOCAL);
+    EMIT_U("PLAT-CSIZE", CSIZE);
+    EMIT_U("PLAT-CS5", CS5);
+    EMIT_U("PLAT-CS6", CS6);
+    EMIT_U("PLAT-CS7", CS7);
+    EMIT_U("PLAT-CS8", CS8);
+    EMIT_U("PLAT-CSTOPB", CSTOPB);
+    EMIT_U("PLAT-CREAD", CREAD);
+    EMIT_U("PLAT-PARENB", PARENB);
+    EMIT_U("PLAT-PARODD", PARODD);
+    EMIT_U("PLAT-HUPCL", HUPCL);
+    EMIT_U("PLAT-CLOCAL", CLOCAL);
     printf("\n");
 
     printf("  ;; TTY local flags\n");
-    EMIT("PLAT-ISIG", ISIG);
-    EMIT("PLAT-ICANON", ICANON);
-    EMIT("PLAT-ECHO", ECHO);
-    EMIT("PLAT-ECHOE", ECHOE);
-    EMIT("PLAT-ECHOK", ECHOK);
-    EMIT("PLAT-ECHONL", ECHONL);
-    EMIT("PLAT-NOFLSH", NOFLSH);
-    EMIT("PLAT-TOSTOP", TOSTOP);
-    EMIT("PLAT-IEXTEN", IEXTEN);
+    EMIT_U("PLAT-ISIG", ISIG);
+    EMIT_U("PLAT-ICANON", ICANON);
+    EMIT_U("PLAT-ECHO", ECHO);
+    EMIT_U("PLAT-ECHOE", ECHOE);
+    EMIT_U("PLAT-ECHOK", ECHOK);
+    EMIT_U("PLAT-ECHONL", ECHONL);
+    EMIT_U("PLAT-NOFLSH", NOFLSH);
+    EMIT_U("PLAT-TOSTOP", TOSTOP);
+    EMIT_U("PLAT-IEXTEN", IEXTEN);
     printf("\n");
 
     printf("  ;; TTY cc indices\n");
-    EMIT("PLAT-VINTR", VINTR);
-    EMIT("PLAT-VQUIT", VQUIT);
-    EMIT("PLAT-VERASE", VERASE);
-    EMIT("PLAT-VKILL", VKILL);
-    EMIT("PLAT-VEOF", VEOF);
-    EMIT("PLAT-VTIME", VTIME);
-    EMIT("PLAT-VMIN", VMIN);
-    EMIT("PLAT-VSTART", VSTART);
-    EMIT("PLAT-VSTOP", VSTOP);
-    EMIT("PLAT-VSUSP", VSUSP);
-    EMIT("PLAT-VEOL", VEOL);
-    EMIT("PLAT-VREPRINT", VREPRINT);
-    EMIT("PLAT-VDISCARD", VDISCARD);
-    EMIT("PLAT-VWERASE", VWERASE);
-    EMIT("PLAT-VLNEXT", VLNEXT);
-    EMIT("PLAT-VEOL2", VEOL2);
-    EMIT("PLAT-NCCS", NCCS);
+    EMIT_S("PLAT-VINTR", VINTR);
+    EMIT_S("PLAT-VQUIT", VQUIT);
+    EMIT_S("PLAT-VERASE", VERASE);
+    EMIT_S("PLAT-VKILL", VKILL);
+    EMIT_S("PLAT-VEOF", VEOF);
+    EMIT_S("PLAT-VTIME", VTIME);
+    EMIT_S("PLAT-VMIN", VMIN);
+    EMIT_S("PLAT-VSTART", VSTART);
+    EMIT_S("PLAT-VSTOP", VSTOP);
+    EMIT_S("PLAT-VSUSP", VSUSP);
+    EMIT_S("PLAT-VEOL", VEOL);
+    EMIT_S("PLAT-VREPRINT", VREPRINT);
+    EMIT_S("PLAT-VDISCARD", VDISCARD);
+    EMIT_S("PLAT-VWERASE", VWERASE);
+    EMIT_S("PLAT-VLNEXT", VLNEXT);
+    EMIT_S("PLAT-VEOL2", VEOL2);
+    EMIT_S("PLAT-NCCS", NCCS);
     printf("\n");
 
     printf("  ;; termios actions\n");
-    EMIT("PLAT-TCSANOW", TCSANOW);
-    EMIT("PLAT-TCSADRAIN", TCSADRAIN);
-    EMIT("PLAT-TCSAFLUSH", TCSAFLUSH);
-    EMIT("PLAT-TCIFLUSH", TCIFLUSH);
-    EMIT("PLAT-TCOFLUSH", TCOFLUSH);
-    EMIT("PLAT-TCIOFLUSH", TCIOFLUSH);
-    EMIT("PLAT-TCOOFF", TCOOFF);
-    EMIT("PLAT-TCOON", TCOON);
-    EMIT("PLAT-TCIOFF", TCIOFF);
-    EMIT("PLAT-TCION", TCION);
+    EMIT_S("PLAT-TCSANOW", TCSANOW);
+    EMIT_S("PLAT-TCSADRAIN", TCSADRAIN);
+    EMIT_S("PLAT-TCSAFLUSH", TCSAFLUSH);
+    EMIT_S("PLAT-TCIFLUSH", TCIFLUSH);
+    EMIT_S("PLAT-TCOFLUSH", TCOFLUSH);
+    EMIT_S("PLAT-TCIOFLUSH", TCIOFLUSH);
+    EMIT_S("PLAT-TCOOFF", TCOOFF);
+    EMIT_S("PLAT-TCOON", TCOON);
+    EMIT_S("PLAT-TCIOFF", TCIOFF);
+    EMIT_S("PLAT-TCION", TCION);
     printf("\n");
 
     printf("  ;; fcntl\n");
-    EMIT("PLAT-F-GETFD", F_GETFD);
-    EMIT("PLAT-F-SETFD", F_SETFD);
-    EMIT("PLAT-FD-CLOEXEC", FD_CLOEXEC);
-    EMIT("PLAT-F-GETFL", F_GETFL);
-    EMIT("PLAT-F-SETFL", F_SETFL);
+    EMIT_S("PLAT-F-GETFD", F_GETFD);
+    EMIT_S("PLAT-F-SETFD", F_SETFD);
+    EMIT_S("PLAT-FD-CLOEXEC", FD_CLOEXEC);
+    EMIT_S("PLAT-F-GETFL", F_GETFL);
+    EMIT_S("PLAT-F-SETFL", F_SETFL);
     printf("\n");
 
     printf("  ;; ioctl\n");
-    EMIT("PLAT-TIOCSCTTY", TIOCSCTTY);
-    EMIT("PLAT-TIOCGWINSZ", TIOCGWINSZ);
+    EMIT_U("PLAT-TIOCSCTTY", TIOCSCTTY);
+    EMIT_U("PLAT-TIOCGWINSZ", TIOCGWINSZ);
+    printf("\n");
+
+    /* ============================================================ */
+    printf("  ;; struct winsize\n");
+    EMIT_SIZEOF("SIZEOF-WINSZ", struct winsize);
+    EMIT_OFFSET("WINSZ-WS-ROW", struct winsize, ws_row);
+    EMIT_OFFSET("WINSZ-WS-COL", struct winsize, ws_col);
     printf("\n");
 
     printf("  ;; utsname\n");
     {
         struct utsname u;
-        EMIT("PLAT-UTSNAME-FIELD-LEN", sizeof(u.sysname));
+        EMIT_S("PLAT-UTSNAME-FIELD-LEN", sizeof(u.sysname));
     }
     printf("\n");
 
     printf("  ;; O_NOCTTY\n");
-    EMIT("PLAT-O-NOCTTY", O_NOCTTY);
+    EMIT_U("PLAT-O-NOCTTY", O_NOCTTY);
     printf("\n");
 
     printf("  ;; fnmatch flags\n");
-    EMIT("PLAT-FNM-NOESCAPE", 1);  /* FNM_NOESCAPE is 1 on both Linux and macOS */
-    EMIT("PLAT-FNM-PATHNAME", 2);  /* FNM_PATHNAME is 2 on both */
-    EMIT("PLAT-FNM-PERIOD", 4);    /* FNM_PERIOD is 4 on both */
+    /* Use the real <fnmatch.h> macros: glibc and the BSDs/macOS disagree --
+       glibc has FNM_PATHNAME=1, FNM_NOESCAPE=2 whereas the BSDs use
+       FNM_NOESCAPE=1, FNM_PATHNAME=2 -- so a hardcoded literal is wrong on
+       one of them. */
+    EMIT_U("PLAT-FNM-NOESCAPE", FNM_NOESCAPE);
+    EMIT_U("PLAT-FNM-PATHNAME", FNM_PATHNAME);
+    EMIT_U("PLAT-FNM-PERIOD", FNM_PERIOD);
     printf("\n");
 
     printf("  ;; Regex flags\n");
-    EMIT("PLAT-REG-EXTENDED", REG_EXTENDED);
-    EMIT("PLAT-REG-ICASE", REG_ICASE);
-    EMIT("PLAT-REG-NOSUB", REG_NOSUB);
-    EMIT("PLAT-REG-NEWLINE", REG_NEWLINE);
-    EMIT("PLAT-REG-NOTBOL", REG_NOTBOL);
-    EMIT("PLAT-REG-NOTEOL", REG_NOTEOL);
-    EMIT("PLAT-REG-NOMATCH", REG_NOMATCH);
+    EMIT_U("PLAT-REG-EXTENDED", REG_EXTENDED);
+    EMIT_U("PLAT-REG-ICASE", REG_ICASE);
+    EMIT_U("PLAT-REG-NOSUB", REG_NOSUB);
+    EMIT_U("PLAT-REG-NEWLINE", REG_NEWLINE);
+    EMIT_U("PLAT-REG-NOTBOL", REG_NOTBOL);
+    EMIT_U("PLAT-REG-NOTEOL", REG_NOTEOL);
+    EMIT_U("PLAT-REG-NOMATCH", REG_NOMATCH);
 
     printf("  ;; Locale\n");
-    EMIT("PLAT-LC-ALL", LC_ALL);
+    EMIT_S("PLAT-LC-ALL", LC_ALL);
     printf("\n");
 
     printf("\n) ; end library\n");

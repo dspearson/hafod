@@ -3,18 +3,27 @@
 
 (library (hafod editor help)
   (export show-keybindings run-tutorial)
-  (import (chezscheme))
+  (import (chezscheme)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?))
 
   ;; ======================================================================
   ;; ANSI formatting helpers
   ;; ======================================================================
 
-  (define (bold s) (string-append "\x1b;[1m" s "\x1b;[22m"))
-  (define (dim s) (string-append "\x1b;[2m" s "\x1b;[22m"))
-  (define (cyan s) (string-append "\x1b;[36m" s "\x1b;[39m"))
-  (define (yellow s) (string-append "\x1b;[33m" s "\x1b;[39m"))
-  (define (green s) (string-append "\x1b;[32m" s "\x1b;[39m"))
-  (define (magenta s) (string-append "\x1b;[35m" s "\x1b;[39m"))
+  ;; Wrap S in the SGR set/reset codes, but only when the current output port is
+  ;; colour-capable -- otherwise return S unchanged so no escape reaches a pipe, a
+  ;; dumb terminal, or a NO_COLOR sink.
+  (define (sgr set reset s)
+    (if (colour-ok? (current-output-port))
+        (string-append "\x1b;[" set "m" s "\x1b;[" reset "m")
+        s))
+
+  (define (bold s) (sgr "1" "22" s))
+  (define (dim s) (sgr "2" "22" s))
+  (define (cyan s) (sgr "36" "39" s))
+  (define (yellow s) (sgr "33" "39" s))
+  (define (green s) (sgr "32" "39" s))
+  (define (magenta s) (sgr "35" "39" s))
 
   ;; Display width of a string, skipping ANSI escape sequences.
   (define (display-width s)
@@ -231,7 +240,8 @@
                  [instr (cadr lesson)]
                  [example (caddr lesson)]
                  [hint (cadddr lesson)])
-            (display "\x1b;[2J\x1b;[H")  ;; clear screen
+            (when (ansi-ok? (current-output-port))
+              (display "\x1b;[2J\x1b;[H"))  ;; clear screen (only on a capable terminal)
             (display (bold (cyan (string-append "  Lesson " (number->string (+ i 1))
                                                 "/" (number->string n)
                                                 ": " title))))
@@ -259,7 +269,8 @@
             (let ([ch (read-char)])
               (cond
                 [(or (eof-object? ch) (char=? ch #\q))
-                 (display "\x1b;[2J\x1b;[H")
+                 (when (ansi-ok? (current-output-port))
+                   (display "\x1b;[2J\x1b;[H"))
                  (display "  Tutorial ended.\n\n")]
                 [(char=? ch #\p)
                  (lp (max 0 (- i 1)))]

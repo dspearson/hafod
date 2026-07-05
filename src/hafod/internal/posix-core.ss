@@ -51,13 +51,21 @@
   ;; Helper utilities
   ;; ======================================================================
 
-  ;; Extract a null-terminated C string from a pointer address.
+  ;; Extract a null-terminated C string from a pointer address, decoding the
+  ;; bytes as UTF-8.  Names read back from the kernel (directory entries, user
+  ;; and group names, tty and timezone names) are byte strings; the matching
+  ;; outbound path (strings->c-argv) encodes with string->utf8, so the inbound
+  ;; path has to decode the same way or every non-ASCII name double-encodes --
+  ;; mapping each byte straight to a character (Latin-1) turned a globbed
+  ;; "name：720" into bytes no exec could match. Invalid UTF-8 is replaced, not
+  ;; raised, so a stray non-UTF-8 name never aborts a directory read.
   (define (ptr->string ptr)
-    (let loop ([i 0] [chars '()])
-      (let ([byte (foreign-ref 'unsigned-8 ptr i)])
-        (if (= byte 0)
-            (list->string (reverse chars))
-            (loop (+ i 1) (cons (integer->char byte) chars))))))
+    (let ([len (let loop ([i 0])
+                 (if (= (foreign-ref 'unsigned-8 ptr i) 0) i (loop (+ i 1))))])
+      (let ([bv (make-bytevector len)])
+        (do ([i 0 (+ i 1)]) ((= i len))
+          (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 ptr i)))
+        (utf8->string bv))))
 
   ;; Build a C char** array from a list of Scheme strings.
   ;; The array is null-terminated. Caller must free with free-c-argv.
@@ -111,7 +119,9 @@
   (define c-dup (foreign-procedure "dup" (int) int))
   (define c-dup2 (foreign-procedure "dup2" (int int) int))
   (define c-close (foreign-procedure "close" (int) int))
-  (define c-open (foreign-procedure "hafod_open3" (string int int) int))
+  (define c-open
+    ;; n = 2: path + flags are fixed; mode is the single variadic arg.
+    (foreign-procedure (__varargs_after 2) "open" (string int int) int))
   (define c-read (foreign-procedure "read" (int void* size_t) ssize_t))
   (define c-write (foreign-procedure "write" (int void* size_t) ssize_t))
   (define c-kill (foreign-procedure "kill" (int int) int))

@@ -59,7 +59,51 @@
                 (command-line chez:command-line)
                 (command-line-arguments chez:command-line-arguments))
     chez:command-line chez:command-line-arguments)
+  ;; Recorded build Chez version, for the best-effort assert below.
+  (hafod internal chez-version)
+  ;; reassert-cooked-tty! backs the top-level cooked-mode guard around the Main
+  ;; dispatch below.  It is a direct (only ...) import rather than an umbrella
+  ;; export, so it introduces no binding that conflicts with (hafod).
+  (only (hafod tty) reassert-cooked-tty!)
+  ;; reset-signal-to-default! lets SIGPIPE terminate hafod quietly on a broken
+  ;; downstream pipe.  A direct (only ...) import (not umbrella-exported), so the
+  ;; umbrella surface is unchanged; SIGPIPE itself comes from (hafod).
+  (only (hafod signal) reset-signal-to-default!)
   (hafod))
+
+;; Best-effort version guard for the source path.  This is the first body
+;; expression, so it runs before any of the program's own side effects.  It
+;; fires only when a full (compiler-bearing) Chez of the wrong version compiles
+;; bin/hafod.sps directly: the fasl path never reaches here (the loader rejects
+;; a mismatched bin/hafod.so first) and the petite source path never reaches
+;; here either ((import (hafod)) is compiled before this runs).  The bin/hafod
+;; wrapper covers those two; this catches the remaining full-but-wrong scheme.
+;;
+;; (scheme-version-number) returns THREE values, so bind it with let-values and
+;; compare the rebuilt list against the recorded list literal -- never apply
+;; equal? to the raw multiple values.
+(let-values ([(maj min sub) (scheme-version-number)])
+  (unless (equal? (list maj min sub) build-chez-version-number)
+    ;; Render a triple as "maj.min.sub" so the message reads like a version,
+    ;; not a run-together digit string.
+    (let ([dotted (lambda (parts)
+                    (let loop ([parts parts] [first #t])
+                      (unless (null? parts)
+                        (unless first (display "." (current-error-port)))
+                        (display (car parts) (current-error-port))
+                        (loop (cdr parts) #f))))])
+      (display "hafod: Chez Scheme " (current-error-port))
+      (dotted build-chez-version-number)
+      (display " required, but running " (current-error-port))
+      (dotted (list maj min sub))
+      (display ".\n" (current-error-port))
+      (display "hafod: run 'nix develop' (or set HAFOD_SCHEME), then 'make compile-wpo' to rebuild.\n"
+               (current-error-port)))
+    ;; Exit 1 to match the wrapper's version/compiler guards and the other
+    ;; (exit 1) error handlers below: a wrong-version Chez always fails with the
+    ;; same code, whichever path (wrapper pre-flight or this source-path assert)
+    ;; trips first.
+    (exit 1)))
 
 ;; port->string is now provided by (hafod) via (hafod port-collect).
 
@@ -390,6 +434,7 @@
       "  --login    Start as a login shell\n"
       "  --no-config  Skip loading config files\n"
       "  --norc     Alias for --no-config (backward compat)\n"
+      "  --batch    Force the non-editor REPL path (also: HAFOD_BATCH=1)\n"
       "\n"
       "Terminators (at most one):\n"
       "  -s FILE    Load and run FILE as a hafod/scsh script\n"
@@ -465,6 +510,12 @@
               ;; --no-config / --norc -- skip config file loading
               [(or (string=? arg "--no-config") (string=? arg "--norc"))
                (loop rest entry preloads login? #t)]
+
+              ;; --batch -- force the non-editor REPL path regardless of whether
+              ;; stdin is a tty (non-terminating, like --login)
+              [(string=? arg "--batch")
+               (batch-mode? #t)
+               (loop rest entry preloads login? no-config?)]
 
               ;; -s FILE -- script mode (terminating)
               [(string=? arg "-s")
@@ -542,9 +593,35 @@
 
 ;; Detect login shell invocation: argv[0] starts with "-" (e.g., "-hafod").
 ;; This is the standard Unix convention used by login(1) and getty(8).
-(let ([argv0 (car (chez:command-line))]
-      [args (command-line-arguments)])
-  (if (and (> (string-length argv0) 0)
-           (char=? (string-ref argv0 0) #\-))
-      (parse-and-execute (cons "--login" args))
-      (parse-and-execute args)))
+;;
+;; Wrap the whole dispatch in a top-level cooked-mode boundary.  An unhandled
+;; exception raised outside the REPL's own dynamic-wind -- during start-up, or
+;; while the line editor is mid-read -- would otherwise reach Chez's default
+;; handler, which prints the diagnostic and exits WITHOUT running the exit
+;; restore, stranding the outer shell with no echo.  Re-assert cooked for fd 0
+;; first, then re-raise the original condition unchanged so the diagnostic and
+;; exit status are exactly as before.  The re-assert has its own guard so a
+;; restore failure can never mask the original error, and it is a no-op off a
+;; terminal (a piped or redirected run), so this is inert unless stdin is a
+;; real tty.  The success path and the (exit)-based -c/--help/--version paths
+;; are untouched -- a clean return never enters the handler.
+;; Let a broken downstream pipe terminate hafod the way a normal Unix filter
+;; ends -- quietly.  Chez sets SIGPIPE to SIG_IGN so a write to a closed pipe
+;; returns EPIPE and surfaces as an i/o exception (from the REPL, an eval's own
+;; output, or a flush); restoring the default disposition makes the kernel end
+;; the process at the write syscall instead, with no diagnostic.  Fix (a) keeps
+;; the line editor off whenever stdout is not a terminal, so a broken pipe can
+;; only occur when stdin/stdout is redirected -- i.e. never in raw mode -- so
+;; this quiet termination never strands a raw terminal.
+(reset-signal-to-default! SIGPIPE)
+
+(guard (con [#t
+             (guard (e [#t (void)])
+               (reassert-cooked-tty! 0))
+             (raise con)])
+  (let ([argv0 (car (chez:command-line))]
+        [args (command-line-arguments)])
+    (if (and (> (string-length argv0) 0)
+             (char=? (string-ref argv0 0) #\-))
+        (parse-and-execute (cons "--login" args))
+        (parse-and-execute args))))

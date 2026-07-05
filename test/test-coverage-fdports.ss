@@ -3,10 +3,12 @@
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (hafod syntax)
+        (hafod process)
         (hafod fd-ports)
         (hafod posix)
         (hafod compat)
-        (except (chezscheme) vector-append open-input-file open-output-file getenv))
+        (except (chezscheme) exit vector-append open-input-file open-output-file getenv))
 
 (test-begin "coverage-fdports")
 
@@ -113,5 +115,21 @@
     (lambda () (display "err-test3" (current-error-port))))
   (test-equal "with-error-output-port* redirects error output"
     "err-test3" (get-output-string sp)))
+
+;; ======================================================================
+;; Child-fd wiring through the opaque spawn file actions
+;; ======================================================================
+;; run/string captures the child's stdout, proving the spawn file actions
+;; dup'd the child's fd 1 onto the parent's pipe (the opaque posix-spawnp* path).
+(test-equal "run/string captures single child's stdout"
+  "hafod-child-fd\n"
+  (run/string (echo "hafod-child-fd")))
+
+;; A 2-stage pipeline returns the sorted child output, proving multi-stage
+;; child-fd wiring through the same opaque spawn file-actions API. printf feeds
+;; the multi-line input (echo would emit a literal backslash-n, not a newline).
+(test-equal "pipeline captures sorted multi-stage child stdout"
+  "apple\nbanana\n"
+  (run/string (pipe (printf "banana\napple\n") (sort))))
 
 (test-end)

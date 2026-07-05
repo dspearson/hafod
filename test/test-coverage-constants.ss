@@ -7,6 +7,9 @@
         (hafod signal)
         (hafod tty)
         (hafod compat)
+        (only (hafod internal platform-constants)
+              PLAT-TIOCGWINSZ PLAT-TIOCSCTTY
+              SIZEOF-WINSZ WINSZ-WS-ROW WINSZ-WS-COL)
         (except (chezscheme) vector-append open-input-file open-output-file getenv))
 
 (test-begin "coverage-constants")
@@ -175,5 +178,26 @@
 (test-assert "ttyout/uppercase is integer or #f" (or (integer? ttyout/uppercase) (not ttyout/uppercase)))
 (test-assert "ttyout/vtab-delay0 is integer or #f" (or (integer? ttyout/vtab-delay0) (not ttyout/vtab-delay0)))
 (test-assert "ttyout/vtab-delay1 is integer or #f" (or (integer? ttyout/vtab-delay1) (not ttyout/vtab-delay1)))
+
+;; ======================================================================
+;; Unsigned-emission guard: ioctl requests and flag masks must be emitted
+;; as non-negative decimals. A negative value here would mean the generator
+;; sign-extended a bit-31 request (a latent off-platform corruption). We
+;; assert sign/range only -- never a hardcoded platform number, since the
+;; ioctl request value differs by platform by design.
+;; ======================================================================
+(test-assert "PLAT-TIOCGWINSZ is non-negative" (>= PLAT-TIOCGWINSZ 0))
+(test-assert "PLAT-TIOCSCTTY is non-negative" (>= PLAT-TIOCSCTTY 0))
+(test-assert "O_APPEND is non-negative" (>= O_APPEND 0))
+
+;; ======================================================================
+;; struct winsize layout facts: the size and the byte offsets of ws_row /
+;; ws_col are emitted by the generator. On every supported host ws_row is
+;; the first field (offset 0) and ws_col is the second unsigned short
+;; (offset 2), and the struct is at least four unsigned shorts (8 bytes).
+;; ======================================================================
+(test-assert "SIZEOF-WINSZ is integer >= 8" (and (integer? SIZEOF-WINSZ) (>= SIZEOF-WINSZ 8)))
+(test-equal  "WINSZ-WS-ROW is 0" 0 WINSZ-WS-ROW)
+(test-equal  "WINSZ-WS-COL is 2" 2 WINSZ-WS-COL)
 
 (test-end)

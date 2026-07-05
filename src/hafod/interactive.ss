@@ -25,16 +25,19 @@
     classify-input
     ;; Feature toggles
     shell-mode?
-    history-expansion?)
+    history-expansion?
+    batch-mode?
+    use-editor?*)
 
   (import (except (chezscheme) getenv)
           (only (hafod posix) status:exit-val SIGWINCH)
-          (only (hafod internal posix-constants) TIOCGWINSZ)
+          (only (hafod signal) set-signal-handler!)
           (only (hafod environment) getenv setenv)
           (only (hafod procobj) background-job-count)
           (only (hafod editor editor) read-expression with-raw-mode
                 editor-history-entries editor-history-set-last-mode!)
-          (only (hafod tty) tty? tty-info set-tty-info/now)
+          (only (hafod tty) tty? terminal-size reassert-cooked-tty! install-terminal-guard!)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod editor render) tokenize display-colourised)
           (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
           (only (hafod shell parser) parse-shell-command)
@@ -139,6 +142,25 @@
   (define history-expansion?
     (make-parameter #t (lambda (v) (and v #t))))
 
+  ;; Force the non-editor (bare read) input path regardless of whether stdin is
+  ;; a terminal.  Set by the launcher's --batch flag and also honoured via the
+  ;; HAFOD_BATCH environment variable, so the deterministic read path can be a
+  ;; deliberate choice rather than a side effect of redirecting stdin.
+  (define batch-mode?
+    (make-parameter #f (lambda (v) (and v #t))))
+
+  ;; Choose the line editor only when BOTH ends are a real terminal and batch
+  ;; mode has not been forced.  The full-screen editor reads keys in raw mode
+  ;; from fd 0 and renders with cursor control to fd 1, so it needs a terminal
+  ;; at each end; when stdout is a pipe or file (`hafod | cat`, `hafod > log`)
+  ;; the bare line-read path is used instead, giving clean output with no
+  ;; per-keystroke re-render.  Pure in its four inputs -- the two live tty
+  ;; states, the batch-mode? value, and a HAFOD_BATCH boolean -- so the
+  ;; precedence (both terminals AND NOT batch AND NOT env) is unit-testable
+  ;; without a pseudo-terminal.
+  (define (use-editor?* tty-at-fd0? tty-at-fd1? forced-batch? env-batch?)
+    (and tty-at-fd0? tty-at-fd1? (not forced-batch?) (not env-batch?)))
+
   ;; === Terminal width ===
 
   ;; Terminal width parameter, updated on SIGWINCH.
@@ -150,45 +172,15 @@
           (error 'terminal-width "expected positive exact integer" v))
         v)))
 
-  ;; Query actual terminal width via ioctl(TIOCGWINSZ).
-  ;; Returns the column count, or 80 as fallback if not a terminal.
-  (define query-terminal-width
-    (let ([c-ioctl (foreign-procedure "hafod_ioctl_ptr" (int unsigned-long void*) int)])
-      (lambda ()
-        (let ([buf (foreign-alloc 8)])  ;; struct winsize = 4 unsigned shorts = 8 bytes
-          (let try-fd ([fds '(1 0 2)])  ;; try stdout, stdin, stderr
-            (cond
-              [(null? fds)
-               (foreign-free buf)
-               80]  ;; fallback
-              [else
-               (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
-                 (if (zero? rc)
-                     (let ([cols (foreign-ref 'unsigned-16 buf 2)])  ;; ws_col at offset 2
-                       (foreign-free buf)
-                       (if (> cols 0) cols 80))
-                     (try-fd (cdr fds))))]))))))
+  ;; Query the terminal column count, falling back to 80 off a terminal.
+  ;; Delegates to the shared tty helper.
+  (define (query-terminal-width)
+    (let-values ([(rows cols) (terminal-size)]) cols))
 
-  ;; Query actual terminal size (rows and columns) via ioctl(TIOCGWINSZ).
-  ;; Returns (values rows cols) with fallback 24x80 if not a terminal.
-  (define query-terminal-size
-    (let ([c-ioctl (foreign-procedure "hafod_ioctl_ptr" (int unsigned-long void*) int)])
-      (lambda ()
-        (let ([buf (foreign-alloc 8)])  ;; struct winsize = 4 unsigned shorts = 8 bytes
-          (let try-fd ([fds '(1 0 2)])  ;; try stdout, stdin, stderr
-            (cond
-              [(null? fds)
-               (foreign-free buf)
-               (values 24 80)]  ;; fallback
-              [else
-               (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
-                 (if (zero? rc)
-                     (let* ([rows (foreign-ref 'unsigned-16 buf 0)]  ;; ws_row at offset 0
-                            [cols (foreign-ref 'unsigned-16 buf 2)]) ;; ws_col at offset 2
-                       (foreign-free buf)
-                       (values (if (> rows 0) rows 24)
-                               (if (> cols 0) cols 80)))
-                     (try-fd (cdr fds))))]))))))
+  ;; Query the terminal size as (values rows cols), falling back to 24x80
+  ;; off a terminal. Delegates to the shared tty helper.
+  (define (query-terminal-size)
+    (terminal-size))
 
   ;; === Colourised output ===
 
@@ -205,8 +197,10 @@
                       (substring str 0 (- (string-length str) 1))
                       str)]
              [tokens (tokenize str)])
-        ;; Pass cursor-pos = -1 to skip enclosing-paren highlighting
-        (display-colourised port str tokens -1)
+        ;; Pass cursor-pos = -1 to skip enclosing-paren highlighting.
+        ;; Colour only when the target port is a live terminal (colour-ok?):
+        ;; a piped or captured stream (string port) yields plain, escape-free text.
+        (display-colourised port str tokens -1 (colour-ok? port))
         (newline port))))
 
   ;; === Helpers ===
@@ -250,10 +244,16 @@
         (let* ([visible-len (ansi-visible-length str)]
                [col (+ (- (terminal-width) visible-len) 1)])
           (when (> col 0)
-            (display "\x1b;7" port)
-            (display (format "\x1b;[~aG" col) port)
-            (display str port)
-            (display "\x1b;8" port))))))
+            ;; Save the cursor, jump to the column, then restore -- only when the
+            ;; target is a live terminal. Otherwise emit the right-prompt text
+            ;; plain so a piped or captured stream carries no cursor escapes.
+            (let ([ansi? (ansi-ok? port)])
+              (when ansi?
+                (display "\x1b;7" port)
+                (display (format "\x1b;[~aG" col) port))
+              (display str port)
+              (when ansi?
+                (display "\x1b;8" port))))))))
 
   ;; Create a continuation port with reset capability.
   ;; Wraps real-port; after the first line, displays repl-continuation-prompt before each
@@ -356,10 +356,13 @@
       (when (>= dur 2000)
         (let ([str (format-duration dur)])
           (when str
-            (display "\x1b;[38;5;240m" (console-error-port))
-            (display str (console-error-port))
-            (display "\x1b;[39m" (console-error-port))
-            (newline (console-error-port)))))))
+            ;; Grey the duration only when stderr is a live terminal; the plain
+            ;; duration text always survives to a piped or captured stream.
+            (let ([colour? (colour-ok? (console-error-port))])
+              (when colour? (display "\x1b;[38;5;240m" (console-error-port)))
+              (display str (console-error-port))
+              (when colour? (display "\x1b;[39m" (console-error-port)))
+              (newline (console-error-port))))))))
 
   ;; === Command-not-found suggestions ===
 
@@ -385,11 +388,14 @@
            [keys (vector->list (hashtable-keys ht))])
       (when (and (> (string-length cmd) 0)
                  (not (hashtable-ref ht cmd #f)))
-        (let ([suggestions (let ([filtered (fuzzy-filter cmd keys)])
+        (let* ([suggestions (let ([filtered (fuzzy-filter cmd keys)])
                              (if (> (length filtered) 3)
                                  (list (car filtered) (cadr filtered) (caddr filtered))
-                                 filtered))])
-          (display "\x1b;[38;5;240m" (console-error-port))
+                                 filtered))]
+               ;; Grey the diagnostic only when stderr is a live terminal; the
+               ;; message text always survives to a piped or captured stream.
+               [colour? (colour-ok? (console-error-port))])
+          (when colour? (display "\x1b;[38;5;240m" (console-error-port)))
           (display cmd (console-error-port))
           (display ": command not found" (console-error-port))
           (when (pair? suggestions)
@@ -400,7 +406,7 @@
                 (display (car rest) (console-error-port))
                 (lp (cdr rest) #f)))
             (display "?" (console-error-port)))
-          (display "\x1b;[39m" (console-error-port))
+          (when colour? (display "\x1b;[39m" (console-error-port)))
           (newline (console-error-port))))))
 
   ;; === REPL state ===
@@ -444,14 +450,36 @@
           ;; Install job control signal handlers
           (install-job-signals!)
 
-          ;; Register SIGWINCH handler to update terminal-width dynamically
-          (register-signal-handler SIGWINCH
+          ;; Arm the last-resort terminal guard once, so a cooked terminal is
+          ;; re-asserted on the exit and fatal-signal paths the editor's own
+          ;; dynamic-wind cannot see.
+          (install-terminal-guard!)
+
+          ;; Register the SIGWINCH handler that updates terminal-width on a
+          ;; resize.  Recording it through the disposition registry keeps it
+          ;; recoverable as the prior handler, so a scoped swap (such as the
+          ;; fuzzy finder's own resize handling) can restore it on exit instead
+          ;; of clobbering it.
+          (set-signal-handler! SIGWINCH
             (lambda (sig)
               (terminal-width (query-terminal-width))))
 
           ;; Main REPL loop with call/cc restart pattern
-          ;; Determine at startup whether stdin is a terminal (editor vs bare read)
-          (let ([use-editor? (tty? 0)])
+          ;; Determine at startup whether stdin is a terminal (editor vs bare read).
+          ;; --batch (via batch-mode?) and HAFOD_BATCH force the bare-read path even
+          ;; on a terminal.  HAFOD_BATCH enables batch when set to a non-falsy
+          ;; value (1, yes, true, ...); it is ignored -- leaving the choice to the
+          ;; tty -- when unset or set to a falsy value: the empty string, 0, false
+          ;; or no, matched case-insensitively.  So HAFOD_BATCH=0 turns batch off
+          ;; rather than silently enabling it.
+          (let ([use-editor? (use-editor?* (tty? 0)
+                                           (tty? 1)
+                                           (batch-mode?)
+                                           (let ([v (getenv "HAFOD_BATCH")])
+                                             (and v
+                                                  (not (member (string-downcase v)
+                                                               '("" "0" "false" "no")))
+                                                  #t)))])
           ;; Create continuation port once (persists across loop iterations to avoid losing buffered data)
           ;; Only needed for non-terminal mode
           (let-values ([(cport cport-reset!) (make-continuation-port (console-input-port))])
@@ -521,10 +549,11 @@
                                   [(builtin)
                                    ;; Execute builtin directly, skip eval
                                    (guard (exn
-                                            [#t (display "\x1b;[31m" (console-error-port))
-                                                (display-condition exn (console-error-port))
-                                                (display "\x1b;[39m" (console-error-port))
-                                                (newline (console-error-port))])
+                                            [#t (let ([colour? (colour-ok? (console-error-port))])
+                                                  (when colour? (display "\x1b;[31m" (console-error-port)))
+                                                  (display-condition exn (console-error-port))
+                                                  (when colour? (display "\x1b;[39m" (console-error-port)))
+                                                  (newline (console-error-port)))])
                                      (run-builtin! line))
                                    ;; Return (void) so the existing cond path skips display
                                    (void)]
@@ -590,10 +619,11 @@
                                [more (cdr forms)])
                            (guard (exn
                                     [#t
-                                     (display "\x1b;[31m" (console-error-port))
-                                     (display-condition exn (console-error-port))
-                                     (display "\x1b;[39m" (console-error-port))
-                                     (newline (console-error-port))
+                                     (let ([colour? (colour-ok? (console-error-port))])
+                                       (when colour? (display "\x1b;[31m" (console-error-port)))
+                                       (display-condition exn (console-error-port))
+                                       (when colour? (display "\x1b;[39m" (console-error-port)))
+                                       (newline (console-error-port)))
                                      ;; Stop on error (don't eval remaining forms)
                                      (loop)])
                              (call-with-values
@@ -644,29 +674,28 @@
                                  (last-duration (elapsed-milliseconds current-t0 t1))
                                  (set! current-t0 #f)
                                  (last-status 1)))
-                             (display "\x1b;[31m" (console-error-port))
-                             (display-condition exn (console-error-port))
-                             (display "\x1b;[39m" (console-error-port))
-                             (newline (console-error-port))
+                             (let ([colour? (colour-ok? (console-error-port))])
+                               (when colour? (display "\x1b;[31m" (console-error-port)))
+                               (display-condition exn (console-error-port))
+                               (when colour? (display "\x1b;[39m" (console-error-port)))
+                               (newline (console-error-port)))
                              ;; Post-eval hook (failure case)
                              ((repl-post-eval-hook) form (void))
                              (display-command-timing!)
                              (loop)])
                      (call-with-values
                        (lambda ()
-                         ;; Save terminal state before eval so interactive
-                         ;; child processes (ssh, vim, etc.) get a clean
-                         ;; terminal.  Restore afterwards in case the child
-                         ;; left it in a dirty state.
-                         (let ([saved-tty (guard (e [#t #f])
-                                            (tty-info 0))])
-                           (dynamic-wind
-                             void
-                             (lambda () (eval form (interaction-environment)))
-                             (lambda ()
-                               (when saved-tty
-                                 (guard (e [#t (void)])
-                                   (set-tty-info/now 0 saved-tty)))))))
+                         ;; Re-assert the known-good cooked terminal after each
+                         ;; evaluation, so an interactive child (ssh, vim, ...)
+                         ;; that left the terminal dirty does not strand the
+                         ;; prompt in raw mode.  The single owner holds the one
+                         ;; cooked baseline; re-asserting it is idempotent and
+                         ;; internally guarded.
+                         (dynamic-wind
+                           void
+                           (lambda () (eval form (interaction-environment)))
+                           (lambda ()
+                             (when (tty? 0) (reassert-cooked-tty! 0)))))
                        (lambda results
                          ;; Capture end time and clear eval marker
                          (let ([t1 (current-time 'time-monotonic)]

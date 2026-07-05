@@ -5,7 +5,10 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod finder)
-  (export run-finder fuzzy-select)
+  (export run-finder fuzzy-select
+          ;; Exposed for the PTY-free renderer tests (white-box): construct a
+          ;; state, render to a string port, and drive the plain fallback.
+          render-finder! make-finder-state run-finder/plain)
   (import (chezscheme)
           (only (hafod fuzzy) filter-search-pattern/positions)
           (only (hafod editor input-decode)
@@ -21,6 +24,8 @@
                 ident-colour-from-hash ident-hash)
           (only (hafod interactive) query-terminal-size)
           (only (hafod posix) SIGWINCH)
+          (only (hafod signal) with-signal-handler)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod shell classifier) classify-input))
 
   ;; ======================================================================
@@ -44,6 +49,12 @@
   (define COL-PROMPT   (fg256 110))  ; prompt (steel blue)
   (define COL-POINTER  (fg256 161))  ; pointer (hot pink)
   (define COL-SPINNER  (fg256 148))  ; spinner/separator fill
+
+  ;; Emit an SGR/palette string only when colour output is permitted. When
+  ;; colour? is #f every palette constant collapses to "" so the renderer emits
+  ;; zero SGR bytes at source; the cursor/movement escapes are gated separately
+  ;; (they only run once ansi-ok? has already admitted the full-screen TUI).
+  (define (sgr colour? s) (if colour? s ""))
 
   ;; Pointer character: ▌ (U+258C LEFT HALF BLOCK) — same as fzf unicode default
   (define POINTER-CHAR "\x258c;")
@@ -70,7 +81,8 @@
       prompt                   ;; string: prompt text (e.g. "> ")
       display-items            ;; vector of flattened display strings
       colorize?                ;; #f or procedure: (string -> boolean) — true means syntax-colour
-      show-numbers?))          ;; boolean: show 1-based index numbers beside candidates
+      show-numbers?            ;; boolean: show 1-based index numbers beside candidates
+      colour?))                ;; boolean: colour-ok? of the output — gates every SGR/palette byte
 
   ;; ======================================================================
   ;; Multiline flattening
@@ -191,14 +203,14 @@
   ;; hl-on/hl-off: escape strings for entering/leaving highlight.
   ;; restore-after-newline: thunk called after ↵ to restore colours.
   (define (emit-char-with-highlight buf ch want-hl? in-hl?
-                                    hl-on hl-off restore-after-newline)
+                                    hl-on hl-off restore-after-newline colour?)
     (cond
       ;; ↵ symbol rendered in dim
       [(char=? ch #\x21b5)
        (when in-hl? (display hl-off buf))
-       (display SGR-DIM buf)
+       (display (sgr colour? SGR-DIM) buf)
        (display ch buf)
-       (display SGR-RESET buf)
+       (display (sgr colour? SGR-RESET) buf)
        (restore-after-newline)
        #f]
       [(and want-hl? (not in-hl?))
@@ -215,15 +227,15 @@
 
   ;; Display candidate text with fzf-style match highlighting.
   ;; on-selected? uses hl+ (151), otherwise hl (108).
-  (define (display-candidate buf str positions on-selected?)
+  (define (display-candidate buf str positions on-selected? colour?)
     (let ([len (string-length str)]
           [pos-set (make-eq-hashtable)]
-          [hl-on  (string-append SGR-BOLD (if on-selected? COL-HL+ COL-HL))]
-          [hl-off (if on-selected?
-                      (string-append SGR-RESET COL-BG+ SGR-BOLD COL-FG+)
-                      SGR-RESET)]
+          [hl-on  (sgr colour? (string-append SGR-BOLD (if on-selected? COL-HL+ COL-HL)))]
+          [hl-off (sgr colour? (if on-selected?
+                                   (string-append SGR-RESET COL-BG+ SGR-BOLD COL-FG+)
+                                   SGR-RESET))]
           [restore (lambda ()
-                     (when on-selected?
+                     (when (and colour? on-selected?)
                        (display (string-append COL-BG+ SGR-BOLD COL-FG+) buf)))])
       (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
       (let loop ([i 0] [in-hl? #f])
@@ -232,7 +244,7 @@
                 [want? (hashtable-ref pos-set i #f)])
             (loop (fx1+ i)
                   (emit-char-with-highlight buf ch want? in-hl?
-                                            hl-on hl-off restore)))))
+                                            hl-on hl-off restore colour?)))))
       (when (let loop ([i 0] [last #f])
               (cond [(fx>= i len) last]
                     [(hashtable-ref pos-set i #f) (loop (fx1+ i) #t)]
@@ -242,12 +254,12 @@
   ;; Display candidate with Scheme syntax colouring + match highlighting.
   ;; Token-based foreground colours (rainbow parens, identifiers, strings, etc.)
   ;; with bold+underline overlay on matched positions.
-  (define (display-candidate/syntax buf str positions on-selected?)
+  (define (display-candidate/syntax buf str positions on-selected? colour?)
     (let* ([tokens (tokenize str)]
            [len (string-length str)]
            [pos-set (make-eq-hashtable)]
-           [hl-on  "\x1b;[1;4m"]
-           [hl-off "\x1b;[22;24m"])
+           [hl-on  (sgr colour? "\x1b;[1;4m")]
+           [hl-off (sgr colour? "\x1b;[22;24m")])
       (for-each (lambda (p) (hashtable-set! pos-set p #t)) positions)
       (for-each
         (lambda (tok)
@@ -258,19 +270,20 @@
                  [span (substring str start end)]
                  [emit-tok-colour
                    (lambda ()
-                     (case type
-                       [(paren)
-                        (fg-colour-l buf (vector-ref paren-colours
-                                           (modulo depth num-paren-colours)))]
-                       [(atom)
-                        (fg-colour-l buf (ident-colour-from-hash (ident-hash span)))]
-                       [(number)  (fg-colour-l buf number-colour)]
-                       [(boolean) (fg-colour-l buf boolean-colour)]
-                       [(string)  (fg-colour-l buf string-colour)]
-                       [(comment) (fg-colour-l buf comment-colour)]
-                       [else (void)]))]
+                     (when colour?
+                       (case type
+                         [(paren)
+                          (fg-colour-l buf (vector-ref paren-colours
+                                             (modulo depth num-paren-colours)))]
+                         [(atom)
+                          (fg-colour-l buf (ident-colour-from-hash (ident-hash span)))]
+                         [(number)  (fg-colour-l buf number-colour)]
+                         [(boolean) (fg-colour-l buf boolean-colour)]
+                         [(string)  (fg-colour-l buf string-colour)]
+                         [(comment) (fg-colour-l buf comment-colour)]
+                         [else (void)])))]
                  [restore (lambda ()
-                            (when on-selected? (display COL-BG+ buf))
+                            (when (and colour? on-selected?) (display COL-BG+ buf))
                             (emit-tok-colour))])
             ;; Set syntax foreground for this token
             (emit-tok-colour)
@@ -281,10 +294,10 @@
                       [want-hl? (hashtable-ref pos-set i #f)])
                   (char-loop (fx1+ i)
                              (emit-char-with-highlight buf ch want-hl? in-hl?
-                                                      hl-on hl-off restore)))))
+                                                      hl-on hl-off restore colour?)))))
             ;; Reset bold/underline and fg after each token
-            (display "\x1b;[22;24;39m" buf)
-            (when on-selected? (display COL-BG+ buf))))
+            (when colour? (display "\x1b;[22;24;39m" buf))
+            (when (and colour? on-selected?) (display COL-BG+ buf))))
         tokens)))
 
   (define (render-finder! state)
@@ -302,7 +315,19 @@
            [cand-bottom (fx- rows 2)]   ; row of best match
            [info-row (fx- rows 1)]      ; info/separator row
            [colorize? (finder-state-colorize? state)]
-           [show-nums? (finder-state-show-numbers? state)])
+           [show-nums? (finder-state-show-numbers? state)]
+           [colour? (finder-state-colour? state)]
+           ;; Shadow the palette with colour?-gated copies: when colour output
+           ;; is not permitted every SGR collapses to "" at source, while the
+           ;; cursor/clear-line escapes below stay intact.
+           [COL-BG+     (sgr colour? COL-BG+)]
+           [COL-FG+     (sgr colour? COL-FG+)]
+           [COL-POINTER (sgr colour? COL-POINTER)]
+           [COL-INFO    (sgr colour? COL-INFO)]
+           [COL-PROMPT  (sgr colour? COL-PROMPT)]
+           [SGR-BOLD    (sgr colour? SGR-BOLD)]
+           [SGR-DIM     (sgr colour? SGR-DIM)]
+           [SGR-RESET   (sgr colour? SGR-RESET)])
 
       ;; --- Candidate rows (bottom-up) ---
       ;; cand-bottom = index 0 (best match), going up for higher indices
@@ -360,12 +385,12 @@
                         (if (and colorize? (colorize? original))
                             (begin
                               (display COL-BG+ buf)
-                              (display-candidate/syntax buf truncated vis-positions #t))
+                              (display-candidate/syntax buf truncated vis-positions #t colour?))
                             (begin
                               (display SGR-BOLD buf)
                               (display COL-FG+ buf)
                               (display COL-BG+ buf)
-                              (display-candidate buf truncated vis-positions #t)))
+                              (display-candidate buf truncated vis-positions #t colour?)))
                         (display SGR-RESET buf))
                       (begin
                         ;; Normal line: 2 space gutter + optional number, default fg
@@ -375,8 +400,8 @@
                           (display num-str buf)
                           (display SGR-RESET buf))
                         (if (and colorize? (colorize? original))
-                            (display-candidate/syntax buf truncated vis-positions #f)
-                            (display-candidate buf truncated vis-positions #f))
+                            (display-candidate/syntax buf truncated vis-positions #f colour?)
+                            (display-candidate buf truncated vis-positions #f colour?))
                         (display SGR-RESET buf))))
                 ;; Empty row (beyond results)
                 (display SGR-RESET buf)))
@@ -670,6 +695,52 @@
          (finder-loop state resize-flag)])))
 
   ;; ======================================================================
+  ;; Plain-text fallback (non-ANSI output target)
+  ;; ======================================================================
+
+  ;; Trim leading/trailing whitespace so " 2 " (or a trailing CR from CRLF)
+  ;; still parses as the integer 2.
+  (define (strip-surrounding-whitespace s)
+    (let ([len (string-length s)])
+      (let ([start (let lp ([i 0])
+                     (if (and (fx< i len) (char-whitespace? (string-ref s i)))
+                         (lp (fx1+ i))
+                         i))]
+            [end (let lp ([i len])
+                   (if (and (fx> i 0) (char-whitespace? (string-ref s (fx1- i))))
+                       (lp (fx1- i))
+                       i))])
+        (if (fx<= end start) "" (substring s start end)))))
+
+  ;; Plain-text selection used when the output target is not ANSI-capable
+  ;; (a pipe, a file, a dumb terminal, or a CI log). The full-screen finder
+  ;; needs cursor positioning and the alternate screen, so instead present a
+  ;; numbered list and read one choice — emitting zero escape bytes. Returns
+  ;; the chosen ORIGINAL item string, or #f on end-of-file, a blank line, or an
+  ;; out-of-range / non-numeric choice (matching the TUI's accept-returns-the-
+  ;; string / cancel-returns-#f contract).
+  (define (run-finder/plain items prompt in-port out-port)
+    (let* ([vec (list->vector items)]
+           [n (vector-length vec)])
+      (let lp ([i 0])
+        (when (fx< i n)
+          (display (fx1+ i) out-port)
+          (display ". " out-port)
+          (display (flatten-for-display (vector-ref vec i)) out-port)
+          (newline out-port)
+          (lp (fx1+ i))))
+      (display prompt out-port)
+      (flush-output-port out-port)
+      (let ([line (get-line in-port)])
+        (if (eof-object? line)
+            #f
+            (let ([choice (string->number (strip-surrounding-whitespace line))])
+              (if (and choice (exact? choice) (integer? choice)
+                       (>= choice 1) (<= choice n))
+                  (vector-ref vec (- choice 1))
+                  #f))))))
+
+  ;; ======================================================================
   ;; Public API
   ;; ======================================================================
 
@@ -684,40 +755,49 @@
        (run-finder* items prompt colorize? mode-map show-numbers?)]))
 
   (define (run-finder* items prompt colorize? mode-map show-numbers?)
-    (let-values ([(rows cols) (query-terminal-size)])
-      (let* ([item-vec (list->vector items)]
-             [disp-vec (build-display-items item-vec)]
-             [init-filtered (list->vector (map (lambda (s) (cons s '())) items))]
-             [color-fn (cond
-                        [(not colorize?) #f]
-                        [mode-map
-                         ;; Use stored mode: syntax-colour only if mode is 'scheme
-                         (lambda (s) (eq? 'scheme (hashtable-ref mode-map s 'scheme)))]
-                        [else
-                         ;; Default: use classifier
-                         (lambda (s) (eq? 'scheme (classify-input s)))])]
-             [state (make-finder-state item-vec init-filtered
-                                       "" 0 0 0
-                                       rows cols
-                                       (length items) prompt
-                                       disp-vec color-fn (and show-numbers? #t))]
-             [resize-flag (make-flag)])
-        (let ([saved-handler #f])
-          (dynamic-wind
-            (lambda ()
-              (set! saved-handler
-                (let ([old #f])
-                  (register-signal-handler SIGWINCH
-                    (lambda (sig) (flag-set! resize-flag)))
-                  old)))
-            (lambda ()
-              (with-raw-mode 0
-                (lambda ()
-                  (with-alternate-screen
-                    (lambda ()
-                      (finder-loop state resize-flag))))))
-            (lambda ()
-              (register-signal-handler SIGWINCH (lambda (sig) (void)))))))))
+    ;; Gate the full-screen TUI on the ANSI-capability of the OUTPUT target,
+    ;; using the explicit fd 1: the shared console port aliases to fd 2, so
+    ;; gating on the port object would inspect the wrong stream and could leak
+    ;; escapes into a piped stdout. When the output is not a capable terminal,
+    ;; refuse raw-mode + the alternate screen and use a plain, zero-escape
+    ;; numbered selection instead.
+    (if (not (ansi-ok? 1))
+        (run-finder/plain items prompt (console-input-port) (console-output-port))
+        (let-values ([(rows cols) (query-terminal-size)])
+          (let* ([colour? (colour-ok? 1)]
+                 [item-vec (list->vector items)]
+                 [disp-vec (build-display-items item-vec)]
+                 [init-filtered (list->vector (map (lambda (s) (cons s '())) items))]
+                 [color-fn (cond
+                            ;; Suppress syntax colour when colour output is not
+                            ;; permitted (NO_COLOR on a real TTY) as well as when
+                            ;; the caller did not ask for it.
+                            [(not (and colour? colorize?)) #f]
+                            [mode-map
+                             ;; Use stored mode: syntax-colour only if mode is 'scheme
+                             (lambda (s) (eq? 'scheme (hashtable-ref mode-map s 'scheme)))]
+                            [else
+                             ;; Default: use classifier
+                             (lambda (s) (eq? 'scheme (classify-input s)))])]
+                 [state (make-finder-state item-vec init-filtered
+                                           "" 0 0 0
+                                           rows cols
+                                           (length items) prompt
+                                           disp-vec color-fn (and show-numbers? #t)
+                                           colour?)]
+                 [resize-flag (make-flag)])
+            ;; Scope the resize handler to the finder: with-signal-handler
+            ;; installs it for the duration of the TUI and restores whatever
+            ;; SIGWINCH disposition was live beforehand (the REPL's resize
+            ;; handler) on exit, rather than clobbering it with a no-op.
+            (with-signal-handler SIGWINCH
+              (lambda (sig) (flag-set! resize-flag))
+              (lambda ()
+                (with-raw-mode 0
+                  (lambda ()
+                    (with-alternate-screen
+                      (lambda ()
+                        (finder-loop state resize-flag)))))))))))
 
   (define fuzzy-select
     (case-lambda

@@ -78,7 +78,7 @@
   (define SIGPROF    PLAT-SIGPROF)
   (define SIGWINCH   PLAT-SIGWINCH)
   (define SIGIO      PLAT-SIGIO)
-  (define SIGPWR    30)
+  (define SIGPWR     PLAT-SIGPWR)
   (define SIGSYS     PLAT-SIGSYS)
 
   ;; File mode bits

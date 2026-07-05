@@ -184,4 +184,39 @@
             '("a.txt" "b.txt" "c.txt" "d.txt" "1.txt"))
   (posix-rmdir dir))
 
+;; Test: multibyte (UTF-8) filenames survive the readdir -> glob -> stat/exec
+;; round-trip. A directory entry's bytes are decoded the same way they are
+;; re-encoded on the way back out; mapping each byte straight to a character
+;; would double-encode every non-ASCII name, so a globbed "naïve：1" could no
+;; longer be stat'd or handed to a command.
+(let ([dir "/tmp/hafod-glob-utf8"]
+      [utf8-names '("café.txt" "naïve：1.webp" "emoji😃.mp4")])
+  (guard (e [#t #f])
+    (for-each (lambda (f) (posix-unlink (string-append dir "/" f))) utf8-names)
+    (posix-rmdir dir))
+  (posix-mkdir dir #o755)
+  (for-each (lambda (name)
+              (let ([path (string-append dir "/" name)])
+                (receive (tmp-path fd) (posix-mkstemp (string-append dir "/tmp-XXXXXX"))
+                  (posix-close fd)
+                  (posix-rename tmp-path path))))
+            utf8-names)
+
+  (let ([results (glob (string-append dir "/*"))])
+    (test-assert "glob finds all UTF-8-named files"
+      (= (length results) (length utf8-names)))
+    ;; Decisive round-trip check: every globbed name must re-encode to the real
+    ;; on-disk bytes, so file-exists? (which stats the re-encoded path) is #t.
+    ;; Under the byte-per-character decode this was #f for every multibyte name.
+    (test-assert "globbed UTF-8 names round-trip (file-exists? on each)"
+      (for-all file-exists? results))
+    ;; The names are decoded as characters, not bytes: at least one entry has
+    ;; fewer characters than its UTF-8 encoding has bytes (multibyte present).
+    (test-assert "a multibyte name decodes to fewer chars than its UTF-8 byte length"
+      (exists (lambda (f) (< (string-length f) (bytevector-length (string->utf8 f))))
+              results)))
+
+  (for-each (lambda (f) (posix-unlink (string-append dir "/" f))) utf8-names)
+  (posix-rmdir dir))
+
 (test-end)
