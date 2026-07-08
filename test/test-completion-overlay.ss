@@ -33,6 +33,7 @@
         (only (hafod pty) open-pty)
         (only (hafod fd-ports) fdes->outport close)
         (only (hafod posix) posix-open O_WRONLY)
+        (only (hafod internal platform) os-family)
         (chezscheme))
 
 ;; ======================================================================
@@ -284,10 +285,17 @@
       (not (has-esc? (get-output-string sp))))))
 
 ;; On a real pty slave the grid renders escapes: the selection's truecolour
-;; background and the height-cap pager both appear on the colour target.  The
-;; master is drained with a single bounded loop after the slave write-end closes,
-;; so it can never block.
-(let-values ([(master slave-name) (open-pty)])
+;; background and the height-cap pager both appear on the colour target.
+;; LINUX-ONLY: closing the last slave write-end makes the master read drain then
+;; EOF on Linux, but on macOS/BSD the master read BLOCKS (no EOF), hanging the
+;; drain loop.  The product render path is identical cross-platform and its
+;; escape-gating is covered by the plain-sink assertions above on every OS, so
+;; gate the pty round-trip (asserting escapes DO appear on a real tty) to Linux.
+(unless (eq? os-family 'linux)
+  (display "  completion-overlay: pty master-drain tests skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
+
+(when (eq? os-family 'linux)  ; see LINUX-ONLY note above
+ (let-values ([(master slave-name) (open-pty)])
   (setenv "NO_COLOR" #f)             ; unset baseline so colour-ok? is not vetoed
   (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
     (let ([captured
@@ -314,7 +322,7 @@
       (test-assert "pty: the selection highlight (truecolour background) renders"
         (contains-substring? captured "\x1b;[48;2;"))
       (test-assert "pty: the height-cap pager row renders"
-        (contains-substring? captured " rows")))))
+        (contains-substring? captured " rows"))))))
 
 ;; ======================================================================
 ;; (e) Cycle redraws in place -- bounded PTY, the behavioural no-stacking proof.
@@ -335,7 +343,8 @@
 (define cycle-keys
   (string-append "(ca" (string #\tab) (string #\tab) (string #\tab)))
 
-(let-values ([(master slave-name) (open-pty)])
+(when (eq? os-family 'linux)  ; see LINUX-ONLY note above (macOS/BSD pty master does not EOF)
+ (let-values ([(master slave-name) (open-pty)])
   (setenv "NO_COLOR" #f)               ; unset baseline so colour-ok? is not vetoed
   (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
     (let ([captured
@@ -360,7 +369,7 @@
         (test-assert "cycle: the repaint carries no cursor save/restore (no DECSC/DECRC)"
           (not (has-save-restore? captured)))
         (test-assert "cycle: the menu marker stays bounded across cycles (no stacking)"
-          (<= sel-count 4))))))
+          (<= sel-count 4)))))))
 
 ;; ======================================================================
 ;; (f) Drop-up decision -- PTY-free, the pure anchor predicate.
