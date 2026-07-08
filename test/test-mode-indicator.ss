@@ -34,6 +34,7 @@
         (only (hafod pty) open-pty)
         (only (hafod fd-ports) fdes->outport close)
         (only (hafod posix) posix-open O_WRONLY)
+        (only (hafod internal platform) os-family)
         (chezscheme))
 
 ;; ======================================================================
@@ -204,7 +205,15 @@
 ;;            clears to end of screen, wiping the indicator row, then redraws.
 ;; After the LAST clear-to-end-of-screen (ESC[J) no "-- NORMAL --" remains, so
 ;; the result printed next cannot collide with it.
-(let* ([prompt "> "]
+;; LINUX-ONLY pty round-trip: closing the slave write-end makes the master read
+;; drain then EOF on Linux, but on macOS/BSD the master read is unreliable (blocks
+;; or returns partial data), so this fails/hangs off Linux.  The render path is
+;; platform-agnostic and its escape-gating is covered by the string-port
+;; assertions above on every OS; see test-completion-overlay for the rationale.
+(unless (eq? os-family 'linux)
+  (display "  mode-indicator: pty round-trip test skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
+(when (eq? os-family 'linux)
+ (let* ([prompt "> "]
        [text "(+ 9 5 4)"]
        [cols 80])
   (let-values ([(master slave-name) (open-pty)])
@@ -244,7 +253,7 @@
           (test-assert "pty: the buffer is redrawn after the final clear"
             (contains-substring? (strip-sgr tail) text))
           (test-assert "pty: no -- NORMAL -- residue remains after the final clear"
-            (not (contains-substring? tail "-- NORMAL --"))))))))
+            (not (contains-substring? tail "-- NORMAL --")))))))))
 
 ;; ======================================================================
 ;; (D) Regression: the toggle governs only the indicator, never the selection.

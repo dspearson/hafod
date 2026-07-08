@@ -23,6 +23,7 @@
         (only (hafod pty) open-pty)
         (only (hafod fd-ports) fdes->outport close)
         (only (hafod posix) posix-open O_WRONLY)
+        (only (hafod internal platform) os-family)
         (chezscheme))
 
 ;; ======================================================================
@@ -161,7 +162,13 @@
 ;; loop after the slave write-end is closed, so it can never block.
 ;; ======================================================================
 
-(let* ([pty-prompt "> "]
+;; LINUX-ONLY pty round-trip: the master read drains then EOFs on Linux after the
+;; slave closes, but on macOS/BSD it is unreliable (blocks or returns partial
+;; data).  The geometry it checks is platform-agnostic; see test-completion-overlay.
+(unless (eq? os-family 'linux)
+  (display "  render-geometry: pty round-trip test skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
+(when (eq? os-family 'linux)
+ (let* ([pty-prompt "> "]
        [pty-before "(a\n(b"]           ; buffer text, cursor left at end
        [pty-sugg "X\nY\nZ"]            ; multi-line ghost suggestion
        [pty-cols 80]
@@ -195,6 +202,6 @@
           (> expected-climb 0))
         (test-equal "pty: cursor climbs exactly the ghost-inclusive rows above the typing row"
           (list expected-climb)
-          (collect-cursor-ups captured))))))
+          (collect-cursor-ups captured)))))))
 
 (test-end)
