@@ -7,6 +7,7 @@
         (hafod editor kill-ring)
         (hafod editor history)
         (hafod editor sexp-tracker)
+        (only (hafod editor render) only-closing-delimiters?)
         (only (hafod tty) current-suspend-hook))
 
 ;; Helper: construct control character
@@ -204,6 +205,66 @@
     (history-prefix-search-backward h "lambda" 3))
 
   (history-close! h))
+
+;; ======================================================================
+;; History ghost-suggestion tests (typed-prefix match + display gate)
+;; ======================================================================
+
+;; The history ghost keys off the typed before-cursor prefix and shows through
+;; paredit's auto-inserted trailing closers.  Assert the pure seam directly,
+;; PTY-free, over an in-memory history.
+(let ([h (open-history ":memory:")])
+  (history-add! h "(+ 3 4 (+ 5 6 7 8))")
+
+  ;; Typed-prefix match through a trailing closer.  With paredit on, typing "(+"
+  ;; leaves the buffer "(+)" with the cursor before the auto-inserted ")".
+  (test-equal "history-ghost-suffix matches typed prefix through a trailing closer"
+    " 3 4 (+ 5 6 7 8))"
+    (history-ghost-suffix "(+" ")" h))
+
+  ;; No-regression: plain end-of-buffer (nothing after the cursor) still suggests.
+  (test-equal "history-ghost-suffix suggests at plain end-of-buffer"
+    " 3 4 (+ 5 6 7 8))"
+    (history-ghost-suffix "(+" "" h))
+
+  ;; Multiple trailing closers still gate the ghost open.
+  (test-equal "history-ghost-suffix shows through multiple trailing closers"
+    " 3 4 (+ 5 6 7 8))"
+    (history-ghost-suffix "(+" "))" h))
+
+  ;; Boundary: a non-closer after the cursor withholds the ghost.
+  (test-equal "history-ghost-suffix withheld when a non-closer follows the cursor"
+    ""
+    (history-ghost-suffix "(+" " x" h))
+
+  ;; An empty typed prefix never suggests.
+  (test-equal "history-ghost-suffix empty prefix never suggests"
+    ""
+    (history-ghost-suffix "" "" h))
+
+  ;; No prefix match yields no ghost.
+  (test-equal "history-ghost-suffix no prefix match yields nothing"
+    ""
+    (history-ghost-suffix "zz" "" h))
+
+  (history-close! h))
+
+;; only-closing-delimiters? — the shared display gate.  Empty and all-closer
+;; strings are true (cursor at end of the typed region); anything else is false.
+(test-equal "only-closing-delimiters? empty string is true"
+  #t (only-closing-delimiters? ""))
+(test-equal "only-closing-delimiters? single closer is true"
+  #t (only-closing-delimiters? ")"))
+(test-equal "only-closing-delimiters? multiple closers is true"
+  #t (only-closing-delimiters? "))"))
+(test-equal "only-closing-delimiters? all closer kinds is true"
+  #t (only-closing-delimiters? ")]}\""))
+(test-equal "only-closing-delimiters? leading space is false"
+  #f (only-closing-delimiters? " )"))
+(test-equal "only-closing-delimiters? content before closer is false"
+  #f (only-closing-delimiters? "3 4)"))
+(test-equal "only-closing-delimiters? closer then char is false"
+  #f (only-closing-delimiters? ")x"))
 
 ;; ======================================================================
 ;; Tab completion helper tests

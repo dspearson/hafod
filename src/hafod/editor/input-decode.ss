@@ -7,6 +7,8 @@
   (export make-key-event key-event? key-event-type key-event-value key-event-mods
           key-event=?
           read-key-event
+          ;; Optional keystroke-recording tee (white-box; #f, or an output string port)
+          current-key-recording
           char-display-width string-display-width
           MOD_SHIFT MOD_ALT MOD_CTRL)
   (import (chezscheme) (hafod internal platform-constants))
@@ -34,6 +36,27 @@
   (define MOD_SHIFT 1)
   (define MOD_ALT   2)
   (define MOD_CTRL  4)
+
+  ;; Optional keystroke-recording tee: either #f (the default) or an output
+  ;; string port. When it holds a port, every character the decoder consumes is
+  ;; copied into it verbatim, so a caller can capture the exact keystroke stream
+  ;; of an action without altering how those bytes decode. It is settable by the
+  ;; caller and read only here; the recorder never re-injects input.
+  (define current-key-recording (make-parameter #f))
+
+  ;; Tee-aware character reader. Reads one character from the real port and,
+  ;; when recording is active and the result is a genuine character (not the
+  ;; end-of-input sentinel), copies it to the recording port before returning
+  ;; it. With recording off this behaves exactly like read-char, so decoding is
+  ;; byte-for-byte unchanged. char-ready? is deliberately left querying the real
+  ;; port directly, so a lone Escape is never routed through the tee and cannot
+  ;; block.
+  (define (rk-read-char port)
+    (let ([ch (read-char port)])
+      (let ([rec (current-key-recording)])
+        (when (and rec (not (eof-object? ch)))
+          (write-char ch rec)))
+      ch))
 
   ;; Extract xterm modifier from CSI params string.
   ;; Params like "1;3" -> modifier 3 -> bitmask 2 (Alt).
@@ -88,7 +111,7 @@
   ;; Parse CSI sequence: ESC [ already consumed, read params + final
   (define (parse-csi port)
     (let loop ([params ""])
-      (let ([ch (read-char port)])
+      (let ([ch (rk-read-char port)])
         (cond
           [(eof-object? ch)
            (make-key-event 'special 'escape 0)]
@@ -112,7 +135,7 @@
 
   ;; Parse SS3 sequence: ESC O already consumed
   (define (parse-ss3 port)
-    (let ([ch (read-char port)])
+    (let ([ch (rk-read-char port)])
       (if (eof-object? ch)
           (make-key-event 'special 'escape 0)
           (case ch
@@ -126,13 +149,13 @@
 
   ;; Read a key event from port
   (define (read-key-event port)
-    (let ([ch (read-char port)])
+    (let ([ch (rk-read-char port)])
       (cond
         [(eof-object? ch) ch]  ; propagate eof
         ;; ESC
         [(char=? ch #\x1b)
          (if (char-ready? port)
-             (let ([next (read-char port)])
+             (let ([next (rk-read-char port)])
                (cond
                  [(eof-object? next)
                   (make-key-event 'special 'escape 0)]

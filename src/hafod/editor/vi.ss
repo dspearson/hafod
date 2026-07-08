@@ -7,21 +7,30 @@
     ;; Main entry point for normal-mode key processing
     vi-process-key
     ;; State management
-    vi-reset-state! vi-reset-session!
+    vi-reset-state! vi-reset-session! vi-clear-visual!
     ;; State accessors (for rendering)
-    vi-visual-mode vi-visual-anchor vi-visual-end
+    vi-visual-mode vi-visual-anchor vi-visual-end vi-visual-range
     vi-mode-indicator vi-pending-state
     ;; Search
     vi-search-pattern vi-search-direction
+    ;; Register read + paste seam (white-box; read by editor.ss paste and the
+    ;; tests — deliberately not re-exported by the (hafod) umbrella)
+    vi-reg-fetch vi-take-paste-register!
+    ;; Dot-repeat: mid-command signal + replay delegation (white-box; the hook
+    ;; is set by editor.ss — deliberately not re-exported by the (hafod) umbrella)
+    vi-mid-command? vi-replay!-proc
     ;; For editor.ss integration (parameters — call with value to set)
     vi-snapshot!-proc vi-undo!-proc vi-redo!-proc
     vi-enter-insert!-proc vi-enter-normal!-proc
     vi-history-prev!-proc vi-history-next!-proc
-    vi-submit!-proc)
+    vi-submit!-proc
+    ;; Configurable surround trigger keys (settable; read live by the dispatch)
+    surround-op-key surround-visual-key)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor kill-ring)
-          (hafod editor input-decode))
+          (hafod editor input-decode)
+          (hafod editor sexp-tracker))
 
   ;; ======================================================================
   ;; Procedure hooks (set by editor.ss to avoid circular deps)
@@ -35,6 +44,23 @@
   (define vi-history-prev!-proc (make-parameter #f))
   (define vi-history-next!-proc (make-parameter #f))
   (define vi-submit!-proc (make-parameter #f))
+  ;; Dot-repeat replay delegation: set by editor.ss to the driver that re-feeds
+  ;; the recorded keystrokes of the last change. The default #f keeps the . arm
+  ;; a safe no-op until the engine is wired.
+  (define vi-replay!-proc (make-parameter #f))
+
+  ;; ======================================================================
+  ;; Configurable surround trigger keys
+  ;; ======================================================================
+  ;; The surround operator (ys / cs / ds) and the visual surround (S) are plain
+  ;; character keys the vi dispatch consumes directly, so — unlike the keymap
+  ;; sexp bindings — their trigger characters live here and are read live on
+  ;; every key. Rebind by setting the parameter; the guard keeps a character,
+  ;; falling back to the default when handed anything else.
+  (define surround-op-key
+    (make-parameter #\s (lambda (v) (if (char? v) v #\s))))
+  (define surround-visual-key
+    (make-parameter #\S (lambda (v) (if (char? v) v #\S))))
 
   ;; ======================================================================
   ;; Vi state — single mutable record
@@ -77,6 +103,25 @@
   (define (vi-visual-mode) (vi-state-vis-mode *vi*))
   (define (vi-visual-anchor) (vi-state-vis-anchor *vi*))
   (define (vi-visual-end gb) (gap-buffer-cursor-pos gb))
+  ;; Resolve the active visual selection into a (start . end) index span in the
+  ;; buffer's coordinate space, or #f when no visual mode is active. The span
+  ;; reproduces exactly what a visual d/y operates on: characterwise is inclusive
+  ;; of the cursor character (min..max+1, clamped to the text length), linewise is
+  ;; the whole single-line buffer (0..len). This mirrors the visual-operator span
+  ;; so the visible highlight and the characterwise/linewise delete or yank always
+  ;; agree on the same text.
+  (define (vi-visual-range gb)
+    (let ([mode (vi-state-vis-mode *vi*)])
+      (and mode
+           (let* ([len (string-length (gap-buffer->string gb))]
+                  [pos (gap-buffer-cursor-pos gb)]
+                  [anchor (vi-state-vis-anchor *vi*)])
+             (if (eq? mode 'line)
+                 (cons 0 len)
+                 ;; characterwise: min..max+1, clamped into [0, len], start <= end
+                 (let* ([start (max 0 (min (min pos anchor) len))]
+                        [end (max start (min (+ (max pos anchor) 1) len))])
+                   (cons start end)))))))
   (define (vi-mode-indicator)
     (cond
       [(eq? (vi-state-pending *vi*) 'operator)
@@ -91,6 +136,15 @@
          [else "-- VISUAL --"])]
       [else #f]))
   (define (vi-pending-state) (vi-state-pending *vi*))
+  ;; Dot-repeat mid-command signal: #t while the state machine is part-way
+  ;; through a command — an operator is pending, OR a find/replace/register
+  ;; prefix is waiting (pending is not 'normal), OR a count is being accumulated
+  ;; (count > 0). #f from a fully-idle normal state. This lets the main loop tell
+  ;; an in-flight change from an idle one without reaching into the vi internals.
+  (define (vi-mid-command?)
+    (or (and (vi-state-operator *vi*) #t)
+        (not (eq? (vi-state-pending *vi*) 'normal))
+        (> (vi-state-count *vi*) 0)))
   (define (vi-search-pattern) (vi-state-search-pat *vi*))
   (define (vi-search-direction) (vi-state-search-dir *vi*))
 
@@ -111,6 +165,15 @@
     (vi-state-search-dir-set! *vi* 'forward)
     (hashtable-clear! (vi-state-marks-ht *vi*))
     (vi-state-last-edit-set! *vi* #f))
+
+  ;; Dismiss any active visual selection -- clear the mode and its anchor while
+  ;; leaving the rest of the vi session (marks, search, registers) intact.  This
+  ;; is the narrow reset used when entering insert mode: a visual open in normal
+  ;; mode must not survive into typing, but a search pattern or mark the user set
+  ;; should.  Mirrors the visual-clear the Escape handler performs.
+  (define (vi-clear-visual!)
+    (vi-state-vis-mode-set! *vi* #f)
+    (vi-state-vis-anchor-set! *vi* 0))
 
   ;; ======================================================================
   ;; Character classification
@@ -429,23 +492,263 @@
           (values (- start 1) (+ end 1)))))
 
   ;; ======================================================================
+  ;; Surround target-family locator (shared by the change verb)
+  ;; ======================================================================
+  ;; A change target names a delimiter FAMILY, not a literal char: the verb must
+  ;; find the pair enclosing the cursor and normalise every family to two
+  ;; delimiter indices. open-mark? drives the inner-whitespace trim (only the
+  ;; four opening brackets trim); surround-target-chars resolves a typed char
+  ;; (including the b/B/r/a aliases) to its canonical open/close pair;
+  ;; enclosing-pair-of-type is the lexer- and type-aware bracket walk; and
+  ;; surround-locate dispatches by family, guarding a non-delimiter char up front
+  ;; so a typo can never reach char=? with a #f.
+
+  ;; True only for the four opening brackets — the marks whose change form trims
+  ;; the inner whitespace. Every closer, alias (b/B/r/a) and quote preserves it.
+  (define (open-mark? ch) (memv ch '(#\( #\[ #\{ #\<)))
+
+  ;; The canonical (open close) delimiter chars for any typed target char,
+  ;; resolving the aliases; (values #f #f) for anything unrecognised. Used both
+  ;; to choose the locator family and to hand the raw pair scanner its chars.
+  (define (surround-target-chars ch)
+    (case ch
+      [(#\( #\) #\b) (values #\( #\))]
+      [(#\[ #\] #\r) (values #\[ #\])]
+      [(#\{ #\} #\B) (values #\{ #\})]
+      [(#\< #\> #\a) (values #\< #\>)]
+      [(#\") (values #\" #\")]
+      [(#\') (values #\' #\')]
+      [(#\`) (values #\` #\`)]
+      [else (values #f #f)]))
+
+  ;; The innermost enclosing pair of a GIVEN bracket type around pos, lexer-aware
+  ;; via scan-lexer's open stack and find-matching-close. Walks the stack
+  ;; innermost-first and returns the first opener whose char is open-ch, together
+  ;; with its match — so a change on ([a]) finds the nearest ( skipping the inner
+  ;; [, and a ( inside a string or comment is never treated as structure.
+  ;; Returns (values open-idx close-idx) or (values #f #f).
+  (define (enclosing-pair-of-type text pos open-ch)
+    (let-values ([(state stack bc) (scan-lexer text pos)])
+      (cond
+        [(not (eq? state 'normal)) (values #f #f)]
+        ;; Cursor sitting ON the opener: scan-lexer only stacks openers in
+        ;; [0, pos), so an opener at pos itself is invisible to the stack walk.
+        ;; Take it as the open index directly -- it is genuine structure, the
+        ;; 'normal guard above having ruled out an opener inside a string or
+        ;; comment -- matching how the raw-scan brace/angle/quote families and
+        ;; ci( already accept the cursor being on the opening delimiter.
+        [(and (fx< pos (string-length text))
+              (char=? (string-ref text pos) open-ch))
+         (let ([cl (find-matching-close text pos)])
+           (if cl (values pos cl) (values #f #f)))]
+        [else
+         (let loop ([s stack])
+           (cond
+             [(null? s) (values #f #f)]
+             [(char=? (string-ref text (car s)) open-ch)
+              (let ([cl (find-matching-close text (car s))])
+                (if cl (values (car s) cl) (values #f #f)))]
+             [else (loop (cdr s))]))])))
+
+  ;; Locate the enclosing pair a change target refers to, normalised to the two
+  ;; delimiter indices (so the inner content is always
+  ;; (substring text (+ open-idx 1) close-idx)). The leading #f guard is
+  ;; MANDATORY and must precede every char=? branch: a non-delimiter char
+  ;; (surround-target-chars → #f) returns (values #f #f) here, so a stray key
+  ;; never reaches a (char=? #f …) further down and the change simply no-ops.
+  ;;  - ( or [   → the lexer- and type-aware bracket walk.
+  ;;  - "        → string-bounds-at, guarded on the cursor being in a string (its
+  ;;               close is already the closing-quote index).
+  ;;  - {}/<>/'/` → the raw nested-pair scan; normalise the half-open (start end)
+  ;;               that text-obj-around-pair yields to (start, end-1).
+  (define (surround-locate text pos ch)
+    (let-values ([(open-char close-char) (surround-target-chars ch)])
+      (cond
+        [(not open-char) (values #f #f)]
+        [(or (char=? open-char #\() (char=? open-char #\[))
+         (enclosing-pair-of-type text pos open-char)]
+        [(char=? open-char #\")
+         (if (eq? (lexer-state-at text pos) 'in-string)
+             (string-bounds-at text pos)
+             (values #f #f))]
+        [else
+         (let-values ([(s e) (text-obj-around-pair text pos open-char close-char)])
+           (if (and s e) (values s (fx- e 1)) (values #f #f)))])))
+
+  ;; ======================================================================
+  ;; Surround delimiter table and wrap transform
+  ;; ======================================================================
+  ;; The single source of truth for the surround pairs. Given the delimiter
+  ;; character the user typed, yield the opening and closing strings with the
+  ;; spacing convention baked in: an opening bracket ( [ { < adds one inner
+  ;; space per side; a closing bracket ) ] } > and its aliases b B r a add none;
+  ;; the symmetric quotes " ' ` add none. Any other character is not a
+  ;; recognised delimiter and yields (values #f #f), so the caller treats it as
+  ;; a safe no-op. Note the deliberate divergence from vim-surround: < is the
+  ;; space-adding open-angle here (vim opens a tag prompt), since this editor
+  ;; has no markup and defers tags.
+  (define (surround-strings ch)
+    (case ch
+      [(#\() (values "( " " )")]
+      [(#\) #\b) (values "(" ")")]
+      [(#\[) (values "[ " " ]")]
+      [(#\] #\r) (values "[" "]")]
+      [(#\{) (values "{ " " }")]
+      [(#\} #\B) (values "{" "}")]
+      [(#\<) (values "< " " >")]
+      [(#\> #\a) (values "<" ">")]
+      [(#\") (values "\"" "\"")]
+      [(#\') (values "'" "'")]
+      [(#\`) (values "`" "`")]
+      [else (values #f #f)]))
+
+  ;; Pure wrap transform: splice the opening/closing strings around the span
+  ;; [s, e) of text and return the new text together with the cursor position on
+  ;; the new opening delimiter. No mutation; the caller commits the result.
+  (define (wrap-span text s e open-str close-str)
+    (values (string-append (substring text 0 s) open-str
+                           (substring text s e) close-str
+                           (substring text e (string-length text)))
+            s))
+
+  ;; Read a single raw delimiter character from the port, returning the
+  ;; character or #f. This only guards against a truncated read (eof) or a
+  ;; non-character event; whether the character is a recognised delimiter is
+  ;; decided by the caller through surround-strings, so a malformed sequence
+  ;; never acts on the buffer.
+  (define (vi-read-delim in-port)
+    (let ([e (read-key-event in-port)])
+      (and (not (eof-object? e))
+           (eq? (key-event-type e) 'char)
+           (key-event-value e))))
+
+  ;; ======================================================================
+  ;; Lexer-aware s-expression text object
+  ;; ======================================================================
+  ;; Unlike text-obj-inner-pair, which counts raw parens and therefore
+  ;; miscounts a ( inside a string, a comment, or a #\( character literal, the
+  ;; s object resolves through the sexp-tracker primitives. Those gate on the
+  ;; lexer state 'normal, so only genuine structure is ever matched.
+
+  ;; The enclosing form around pos: inner drops the delimiters, around keeps
+  ;; them. Returns a half-open (values start end), or (values #f #f).
+  (define (form-object text pos inner?)
+    (let-values ([(open close) (find-enclosing-parens text pos)])
+      (cond
+        [(not (and open close)) (values #f #f)]
+        [inner? (values (fx+ open 1) close)]
+        [else (values open (fx+ close 1))])))
+
+  ;; Bounds of the string enclosing pos. Precondition: pos is inside a string.
+  ;; Scan forward to the closing quote, honouring backslash escapes; derive the
+  ;; opening quote by handing the position just past the close quote to
+  ;; backward-sexp-start, whose close-quote branch scans from the start of the
+  ;; text to find the matching open. close is the index of the closing quote.
+  (define (string-bounds-at text pos)
+    (let* ([len (string-length text)]
+           [close (let scan ([i pos])
+                    (cond
+                      [(fx>= i len) #f]
+                      [(char=? (string-ref text i) #\\) (scan (fx+ i 2))]
+                      [(char=? (string-ref text i) #\") i]
+                      [else (scan (fx+ i 1))]))]
+           [open (and close (backward-sexp-start text (fx+ close 1)))])
+      (if (and open close) (values open close) (values #f #f))))
+
+  ;; Resolve the s-expression at pos into a half-open (values start end).
+  ;; Dispatches on the lexer state so strings and comments are handled as whole
+  ;; units and never scanned as structure.
+  (define (resolve-sexp-object text pos inner?)
+    (let ([state (lexer-state-at text pos)]
+          [len (string-length text)])
+      (cond
+        ;; Inside a string: the string is the unit (quotes dropped for inner).
+        [(eq? state 'in-string)
+         (let-values ([(open close) (string-bounds-at text pos)])
+           (cond
+             [(not open) (values #f #f)]
+             [inner? (values (fx+ open 1) close)]
+             [else (values open (fx+ close 1))]))]
+        ;; Inside a comment: no structural sub-unit; take the enclosing form.
+        [(memq state '(in-line-comment in-block-comment))
+         (form-object text pos inner?)]
+        [else
+         (let ([ch (and (fx< pos len) (string-ref text pos))])
+           (cond
+             ;; On an opener: this list.
+             [(and ch (memv ch '(#\( #\[)))
+              (let ([close (find-matching-close text pos)])
+                (cond
+                  [(not close) (values #f #f)]
+                  [inner? (values (fx+ pos 1) close)]
+                  [else (values pos (fx+ close 1))]))]
+             ;; On a closer: the list it closes.
+             [(and ch (memv ch '(#\) #\])))
+              (let ([open (find-matching-paren text pos)])
+                (cond
+                  [(not open) (values #f #f)]
+                  [inner? (values (fx+ open 1) pos)]
+                  [else (values open (fx+ pos 1))]))]
+             ;; On an atom: bound it by scanning forward, then back from the
+             ;; end (so the first atom in a list, where a backward scan from
+             ;; pos would stop at the opener, is still bounded). Inner and
+             ;; around are identical for an atom -- it has no delimiters.
+             [(and ch (not (char-whitespace? ch)))
+              (let* ([end (forward-sexp-end text pos)]
+                     [start (and end (backward-sexp-start text end))])
+                (if (and start end) (values start end) (values #f #f)))]
+             ;; On whitespace inside a list: the enclosing form.
+             [else (form-object text pos inner?)]))])))
+
+  ;; ======================================================================
   ;; Register management
   ;; ======================================================================
 
-  (define (vi-reg-store! reg text)
-    (hashtable-set! (vi-state-registers-ht *vi*) reg text)
-    ;; Also store in unnamed register
-    (hashtable-set! (vi-state-registers-ht *vi*) #\" text))
+  ;; Store TEXT into register REG, always mirroring into the unnamed register.
+  ;; An upper-case A..Z register appends to its lower-case sibling and the
+  ;; unnamed register then mirrors the accumulated text; any other named register
+  ;; overwrites (and mirrors); the unnamed default writes only itself. When YANK?
+  ;; is true the text also lands in the "0 yank register (the last-yank slot), so
+  ;; a later delete — which passes YANK? false — cannot clobber the last yank.
+  (define (vi-reg-store! reg text yank?)
+    (let ([ht (vi-state-registers-ht *vi*)])
+      (cond
+        [(and (char? reg) (char<=? #\A reg #\Z))
+         (let* ([lc (char-downcase reg)]
+                [joined (string-append (hashtable-ref ht lc "") text)])
+           (hashtable-set! ht lc joined)
+           (hashtable-set! ht #\" joined))]
+        [(and (char? reg) (not (char=? reg #\")))
+         (hashtable-set! ht reg text)
+         (hashtable-set! ht #\" text)]
+        [else
+         (hashtable-set! ht #\" text)])
+      (when yank?
+        (hashtable-set! ht #\0 text))))
 
   (define (vi-reg-fetch reg)
     (hashtable-ref (vi-state-registers-ht *vi*) reg ""))
+
+  ;; Read the text of the currently-selected register for a paste, then reset the
+  ;; selection back to the unnamed default. Returns #f when the unnamed register
+  ;; is selected — the signal that the caller should fall back to the kill-ring
+  ;; (today's p / P behaviour) — otherwise the register's text, downcasing an
+  ;; A..Z selection to its lower-case sibling. The reset happens AFTER the read
+  ;; so the next paste starts afresh from the unnamed default.
+  (define (vi-take-paste-register!)
+    (let ([reg (vi-state-register-char *vi*)])
+      (vi-state-register-char-set! *vi* #\")
+      (if (char=? reg #\")
+          #f
+          (vi-reg-fetch (if (char<=? #\A reg #\Z) (char-downcase reg) reg)))))
 
   ;; ======================================================================
   ;; Operator application
   ;; ======================================================================
 
-  ;; Delete range [start, end) from gap buffer, store in register
-  (define (vi-delete-range! gb start end kr)
+  ;; Delete range [start, end) from gap buffer, storing the deleted text under
+  ;; the captured register REG (a delete is not a yank, so it never touches "0).
+  (define (vi-delete-range! gb start end kr reg)
     (let* ([text (gap-buffer->string gb)]
            [len (string-length text)]
            [s (max 0 (min start len))]
@@ -454,37 +757,183 @@
         (let* ([deleted (substring text s e)]
                [new-text (string-append (substring text 0 s)
                                         (substring text e len))])
-          (vi-reg-store! (vi-state-register-char *vi*) deleted)
+          (vi-reg-store! reg deleted #f)
           (kill-ring-push! kr deleted)
           (gap-buffer-set-from-string! gb new-text)
           (gap-buffer-move-cursor! gb (- (min s (string-length new-text))
                                          (gap-buffer-cursor-pos gb)))))))
 
-  ;; Yank range [start, end) — copy to register without deleting
-  (define (vi-yank-range! gb start end kr)
+  ;; Yank range [start, end) — copy to the captured register REG without
+  ;; deleting; a yank also fills the "0 last-yank register (via YANK? true).
+  (define (vi-yank-range! gb start end kr reg)
     (let* ([text (gap-buffer->string gb)]
            [len (string-length text)]
            [s (max 0 (min start len))]
            [e (max s (min end len))])
       (when (< s e)
         (let ([yanked (substring text s e)])
-          (vi-reg-store! (vi-state-register-char *vi*) yanked)
+          (vi-reg-store! reg yanked #t)
           (kill-ring-push! kr yanked)))))
 
-  ;; Apply operator to range
+  ;; Apply operator to range. The selected register is captured BEFORE the
+  ;; reset: vi-reset-state! sets register-char back to the unnamed default, so a
+  ;; named "ayy / "add would otherwise lose its target before the range procs
+  ;; read it. The captured register is threaded into the delete/yank procs.
   (define (vi-apply-operator! es gb kr start end)
-    (let ([op (vi-state-operator *vi*)])
+    (let ([op (vi-state-operator *vi*)]
+          [reg (vi-state-register-char *vi*)])
       (vi-reset-state!)
       (case op
         [(d)
          (when (vi-snapshot!-proc) ((vi-snapshot!-proc) es))
-         (vi-delete-range! gb start end kr)]
+         (vi-delete-range! gb start end kr reg)]
         [(c)
          (when (vi-snapshot!-proc) ((vi-snapshot!-proc) es))
-         (vi-delete-range! gb start end kr)
+         (vi-delete-range! gb start end kr reg)
          (when (vi-enter-insert!-proc) ((vi-enter-insert!-proc) es))]
         [(y)
-         (vi-yank-range! gb start end kr)])))
+         (vi-yank-range! gb start end kr reg)])))
+
+  ;; ======================================================================
+  ;; Surround: add a delimiter pair around a span
+  ;; ======================================================================
+
+  ;; Commit a surround: wrap the span [start, end) of the buffer in the given
+  ;; opening/closing strings. The span is clamped into [0, len] with start <=
+  ;; end; an empty span or an unrecognised delimiter (open-str #f) is a safe
+  ;; no-op that leaves the buffer and the undo stack untouched. The snapshot is
+  ;; taken only inside the change guard, and the whole edit commits as one
+  ;; gap-buffer-set-from-string! -- never character by character, so paredit
+  ;; auto-pairing cannot fire mid-edit -- leaving the cursor on the new opening
+  ;; delimiter.
+  (define (vi-surround-add! es gb start end open-str close-str)
+    (let* ([text (gap-buffer->string gb)]
+           [len (string-length text)]
+           [s (max 0 (min start len))]
+           [e (max s (min end len))])
+      (when (and open-str (< s e))
+        (when (vi-snapshot!-proc) ((vi-snapshot!-proc) es))
+        (let-values ([(nt np) (wrap-span text s e open-str close-str)])
+          (gap-buffer-set-from-string! gb nt)
+          (gap-buffer-move-cursor! gb (- np (gap-buffer-cursor-pos gb)))))))
+
+  ;; Stage the ys operand and then the delimiter, both read directly from the
+  ;; port so neither reaches the keymap. The operand is one of: a second
+  ;; surround key (yss -- the whole line from first-non-blank to end); an i/a
+  ;; text object (iw, i(, is/as, ...); or a motion, whose span copies the motion
+  ;; arm's inclusive-end fixup. Any eof, non-character, unresolved operand or
+  ;; unrecognised delimiter at any stage is a safe no-op.
+  (define (vi-surround-read-add! es gb in-port text pos)
+    (let ([k1 (read-key-event in-port)])
+      (when (and (not (eof-object? k1)) (eq? (key-event-type k1) 'char))
+        (let ([opc (key-event-value k1)])
+          (let-values ([(start end)
+                        (cond
+                          ;; yss: the whole line, leading blanks preserved
+                          [(char=? opc (surround-op-key))
+                           (values (motion-first-non-blank text pos)
+                                   (string-length text))]
+                          ;; i/a text object (covers iw, i(, is/as, ...)
+                          [(memv opc '(#\i #\a))
+                           (let ([k2 (read-key-event in-port)])
+                             (if (and (not (eof-object? k2))
+                                      (eq? (key-event-type k2) 'char))
+                                 (resolve-text-object text pos
+                                   (char=? opc #\i) (key-event-value k2))
+                                 (values #f #f)))]
+                          ;; motion operand, inclusive-end for e E $ %
+                          [(resolve-motion k1)
+                           => (lambda (motion)
+                                (let ([new-pos (run-motion-n motion text pos
+                                                 (max 1 (vi-state-count *vi*)))])
+                                  (values (min pos new-pos)
+                                          (if (memv opc '(#\e #\E #\$ #\%))
+                                              (+ (max pos new-pos) 1)
+                                              (max pos new-pos)))))]
+                          [else (values #f #f)])])
+            ;; Drain the trailing delimiter from the port on EVERY operand form,
+            ;; whether or not the operand resolved to a span. Reading it here is
+            ;; what keeps it off the keymap: were it left in the port an
+            ;; unresolved operand -- a garbage operand, or an iw/ib that finds no
+            ;; span at end-of-buffer or outside any block -- would let the
+            ;; delimiter surface as a fresh keystroke on the next loop pass and
+            ;; self-insert or auto-pair. The edit itself stays gated on a
+            ;; resolved span and a recognised delimiter, so an unresolved operand
+            ;; remains a clean no-op.
+            (let ([ch (vi-read-delim in-port)])
+              (when (and start end ch)
+                (let-values ([(open close) (surround-strings ch)])
+                  (when open
+                    (vi-surround-add! es gb start end open close))))))))))
+
+  ;; ======================================================================
+  ;; Surround: change one delimiter pair to another
+  ;; ======================================================================
+
+  ;; Strip the leading and trailing whitespace from the extracted inner content,
+  ;; leaving any interior whitespace intact. This is the reversible open-mark
+  ;; trim: it round-trips the single-space add (( x ) → x), while a close-mark,
+  ;; alias or quote target skips it so the inner spaces are preserved.
+  (define (surround-trim-inner str)
+    (let* ([len (string-length str)]
+           [start (let lp ([i 0])
+                    (if (and (fx< i len) (char-whitespace? (string-ref str i)))
+                        (lp (fx+ i 1)) i))]
+           [end (let lp ([i len])
+                  (if (and (fx> i start)
+                           (char-whitespace? (string-ref str (fx- i 1))))
+                      (lp (fx- i 1)) i))])
+      (substring str start end)))
+
+  ;; Change the enclosing OLD pair to the NEW pair. surround-locate finds the
+  ;; pair of the old family (a missing pair, or a non-delimiter old char, yields
+  ;; #f indices and no-ops); surround-strings gives the new pair with its spacing
+  ;; baked in (an unrecognised new delimiter is #f and no-ops). The inner content
+  ;; is trimmed of its outer whitespace only when the old char is an open-mark,
+  ;; then re-emitted wrapped in the new strings. The snapshot is taken only
+  ;; inside the change guard and the whole edit commits as one
+  ;; gap-buffer-set-from-string!, leaving the cursor on the new opening delimiter.
+  (define (vi-surround-change! es gb text pos old-ch new-ch)
+    (let-values ([(oi ci) (surround-locate text pos old-ch)])
+      (when (and oi ci)
+        (let-values ([(no nc) (surround-strings new-ch)])
+          (when no
+            (let* ([raw (substring text (fx+ oi 1) ci)]
+                   [inner (if (open-mark? old-ch) (surround-trim-inner raw) raw)])
+              (when (vi-snapshot!-proc) ((vi-snapshot!-proc) es))
+              (let ([new-text (string-append (substring text 0 oi) no inner nc
+                                             (substring text (fx+ ci 1)
+                                                        (string-length text)))])
+                (gap-buffer-set-from-string! gb new-text)
+                (gap-buffer-move-cursor! gb
+                  (- oi (gap-buffer-cursor-pos gb))))))))))
+
+  ;; ======================================================================
+  ;; Surround: delete a delimiter pair
+  ;; ======================================================================
+
+  ;; Delete the enclosing pair of the requested family, keeping the inner
+  ;; content. This is the change verb minus the re-emitted delimiters:
+  ;; surround-locate finds the pair (a missing pair, a lone quote, or a
+  ;; non-delimiter char all yield #f indices and no-op), the inner content is
+  ;; trimmed of its outer whitespace only when the requested char is an
+  ;; open-mark -- so ds( on ( x ) gives x while ds) on ( x ) preserves the inner
+  ;; spaces -- and the prefix, inner and suffix are spliced with both delimiters
+  ;; dropped. The snapshot is taken only inside the delete guard and the whole
+  ;; edit commits as one gap-buffer-set-from-string!, leaving the cursor where
+  ;; the opener was.
+  (define (vi-surround-delete! es gb text pos ch)
+    (let-values ([(oi ci) (surround-locate text pos ch)])
+      (when (and oi ci)
+        (let* ([raw (substring text (fx+ oi 1) ci)]
+               [inner (if (open-mark? ch) (surround-trim-inner raw) raw)])
+          (when (vi-snapshot!-proc) ((vi-snapshot!-proc) es))
+          (let ([new-text (string-append (substring text 0 oi) inner
+                                         (substring text (fx+ ci 1)
+                                                    (string-length text)))])
+            (gap-buffer-set-from-string! gb new-text)
+            (gap-buffer-move-cursor! gb
+              (- oi (gap-buffer-cursor-pos gb))))))))
 
   ;; ======================================================================
   ;; Search
@@ -629,6 +1078,7 @@
                         (text-obj-around-pair text pos #\' #\'))]
       [(#\`) (if inner? (text-obj-inner-pair text pos #\` #\`)
                         (text-obj-around-pair text pos #\` #\`))]
+      [(#\s) (resolve-sexp-object text pos inner?)]
       [else (values #f #f)]))
 
   ;; ======================================================================
@@ -732,6 +1182,39 @@
             (let* ([text (gap-buffer->string gb)]
                    [len (string-length text)])
               (vi-apply-operator! es gb kr 0 len))
+            #t]
+
+           ;; Surround operator: ys (the surround key after y). The change and
+           ;; delete operators reach this arm too, so the operator symbol is
+           ;; captured before the reset -- their clauses land here later. Guarded
+           ;; on an operator pending AND the surround key, so yiw, dw, ci( and
+           ;; the other operator forms are untouched.
+           [(and (vi-state-operator *vi*) (eq? type 'char)
+                 (char=? val (surround-op-key)))
+            (let ([op (vi-state-operator *vi*)])
+              (case op
+                [(y) (vi-surround-read-add! es gb in-port
+                       (gap-buffer->string gb) (gap-buffer-cursor-pos gb))]
+                ;; cs{old}{new}: read the two raw delimiters left-to-right. let*
+                ;; (NOT let) is load-bearing -- Chez leaves a plain let's init
+                ;; order unspecified (right-to-left in practice), which would bind
+                ;; old to the SECOND char and new to the FIRST, so cs)] would hunt
+                ;; for a [] that is not there and no-op on every input. let* forces
+                ;; the sequential reads: old = the first delimiter, new = the
+                ;; second. An eof or non-char at either read leaves old or new #f
+                ;; and the change no-ops.
+                [(c) (let* ([old (vi-read-delim in-port)]
+                            [new (vi-read-delim in-port)])
+                       (when (and old new)
+                         (vi-surround-change! es gb (gap-buffer->string gb)
+                           (gap-buffer-cursor-pos gb) old new)))]
+                ;; ds{char}: read one raw delimiter naming the family to delete;
+                ;; an eof or non-char leaves ch #f and the delete no-ops.
+                [(d) (let ([ch (vi-read-delim in-port)])
+                       (when ch
+                         (vi-surround-delete! es gb (gap-buffer->string gb)
+                           (gap-buffer-cursor-pos gb) ch)))]))
+            (vi-reset-state!)
             #t]
 
            ;; Text object: i/a prefix in operator-pending
@@ -973,6 +1456,54 @@
                 (vi-apply-operator! es gb kr s e)))
             #t]
 
+           ;; Visual-mode surround: capital S wraps the current selection in a
+           ;; delimiter pair. Lowercase s stays the visual substitute above, so
+           ;; S is free. The span comes from vi-visual-range; an unrecognised
+           ;; delimiter leaves the buffer untouched.
+           [(and (vi-state-vis-mode *vi*) (eq? type 'char)
+                 (char=? val (surround-visual-key)))
+            (let ([span (vi-visual-range gb)]
+                  [ch (vi-read-delim in-port)])
+              ;; Clear the selection once, on every path: an aborted S (an
+              ;; unrecognised or truncated delimiter) leaves visual mode exactly
+              ;; as a resolved one does. span is already captured above, so
+              ;; clearing here does not disturb the wrap.
+              (vi-state-vis-mode-set! *vi* #f)
+              (when (and span ch)
+                (let-values ([(open close) (surround-strings ch)])
+                  (when open
+                    (vi-surround-add! es gb (car span) (cdr span) open close)))))
+            (vi-reset-state!)
+            #t]
+
+           ;; Visual-mode i/a text object: read the following object key and
+           ;; set the visual selection to the resolved span. This is what makes
+           ;; vis / vas (and the other visual i/a objects) select -- the visual
+           ;; operator arm above only applies an operator to the existing
+           ;; anchor..cursor span and has no i/a entry of its own. Guarded on
+           ;; vis-mode so a normal-mode i/a still falls through to the keymap
+           ;; (insert entry), and on the absence of an operator so the
+           ;; operator-pending i/a path is untouched.
+           [(and (vi-state-vis-mode *vi*) (eq? type 'char) (memv val '(#\i #\a))
+                 (not (vi-state-operator *vi*)))
+            (let ([next (read-key-event in-port)])
+              (when (and (not (eof-object? next))
+                         (eq? (key-event-type next) 'char))
+                (let* ([text (gap-buffer->string gb)]
+                       [pos (gap-buffer-cursor-pos gb)])
+                  (let-values ([(start end)
+                                (resolve-text-object text pos
+                                  (char=? val #\i)
+                                  (key-event-value next))])
+                    (when (and start end (< start end))
+                      ;; anchor = span start, cursor = span end - 1, so
+                      ;; vi-visual-range resolves to exactly (start . end).
+                      (vi-state-vis-anchor-set! *vi* start)
+                      (gap-buffer-move-cursor! gb
+                        (- (- end 1) (gap-buffer-cursor-pos gb))))))))
+            (vi-reset-state!)
+            #t]
+
            ;; / ? search
            [(and (eq? type 'char) (or (char=? val #\/) (char=? val #\?))
                  (not (vi-state-operator *vi*)))
@@ -1071,15 +1602,30 @@
             (vi-reset-state!)
             #t]
 
-           ;; . repeat last edit
+           ;; . repeat last edit — delegate to the replay hook with the count
+           ;; typed before the dot. The count is read BEFORE vi-reset-state!
+           ;; zeroes it (the u / C-r read-before-reset idiom); a raw 0 means no
+           ;; count was given. A #f hook (no engine wired) makes this a safe
+           ;; no-op that just resets — pressing . never crashes.
            [(and (eq? type 'char) (char=? val #\.) (not (vi-state-operator *vi*)))
-            ;; TODO: replay recorded edit
+            (let ([cnt (vi-state-count *vi*)])
+              (when (vi-replay!-proc) ((vi-replay!-proc) es cnt)))
             (vi-reset-state!)
             #t]
 
-           ;; Not handled by vi — fall through to keymap
+           ;; Not handled by vi — fall through to the keymap.  Clear the transient
+           ;; operator / count / pending / find state, but LEAVE register-char: a
+           ;; keymap paste (cmd-paste-after / cmd-paste-before) still reads the
+           ;; pending "reg selection through vi-take-paste-register!, which resets
+           ;; it to the unnamed default on that read.  A blanket vi-reset-state!
+           ;; here would zero the register before the paste ran, stranding "ap /
+           ;; "aP back on the kill-ring instead of the named register.
            [else
-            (vi-reset-state!)
+            (vi-state-count-set! *vi* 0)
+            (vi-state-operator-set! *vi* #f)
+            (vi-state-pending-set! *vi* 'normal)
+            (vi-state-find-dir-set! *vi* #f)
+            (vi-state-recording-edit-set! *vi* #f)
             #f])])))
 
 ) ; end library

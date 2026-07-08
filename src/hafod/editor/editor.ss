@@ -6,18 +6,60 @@
 (library (hafod editor editor)
   (export read-expression with-raw-mode editor-default-keymap
           editor-insert-keymap editor-normal-keymap
+          ;; Keymap constructors + the insert->normal transition command
+          ;; (white-box: exported so the default-on suite can build FRESH keymaps
+          ;; with no configuration and assert their bindings directly -- including
+          ;; that the insert keymap maps Escape to cmd-enter-normal-mode, so the
+          ;; fully-featured normal/visual mode is reachable out of the box with no
+          ;; opt-in.  Mirrors the eager module instances above; deliberately NOT
+          ;; re-exported by the (hafod) umbrella, like editor-insert-keymap.)
+          make-insert-keymap make-normal-keymap cmd-enter-normal-mode
           ;; Exported for testing
           make-editor-state editor-state-gb editor-state-done? editor-state-result
           editor-state-mode editor-state-mode-set!
+          editor-state-mark editor-state-mark-set!
+          ;; Derived selection span + mode indicator (exported for testing)
+          editor-selection-range editor-mode-indicator
+          ;; Text mode-indicator toggle: OFF by default, opt-in from a user's
+          ;; init (white-box editor export; deliberately not re-exported by the
+          ;; (hafod) umbrella, like editor-mode-indicator itself)
+          show-mode-indicator?
           ;; Completion helpers (exported for testing)
           word-at-cursor symbol-completions filename-completions
           longest-common-prefix path-at-cursor
+          ;; Completion menu anchor decision (exported for testing)
+          menu-anchor-place
+          ;; Auto-suggestion ghost seam (exported for testing)
+          history-ghost-suffix
           ;; Shell-mode completion
           shell-completions
           ;; Keymap layers
           bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
           ;; Paredit toggle
           toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
+          ;; Structural s-expression selection (white-box: tests + reset hooks)
+          cmd-select-sexp cmd-expand-region cmd-contract-region
+          reset-sexp-stack!
+          ;; S-expression transpose (white-box: tests); cmd-undo exported so the
+          ;; transpose suite can prove a no-op pushes no undo snapshot
+          cmd-transpose-sexp cmd-transpose-sexp-backward cmd-undo
+          ;; Paste commands (white-box: exported so the register suite can drive
+          ;; p / P directly and assert the selected-register insertion)
+          cmd-paste-after cmd-paste-before
+          ;; Dot-repeat: the committed last change's recorded keystroke bytes
+          ;; (white-box: exported so the repeat suite can assert the recording is
+          ;; the keystrokes of the change, not a descriptor)
+          editor-dot-last-change
+          ;; Dot-repeat: PTY-free drive harness that runs the real recording
+          ;; boundary + dispatch over a keystroke script (white-box, for the suite
+          ;; -- the decoder's ESC-timing makes a pure read-expression script unable
+          ;; to enter normal mode mid-stream)
+          editor-drive-keys!
+          ;; Configurable structural keybindings (white-box): each key is held in
+          ;; a parameter that bind-sexp-keys! reads, so an init can rebind by
+          ;; setting the parameter and re-invoking bind-sexp-keys!
+          sexp-expand-key sexp-contract-key sexp-transpose-key
+          sexp-drag-fwd-key sexp-drag-back-key bind-sexp-keys!
           ;; History access (for history expansion and mode tagging)
           editor-history-entries editor-history-set-last-mode!
           editor-history-entry-mode
@@ -53,6 +95,12 @@
   ;; Delegates to the shared tty helper.
   (define (editor-query-terminal-cols)
     (let-values ([(rows cols) (terminal-size)]) cols))
+
+  ;; Query the terminal row count, falling back to 24 off a terminal.  Reads the
+  ;; same (values rows cols) as editor-query-terminal-cols but keeps the rows it
+  ;; discards -- the drop-up decision needs the terminal height.
+  (define (editor-query-terminal-rows)
+    (let-values ([(rows cols) (terminal-size)]) rows))
 
   ;; ======================================================================
   ;; Raw mode
@@ -97,7 +145,59 @@
       (mutable last-yank-len)  ;; length of last yanked text (for M-y replace)
       (mutable done?)          ;; #t when user pressed Return or C-d on empty
       (mutable result)         ;; string or eof-object when done
-      (mutable mode)))         ;; 'insert or 'normal
+      (mutable mode)           ;; 'insert or 'normal
+      (mutable mark)))         ;; emacs mark: integer index when a region is set, #f otherwise
+
+  ;; ======================================================================
+  ;; Selection span + mode indicator (fed to the selection-aware renderer)
+  ;; ======================================================================
+
+  ;; Resolve the ONE span to highlight into a (start . end) index pair over the
+  ;; buffer text (the gap-buffer-cursor-pos coordinate space), or #f when nothing
+  ;; is selected.  The vi visual selection takes priority, but only outside insert
+  ;; mode: while typing (insert) a still-active visual is ignored -- mirroring the
+  ;; same insert gate on editor-mode-indicator -- so a visual left set on the
+  ;; previous line cannot paint a phantom highlight as the user types.  When a
+  ;; visual mode is active in a non-insert buffer the span is the vi visual range
+  ;; (inclusive characterwise / linewise, from vi.ss).  Otherwise, when an emacs
+  ;; mark is set, the span is the half-open mark..point region -- min..max with
+  ;; NO +1, since the region excludes point, unlike the inclusive vi range --
+  ;; clamped into [0, buffer-length].  With neither active there is no selection.
+  (define (editor-selection-range es)
+    (cond
+      [(and (not (eq? (editor-state-mode es) 'insert)) (vi-visual-mode))
+       (vi-visual-range (editor-state-gb es))]
+      [else
+       (let ([m (editor-state-mark es)])
+         (and (integer? m)
+              (let* ([gb (editor-state-gb es)]
+                     [len (string-length (gap-buffer->string gb))]
+                     [p (gap-buffer-cursor-pos gb)]
+                     [lo (max 0 (min (min m p) len))]
+                     [hi (max lo (min (max m p) len))])
+                (cons lo hi))))]))
+
+  ;; Optional text mode indicator, OFF by default.  The active mode is already
+  ;; visible through the cursor shape and colour -- steady block / yellow in a
+  ;; non-insert mode, steady bar / blue in insert -- so the textual
+  ;; "-- NORMAL --" row is redundant and switched off out of the box.  A user's
+  ;; init may switch it on with (show-mode-indicator? #t); it then shows on its
+  ;; own row below the edit line whenever the mode is not insert.  Coerced to a
+  ;; strict boolean, mirroring the fuzzy-finder? / tab-completions? toggles.
+  (define show-mode-indicator?
+    (make-parameter #f (lambda (v) (and v #t))))
+
+  ;; The compact mode indicator to show, or #f when nothing should be drawn:
+  ;; #f whenever the text indicator is switched off (the default) or the buffer
+  ;; is in insert mode (nothing is shown while typing).  Otherwise defer to
+  ;; vi-mode-indicator -- which already yields "-- VISUAL --" / "-- VISUAL LINE
+  ;; --" / the operator strings -- and supply the plain-normal "-- NORMAL --"
+  ;; fallback it returns #f for, so a non-insert mode always shows something.
+  (define (editor-mode-indicator es)
+    (if (or (not (show-mode-indicator?))
+            (eq? (editor-state-mode es) 'insert))
+        #f
+        (or (vi-mode-indicator) "-- NORMAL --")))
 
   ;; ======================================================================
   ;; Word boundary helpers
@@ -352,9 +452,71 @@
                 (kill-ring-push! kr killed)))))
       (editor-state-last-yank-len-set! es 0)))
 
+  ;; ======================================================================
+  ;; Emacs mark and region
+  ;; ======================================================================
+
+  ;; A region is active when the mark holds an integer index; #f means unset.
+  (define (region-active? es)
+    (and (editor-state-mark es) #t))
+
+  ;; C-Space: set the mark at the current cursor position.  No snapshot and no
+  ;; buffer mutation -- the mark is a bookmark, not an edit.
+  ;;
+  ;; Known limitation: the mark is stored as a fixed buffer index and is not
+  ;; adjusted when text is inserted or deleted before it.  Editing between
+  ;; set-mark and a copy or kill therefore drifts the region -- mark..point no
+  ;; longer spans the text that was marked (the defensive clamp keeps it in
+  ;; range but cannot recover the intended span).  The common flow -- set the
+  ;; mark, move point WITHOUT editing, then copy or kill -- is unaffected.
+  (define (cmd-set-mark es)
+    (editor-state-mark-set! es (gap-buffer-cursor-pos (editor-state-gb es))))
+
+  ;; M-w: copy the region mark..point into the kill-ring WITHOUT mutating the
+  ;; buffer, then deactivate the region.  The span is clamped into [0,len] with
+  ;; s <= e (the vi-yank-range! idiom) so a mark left past a since-shrunk buffer
+  ;; cannot substring out of range; an empty span pushes nothing.
+  (define (cmd-copy-region es)
+    (when (region-active? es)
+      (let* ([gb (editor-state-gb es)]
+             [text (gap-buffer->string gb)]
+             [len (string-length text)]
+             [m (editor-state-mark es)]
+             [p (gap-buffer-cursor-pos gb)]
+             [s (max 0 (min (min m p) len))]
+             [e (max s (min (max m p) len))])
+        (when (< s e)
+          (kill-ring-push! (editor-state-kr es) (substring text s e)))
+        ;; Copying to the kill-ring breaks the yank-pop chain, exactly as a kill
+        ;; does: a following M-y must start a fresh replace, not delete against a
+        ;; length left over from an earlier C-y.
+        (editor-state-last-yank-len-set! es 0)
+        (editor-state-mark-set! es #f))))
+
+  ;; C-w with a region active: kill mark..point into the kill-ring, snapshotting
+  ;; first so the edit is undoable, then deactivate the region.  With NO region
+  ;; active, delegate to backward-kill-word so the bound key keeps its historical
+  ;; behaviour.  Same clamped span as cmd-copy-region.
   (define (cmd-kill-region es)
-    ;; For now, same as kill-line (full region support deferred)
-    (cmd-kill-line es))
+    (if (region-active? es)
+        (let* ([gb (editor-state-gb es)]
+               [text (gap-buffer->string gb)]
+               [len (string-length text)]
+               [m (editor-state-mark es)]
+               [p (gap-buffer-cursor-pos gb)]
+               [s (max 0 (min (min m p) len))]
+               [e (max s (min (max m p) len))])
+          (when (< s e)
+            ;; Snapshot only when the region is non-empty, so an empty region
+            ;; (mark == point) leaves no no-op entry on the undo stack.
+            (editor-snapshot! gb)
+            (kill-ring-push! (editor-state-kr es) (substring text s e))
+            (editor-replace-text! gb
+              (string-append (substring text 0 s) (substring text e len))
+              s))
+          (editor-state-last-yank-len-set! es 0)
+          (editor-state-mark-set! es #f))
+        (cmd-backward-kill-word es)))
 
   (define (cmd-kill-word es)
     (let* ([gb (editor-state-gb es)]
@@ -500,8 +662,13 @@
         (gap-buffer-move-cursor! gb -1)))
     (set-cursor-block (editor-state-out-port es)))
 
-  ;; Enter insert mode at cursor (i)
+  ;; Enter insert mode at cursor (i).  Dismiss any active vi visual first: every
+  ;; insert-entry key (i a I A o O s S C, and the vi c operator) funnels through
+  ;; here, so clearing the visual at this one chokepoint stops a selection open in
+  ;; normal mode from lingering as a highlight once typing begins.
   (define (cmd-enter-insert-mode es)
+    (vi-clear-visual!)
+    (reset-sexp-stack!)
     (editor-state-mode-set! es 'insert)
     (set-cursor-bar (editor-state-out-port es)))
 
@@ -858,16 +1025,35 @@
             (editor-state-done?-set! es #t)
             (editor-state-result-set! es (gap-buffer->string (editor-state-gb es))))))))
 
-  ;; Paste after cursor (p)
+  ;; Paste after cursor (p). Consult the selected vi register first: a named
+  ;; register inserts its snapshot under a fresh undo step; the unnamed default
+  ;; (vi-take-paste-register! returns #f) falls back to the kill-ring exactly as
+  ;; before, so emacs kills and a dd-then-p still paste. The cursor advance keeps
+  ;; the after-cursor placement for both paths.
   (define (cmd-paste-after es)
-    (let ([gb (editor-state-gb es)])
+    (dot-taint-undo/redo/paste!)
+    (let* ([gb (editor-state-gb es)]
+           [reg-text (vi-take-paste-register!)])
       (when (< (gap-buffer-cursor-pos gb) (gap-buffer-length gb))
         (gap-buffer-move-cursor! gb 1))
-      (cmd-yank es)))
+      (if (string? reg-text)
+          (begin
+            (editor-snapshot! gb)
+            (gap-buffer-insert-string! gb reg-text))
+          (cmd-yank es))))
 
-  ;; Paste before cursor (P) - same as yank
+  ;; Paste before cursor (P). As cmd-paste-after but without the cursor advance,
+  ;; so a named register (or the kill-ring fallback for the unnamed default)
+  ;; lands before the cursor.
   (define (cmd-paste-before es)
-    (cmd-yank es))
+    (dot-taint-undo/redo/paste!)
+    (let* ([gb (editor-state-gb es)]
+           [reg-text (vi-take-paste-register!)])
+      (if (string? reg-text)
+          (begin
+            (editor-snapshot! gb)
+            (gap-buffer-insert-string! gb reg-text))
+          (cmd-yank es))))
 
   ;; ======================================================================
   ;; Intelligent auto-indentation
@@ -1291,6 +1477,196 @@
             (editor-replace-text! gb new-text new-pos))))))
 
   ;; ======================================================================
+  ;; Structural s-expression selection (select / expand / contract)
+  ;; ======================================================================
+  ;;
+  ;; A single command selects the innermost meaningful unit at point; expand and
+  ;; contract then walk the nesting with a true retrace stack.  All three feed the
+  ;; ONE visible selection through the emacs mark + cursor -- apply-span! sets the
+  ;; mark at one end and moves the cursor to the other, so editor-selection-range
+  ;; paints the span in both insert (emacs) and normal modes, with no second
+  ;; highlighter.
+
+  ;; The expansion stack: half-open (start . end) conses, newest first, mirroring
+  ;; undo-stack.  It is a module variable, NOT an editor-state field -- a new
+  ;; field would change make-editor-state's arity.  reset-sexp-stack! clears it
+  ;; from the same chokepoints that clear the selection (insert-entry and submit).
+  (define *sexp-expansion-stack* '())
+  (define (reset-sexp-stack!) (set! *sexp-expansion-stack* '()))
+
+  ;; Bound the string literal point sits inside: forward-scan to the closing
+  ;; quote honouring backslash-escapes, then derive the opening quote by feeding
+  ;; the position past the close quote to backward-sexp-start's close-quote
+  ;; branch.  Returns (values open close), where close is the index of the closing
+  ;; quote, or (values #f #f).  Kept internal to editor.ss (an independent copy so
+  ;; this module stays decoupled from vi.ss).
+  (define (string-bounds-at text pos)
+    (let* ([len (string-length text)]
+           [close (let scan ([i pos])
+                    (cond
+                      [(fx>= i len) #f]
+                      [(char=? (string-ref text i) #\\) (scan (fx+ i 2))]
+                      [(char=? (string-ref text i) #\") i]
+                      [else (scan (fx+ i 1))]))]
+           [open (and close (backward-sexp-start text (fx+ close 1)))])
+      (if (and open close) (values open close) (values #f #f))))
+
+  ;; The innermost enclosing form as a half-open span, or (values #f #f).
+  (define (form-bounds text pos)
+    (let-values ([(open close) (find-enclosing-parens text pos)])
+      (if (and open close) (values open (fx+ close 1)) (values #f #f))))
+
+  ;; The innermost meaningful unit at point as a half-open (values start end), or
+  ;; (values #f #f).  Dispatch on the lexer state, then on the character at point:
+  ;; a string is the whole literal, an opener/closer selects its list, an atom is
+  ;; bounded end-first (so a list's first atom is still bounded past its opener),
+  ;; and whitespace falls to the enclosing form.  Every primitive's #f collapses
+  ;; to (values #f #f) so a malformed or edge position is a clean no-op.
+  (define (sexp-at-point text pos)
+    (let ([state (lexer-state-at text pos)]
+          [len (string-length text)])
+      (cond
+        [(eq? state 'in-string)
+         (let-values ([(open close) (string-bounds-at text pos)])
+           (if (and open close) (values open (fx+ close 1)) (values #f #f)))]
+        [(memq state '(in-line-comment in-block-comment))
+         (form-bounds text pos)]
+        [else
+         (let ([ch (and (fx< pos len) (string-ref text pos))])
+           (cond
+             [(and ch (memv ch '(#\( #\[)))
+              (let ([close (find-matching-close text pos)])
+                (if close (values pos (fx+ close 1)) (values #f #f)))]
+             [(and ch (memv ch '(#\) #\])))
+              (let ([open (find-matching-paren text pos)])
+                (if open (values open (fx+ pos 1)) (values #f #f)))]
+             [(and ch (not (char-whitespace? ch)))
+              (let* ([end (forward-sexp-end text pos)]
+                     [start (and end (backward-sexp-start text end))])
+                (if (and start end) (values start end) (values #f #f)))]
+             [else (form-bounds text pos)]))])))
+
+  ;; Show the half-open span [start,end) as the ONE visible selection.  Clear any
+  ;; active vi visual first (so the mark path is not masked in normal mode), set
+  ;; the emacs mark at start, and move the cursor to end.  No snapshot -- a
+  ;; selection is not an edit.  editor-selection-range's mark branch then resolves
+  ;; (start . end) in both insert and normal mode.
+  (define (apply-span! es start end)
+    (vi-clear-visual!)
+    (editor-state-mark-set! es start)
+    (let ([gb (editor-state-gb es)])
+      (gap-buffer-move-cursor! gb (- end (gap-buffer-cursor-pos gb)))))
+
+  ;; Select the innermost s-expression at point and seed the expansion stack.  A
+  ;; no-op (the selection is left untouched) when there is no meaningful unit --
+  ;; an empty buffer, or the whitespace between top-level forms.
+  (define (cmd-select-sexp es)
+    (let* ([gb (editor-state-gb es)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [text (gap-buffer->string gb)])
+      (reset-sexp-stack!)
+      (let-values ([(start end) (sexp-at-point text pos)])
+        (when (and start end (fx< start end))
+          (apply-span! es start end)
+          (set! *sexp-expansion-stack*
+                (cons (cons start end) *sexp-expansion-stack*))))))
+
+  ;; The stack is fresh only while the live selection still equals the span at its
+  ;; top.  Any cursor move or edit changes editor-selection-range, so the compare
+  ;; fails and the next expand transparently re-seeds from the new point -- the
+  ;; locked reset condition for a moved cursor or an edited buffer.
+  (define (stack-fresh? es)
+    (and (pair? *sexp-expansion-stack*)
+         (let ([cur (editor-selection-range es)])
+           (and cur (equal? cur (car *sexp-expansion-stack*))))))
+
+  ;; Progressive select-then-expand.  On a stale or empty stack (a fresh start)
+  ;; this selects the innermost unit at point -- the first press selects, it does
+  ;; not also grow.  On a fresh stack it grows the selection to the next enclosing
+  ;; form, taken from the START index of the current top span (never the live
+  ;; cursor), and no-ops at the outermost form (the empty [0,pos) window there
+  ;; yields no enclosing pair).
+  (define (cmd-expand-region es)
+    (if (not (stack-fresh? es))
+        (cmd-select-sexp es)
+        (let ([text (gap-buffer->string (editor-state-gb es))])
+          (let-values ([(open close)
+                        (find-enclosing-parens text (car (car *sexp-expansion-stack*)))])
+            (when (and open close)
+              (let ([start open] [end (fx+ close 1)])
+                (set! *sexp-expansion-stack*
+                      (cons (cons start end) *sexp-expansion-stack*))
+                (apply-span! es start end)))))))
+
+  ;; True retrace inward: pop the stack head and re-apply exactly the previously
+  ;; pushed span, mirroring cmd-undo popping undo-stack.  Only when the stack is
+  ;; fresh (still a live structural selection) and a previous span remains --
+  ;; never contract past the seed.
+  (define (cmd-contract-region es)
+    (when (and (stack-fresh? es) (pair? (cdr *sexp-expansion-stack*)))
+      (set! *sexp-expansion-stack* (cdr *sexp-expansion-stack*))
+      (let ([span (car *sexp-expansion-stack*)])
+        (apply-span! es (car span) (cdr span)))))
+
+  ;; Transpose the s-expression AT point with its next sibling (emacs
+  ;; transpose-sexps semantics).  Anchor A on the sexp at point bound-by-end:
+  ;; end-a bounds A by its end, then backward-sexp-start walks back from that end
+  ;; to A's start -- so a cursor sitting on a non-first child anchors on THAT
+  ;; child, never on its left sibling.  The next sibling B is found by running
+  ;; forward-sexp-end again from A's end.  A safe no-op (no snapshot, no change)
+  ;; when there is no next sibling: forward-sexp-end returns #f at a closer or the
+  ;; buffer edge, so a last / single child yields end-b #f and the guard fails.
+  ;; The swap is a single length-preserving whole-string rebuild applied through
+  ;; editor-replace-text! (never char-by-char), so paredit's per-key auto-close
+  ;; path cannot fire, the inter-form gap is carried across verbatim, and point
+  ;; lands immediately after the moved form.  editor-snapshot! is taken INSIDE the
+  ;; guard (guard-then-snapshot, the cmd-kill-region shape) so a no-op leaves the
+  ;; undo history untouched.
+  (define (cmd-transpose-sexp es)
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [end-a (forward-sexp-end text pos)]
+           [start-a (and end-a (backward-sexp-start text end-a))]
+           [end-b (and end-a (forward-sexp-end text end-a))]
+           [start-b (and end-b (backward-sexp-start text end-b))])
+      (when (and start-a end-a end-b start-b (fx<= end-a start-b))
+        (editor-snapshot! gb)
+        (let ([new-text (string-append
+                          (substring text 0 start-a)
+                          (substring text start-b end-b)      ; B moves before A
+                          (substring text end-a start-b)      ; inter-form gap
+                          (substring text start-a end-a)      ; A moves after B
+                          (substring text end-b (string-length text)))])
+          (editor-replace-text! gb new-text end-b)))))
+
+  ;; The symmetric mirror of cmd-transpose-sexp: swap the s-expression AT point
+  ;; (anchored the SAME bound-by-end way) with the PREVIOUS sibling.  The previous
+  ;; sibling P is found by stepping backward-sexp-start from A's start, then
+  ;; bounding it with forward-sexp-end.  A safe no-op (no snapshot, no change) when
+  ;; there is no previous sibling: backward-sexp-start returns #f at an opener, so
+  ;; a first child / top-level first form yields start-p #f and the guard fails.
+  ;; Same guard-then-snapshot discipline and length-preserving whole-string
+  ;; rebuild; point lands after the moved A in its new, earlier position.
+  (define (cmd-transpose-sexp-backward es)
+    (let* ([gb (editor-state-gb es)]
+           [text (gap-buffer->string gb)]
+           [pos (gap-buffer-cursor-pos gb)]
+           [end-a (forward-sexp-end text pos)]
+           [start-a (and end-a (backward-sexp-start text end-a))]
+           [start-p (and start-a (backward-sexp-start text start-a))]
+           [end-p (and start-p (forward-sexp-end text start-p))])
+      (when (and start-a end-a start-p end-p (fx<= end-p start-a))
+        (editor-snapshot! gb)
+        (let ([new-text (string-append
+                          (substring text 0 start-p)
+                          (substring text start-a end-a)      ; A moves before P
+                          (substring text end-p start-a)      ; inter-form gap
+                          (substring text start-p end-p)      ; P moves after A
+                          (substring text end-a (string-length text)))])
+          (editor-replace-text! gb new-text (fx+ start-p (fx- end-a start-a)))))))
+
+  ;; ======================================================================
   ;; Undo/Redo state
   ;; ======================================================================
 
@@ -1326,6 +1702,7 @@
     (undo-push-snapshot! (gap-buffer->string gb) (gap-buffer-cursor-pos gb)))
 
   (define (cmd-undo es)
+    (dot-taint-undo/redo/paste!)
     (let ([gb (editor-state-gb es)])
       (when (pair? undo-stack)
         (let ([current (cons (gap-buffer->string gb) (gap-buffer-cursor-pos gb))]
@@ -1339,6 +1716,7 @@
             (gap-buffer-move-cursor! gb (- (min target-pos len) (gap-buffer-cursor-pos gb))))))))
 
   (define (cmd-redo es)
+    (dot-taint-undo/redo/paste!)
     (let ([gb (editor-state-gb es)])
       (when (pair? redo-stack)
         (let ([current (cons (gap-buffer->string gb) (gap-buffer-cursor-pos gb))]
@@ -1352,55 +1730,183 @@
             (gap-buffer-move-cursor! gb (- (min target-pos len) (gap-buffer-cursor-pos gb))))))))
 
   ;; ======================================================================
+  ;; Dot-repeat state (the last change's keystrokes + the in-flight recording)
+  ;; ======================================================================
+
+  ;; The committed last change: the recorded keystroke bytes of the most recent
+  ;; buffer-modifying change (or #f before any change).  Modelled on the
+  ;; undo-stack module state above.  This PERSISTS across prompts -- like vim's
+  ;; redo register -- so . repeats it on a later line; only reset-undo-state!'s
+  ;; sibling reset-dot-recording! (below) clears the *in-flight* recording.
+  (define *dot-last-change* #f)
+  ;; #t while a change is being recorded at the main-loop boundary.
+  (define *dot-recording?* #f)
+  ;; The buffer text snapshotted when the current change began; the change is
+  ;; committed only when the buffer differs from this at the idle boundary.
+  (define *dot-change-start-text* "")
+  ;; The initiating key-event of the in-flight change ('unset until the first key
+  ;; of the change is read).  Consulted by dot-excluded-event? at commit time.
+  (define *dot-initiating-evt* 'unset)
+  ;; #t when the in-flight change has invoked a replay (a . or N.).  Such a change
+  ;; must never be committed as the last change: dot-excluded-event? catches a
+  ;; bare . by its initiating key, but N. begins with a digit, so without this
+  ;; flag N. would commit itself ("3.") and a following . would replay a . -- an
+  ;; unbounded recursion.  Set by the replay driver, reset at each change-start.
+  (define *dot-change-replayed?* #f)
+  ;; #t when the in-flight change actually PERFORMED an undo, redo or paste.
+  ;; dot-excluded-event? catches a BARE u / p / P / C-r / C-_ / M-/ by the change's
+  ;; initiating key, but a leading count makes the initiating key a digit (2u, 3p,
+  ;; 2P, 2C-r), slipping past that check -- so the counted undo / redo / paste would
+  ;; be committed as the last change and a later . would replay it.  This flag
+  ;; classifies the change by what it DID rather than its first key: it is raised
+  ;; inside cmd-undo / cmd-redo / cmd-paste-after / cmd-paste-before whenever a
+  ;; recording is live, and consulted in the commit guard beside dot-excluded-event?
+  ;; (kept as belt-and-braces for the bare forms).  Reset at each change-start,
+  ;; mirroring *dot-change-replayed?*.
+  (define *dot-change-undo/redo/paste?* #f)
+
+  ;; Raise the undo/redo/paste taint for the in-flight change, but only while a
+  ;; change is being recorded -- outside a recording there is nothing to taint (and
+  ;; the flag is cleared afresh at the next change-start regardless).
+  (define (dot-taint-undo/redo/paste!)
+    (when *dot-recording?*
+      (set! *dot-change-undo/redo/paste?* #t)))
+
+  ;; Reset the in-flight recording (called once per prompt, beside the vi session
+  ;; reset).  The committed last change is deliberately LEFT intact so a change
+  ;; made on a previous line stays repeatable on this one.
+  (define (reset-dot-recording!)
+    (set! *dot-recording?* #f)
+    (set! *dot-initiating-evt* 'unset)
+    (set! *dot-change-replayed?* #f)
+    (set! *dot-change-undo/redo/paste?* #f)
+    (current-key-recording #f))
+
+  ;; The recorded bytes of the last change (white-box getter for the test).
+  (define (editor-dot-last-change) *dot-last-change*)
+
+  ;; #t when the initiating key of a change must NOT overwrite the last change:
+  ;; . itself (else it would self-reference), the vi u undo and p / P paste, the
+  ;; emacs undo C-_ and redo M-/, the reverse-history finder C-r, and the
+  ;; terminal bracketed-paste start.  In normal mode vi-process-key consumes
+  ;; neither C-_ nor M-/ (its #\/ arm is a 'char search, not a 'meta event), so
+  ;; both fall through to the normal keymap and MUTATE the buffer via cmd-undo /
+  ;; cmd-redo; unless excluded here the boundary would commit an undo/redo as the
+  ;; last change and a later . would replay it.  A non-key-event (the 'unset
+  ;; sentinel) is never excluded -- the buffer-changed guard already suppresses a
+  ;; commit that has no real initiating key.
+  (define (dot-excluded-event? evt)
+    (and (key-event? evt)
+         (let ([type (key-event-type evt)]
+               [val (key-event-value evt)])
+           (cond
+             [(eq? type 'char) (memv val '(#\. #\u #\p #\P))]
+             [(eq? type 'ctrl) (or (eqv? val #\_) (eqv? val #\r))]
+             [(eq? type 'meta) (eqv? val #\/)]
+             [(eq? type 'special) (eq? val 'paste-start)]
+             [else #f]))))
+
+  ;; ======================================================================
   ;; Auto-suggestion state (fish-style ghost text)
   ;; ======================================================================
 
   (define suggestion-text "")  ; the ghost suffix to display after cursor
 
-  ;; Update suggestion: search history for prefix match of current buffer.
-  ;; Only suggests when cursor is at end of buffer.
+  ;; history-ghost-suffix: compute the dim ghost suffix to show after the cursor,
+  ;; or "" when none.  Pure over the history object.  Keys the search off `before`
+  ;; (the typed before-cursor prefix, ignoring paredit's auto-inserted trailing
+  ;; closers) and only offers a suggestion when `after` is empty or all closing
+  ;; delimiters/quotes -- i.e. the cursor sits at the end of the typed region.
+  ;; The suffix is cut at the typed-prefix length, so it continues exactly where
+  ;; the user stopped typing.  Bounds are safe: `before` is a proven string-prefix?
+  ;; of `entry`, so (string-length before) <= (string-length entry).
+  (define (history-ghost-suffix before after history)
+    (if (or (= (string-length before) 0)
+            (not (only-closing-delimiters? after)))
+        ""
+        (let* ([entries (history-entries history)]
+               [n (vector-length entries)]
+               [idx (history-prefix-search-backward history before (- n 1))])
+          (if idx
+              (let ([entry (vector-ref entries idx)])
+                (substring entry (string-length before) (string-length entry)))
+              ""))))
+
+  ;; Update suggestion: search history for a prefix match of the typed text (the
+  ;; before-cursor string), ignoring paredit's auto-inserted trailing closers, and
+  ;; show when the cursor is at the end of the typed region.  Delegates to the pure
+  ;; history-ghost-suffix seam.
   ;; Note: editor-history is referenced via closure; must be defined before first call.
   (define (update-suggestion! gb)
-    (let* ([text (gap-buffer->string gb)]
-           [pos (gap-buffer-cursor-pos gb)]
-           [len (string-length text)])
-      (cond
-        [(and (= pos len) (> len 0))
-         (let* ([entries (history-entries editor-history)]
-                [n (vector-length entries)]
-                [idx (history-prefix-search-backward editor-history text (- n 1))])
-           (if idx
-               (let ([entry (vector-ref entries idx)])
-                 (set! suggestion-text (substring entry len (string-length entry))))
-               (set! suggestion-text "")))]
-        [else (set! suggestion-text "")])))
+    (set! suggestion-text
+      (history-ghost-suffix (gap-buffer-before-string gb)
+                            (gap-buffer-after-string gb)
+                            editor-history)))
 
-  ;; Accept suggestion: insert ghost text into buffer.
+  ;; Accept suggestion: land the buffer exactly on the matched history entry,
+  ;; replacing paredit's auto-inserted trailing closers rather than inserting
+  ;; before them (which would double the closers, e.g. "(+ 1 2))").
+  ;;
+  ;; The ghost only ever shows when the after-cursor text is empty or entirely
+  ;; closing delimiters -- history-ghost-suffix gates on only-closing-delimiters?
+  ;; -- and suggestion-text is that entry's tail, which itself ends with those
+  ;; same closers.  So delete forward to end-of-buffer first (that only removes
+  ;; closers: the gate guarantees nothing else can sit after the cursor while a
+  ;; ghost is showing), then lay down the tail.  The result is exactly
+  ;; `before + suggestion-text` == the entry, balanced, with no doubled closer.
+  ;; The cursor ends at end-of-buffer, just past the inserted text.
   (define (cmd-accept-suggestion es)
     (let ([gb (editor-state-gb es)])
       (when (> (string-length suggestion-text) 0)
         (let ([text suggestion-text])
           (set! suggestion-text "")
+          ;; Drop the auto-inserted closers (the only thing that can follow the
+          ;; cursor while a ghost shows) so the tail is not stacked on top of them.
+          (let drop ()
+            (when (< (gap-buffer-cursor-pos gb) (gap-buffer-length gb))
+              (gap-buffer-delete-forward! gb)
+              (drop)))
           (do ([i 0 (+ i 1)])
               ((= i (string-length text)))
             (gap-buffer-insert! gb (string-ref text i)))))))
 
-  ;; Suggestion-aware movement: accept ghost text if at end of buffer.
+  ;; ghost-acceptable?: may a showing ghost be laid down right now?  Only when a
+  ;; non-empty suggestion-text is matched by a LIVE after-cursor string that is
+  ;; still empty or all closing delimiters -- the exact gate history-ghost-suffix
+  ;; applied when it computed the ghost.  Re-reading the buffer here, rather than
+  ;; trusting the module variable alone, refuses a ghost left stale by an
+  ;; intervening edit: update-suggestion! is suppressed while a completion menu is
+  ;; up, so a Tab that rewrites the line leaves suggestion-text describing text
+  ;; the cursor no longer sits on.  An empty after-cursor string stays acceptable,
+  ;; so a literal end-of-buffer accept keeps working.
+  (define (ghost-acceptable? gb)
+    (and (> (string-length suggestion-text) 0)
+         (only-closing-delimiters? (gap-buffer-after-string gb))))
+
+  ;; Suggestion-aware movement: accept the ghost when one is genuinely acceptable
+  ;; (ghost-acceptable?), else move normally.  The buffer re-check means an accept
+  ;; only ever lands the entry at real end-of-buffer or before paredit's
+  ;; auto-inserted closers, never on top of a stale suggestion.  With no
+  ;; acceptable ghost, Right still moves the cursor forward one character.
   (define (cmd-forward-char-or-accept es)
-    (let* ([gb (editor-state-gb es)]
-           [pos (gap-buffer-cursor-pos gb)]
-           [len (gap-buffer-length gb)])
-      (if (and (= pos len) (> (string-length suggestion-text) 0))
-          (cmd-accept-suggestion es)
-          (cmd-forward-char es))))
+    (if (ghost-acceptable? (editor-state-gb es))
+        (cmd-accept-suggestion es)
+        (cmd-forward-char es)))
 
   (define (cmd-end-of-line-or-accept es)
-    (let* ([gb (editor-state-gb es)]
-           [pos (gap-buffer-cursor-pos gb)]
-           [len (gap-buffer-length gb)])
-      (if (and (= pos len) (> (string-length suggestion-text) 0))
-          (cmd-accept-suggestion es)
-          (cmd-end-of-line es))))
+    (if (ghost-acceptable? (editor-state-gb es))
+        (cmd-accept-suggestion es)
+        (cmd-end-of-line es)))
+
+  ;; Ctrl-Right: accept an acceptable ghost like Right/End, else fall through to
+  ;; the ordinary Ctrl-Right word motion.  Keeping word movement as the no-ghost
+  ;; path makes the explicit chord a superset of its usual motion and stays
+  ;; symmetric with Ctrl-Left, so nothing regresses when no suggestion is on
+  ;; screen.
+  (define (cmd-forward-word-or-accept es)
+    (if (ghost-acceptable? (editor-state-gb es))
+        (cmd-accept-suggestion es)
+        (cmd-forward-word es)))
 
   ;; Ctrl-Z: drop to the shell. VSUSP is disabled in raw mode, so Ctrl-Z reaches
   ;; the editor as byte 0x1A rather than a SIGTSTP the blocking read would defer;
@@ -1427,7 +1933,14 @@
     (keymap-bind! km (list (make-key-event 'meta #\f 0)) cmd-forward-word)
     (keymap-bind! km (list (make-key-event 'meta #\b 0)) cmd-backward-word)
 
-    ;; Arrow keys and Home/End (Right/End accept ghost suggestion at EOB)
+    ;; Arrow keys and Home/End.  Right/End accept the history ghost whenever one
+    ;; is showing -- including when the cursor sits before paredit's auto-inserted
+    ;; closers -- else move normally.  Ctrl-Right is deliberately NOT bound in this
+    ;; base layer: bind-paredit-keys! runs after it and claims Ctrl-Right for
+    ;; forward-slurp in both keymaps, so a base bind would be immediately
+    ;; overwritten (dead).  The explicit Ctrl-Right accept is installed in the
+    ;; insert keymap (make-insert-keymap), where history ghosts arise while typing;
+    ;; normal-mode Ctrl-Right stays paredit's forward-slurp.
     (keymap-bind! km (list (make-key-event 'special 'left 0)) cmd-backward-char)
     (keymap-bind! km (list (make-key-event 'special 'right 0)) cmd-forward-char-or-accept)
     (keymap-bind! km (list (make-key-event 'special 'home 0)) cmd-beginning-of-line)
@@ -1437,13 +1950,21 @@
 
     ;; Kill (Emacs)
     (keymap-bind! km (list (make-key-event 'ctrl #\k 0)) cmd-kill-line)
-    (keymap-bind! km (list (make-key-event 'ctrl #\w 0)) cmd-backward-kill-word)
+    ;; C-w kills the region when a mark is set, else backward-kill-word.
+    ;; cmd-kill-region already owns that fallback, so bind it directly rather
+    ;; than re-testing the region here.
+    (keymap-bind! km (list (make-key-event 'ctrl #\w 0)) cmd-kill-region)
     (keymap-bind! km (list (make-key-event 'meta #\d 0)) cmd-kill-word)
     (keymap-bind! km (list (make-key-event 'special 'backspace MOD_ALT)) cmd-backward-kill-word)
 
     ;; Yank
     (keymap-bind! km (list (make-key-event 'ctrl #\y 0)) cmd-yank)
     (keymap-bind! km (list (make-key-event 'meta #\y 0)) cmd-yank-pop)
+
+    ;; Emacs mark / region: C-Space sets the mark (the NUL key event -- < 32, so
+    ;; cmd-self-insert never claims it), M-w copies mark..point to the kill-ring.
+    (keymap-bind! km (list (make-key-event 'char (integer->char 0) 0)) cmd-set-mark)
+    (keymap-bind! km (list (make-key-event 'meta #\w 0)) cmd-copy-region)
 
     ;; History navigation
     (keymap-bind! km (list (make-key-event 'special 'up 0)) cmd-history-prev)
@@ -1522,10 +2043,52 @@
       paredit-key-sequences))
 
   ;; Shared structural and emacs-style bindings applied to both keymaps.
-  ;; Backward-compatible wrapper calling both base and paredit layers.
+  ;; Backward-compatible wrapper calling the base, paredit, and structural
+  ;; s-expression layers.  Both make-insert-keymap and make-normal-keymap call
+  ;; this, so the configurable s-expression keys are installed into BOTH the
+  ;; emacs/insert and vi/normal keymaps at construction, default-on.
   (define (bind-common-keys! km)
     (bind-base-keys! km)
-    (bind-paredit-keys! km))
+    (bind-paredit-keys! km)
+    (bind-sexp-keys! km))
+
+  ;; ======================================================================
+  ;; Configurable structural s-expression keybindings
+  ;; ======================================================================
+
+  ;; The structural select / expand / contract / transpose / drag commands are
+  ;; reachable out of the box through Lispy / lispyville (Doom-Emacs) default
+  ;; keys, but every key is held in an exported parameter so a user's init can
+  ;; rebind it.  Each default is the exact key-event the terminal decoder yields:
+  ;;   C-M-SPC   = (meta #\nul 0)     -- ESC+NUL: progressive select, then expand
+  ;;   M-SPC     = (meta #\space 0)   -- ESC+space: contract
+  ;;   C-M-t     = (ctrl #\t MOD_ALT) -- ESC+C-t: transpose forward (mirrors C-M-f)
+  ;;   M-j / M-k = (meta #\j 0) / (meta #\k 0) -- drag forward / backward
+  ;; Every default is a 'meta or 'ctrl event, so vi never consumes it: the keys
+  ;; fall through to the keymap in normal and visual modes and reach it directly
+  ;; in insert mode.
+  (define sexp-expand-key    (make-parameter (make-key-event 'meta (integer->char 0) 0)))
+  (define sexp-contract-key  (make-parameter (make-key-event 'meta #\space 0)))
+  (define sexp-transpose-key (make-parameter (make-key-event 'ctrl #\t MOD_ALT)))
+  (define sexp-drag-fwd-key  (make-parameter (make-key-event 'meta #\j 0)))
+  (define sexp-drag-back-key (make-parameter (make-key-event 'meta #\k 0)))
+
+  ;; Bind the structural commands into KM, reading each key from its parameter at
+  ;; call time (never a literal) so a re-invocation after an init override
+  ;; installs the new key.  keymap-bind! overwrites any existing entry for a key,
+  ;; so this is idempotent and re-invokable: an init can set a parameter (e.g.
+  ;; (sexp-transpose-key (make-key-event 'ctrl #\y MOD_ALT))) then call
+  ;; (bind-sexp-keys! editor-insert-keymap) and (bind-sexp-keys! editor-normal-keymap)
+  ;; to rebind without touching source.  Drag-forward is transpose-forward, so it
+  ;; shares cmd-transpose-sexp with the transpose key.  These binds are untouched
+  ;; by disable-paredit! (which only unbinds the paredit set), so structural
+  ;; selection stays on when paredit is toggled off.
+  (define (bind-sexp-keys! km)
+    (keymap-bind! km (list (sexp-expand-key))    cmd-expand-region)
+    (keymap-bind! km (list (sexp-contract-key))  cmd-contract-region)
+    (keymap-bind! km (list (sexp-transpose-key)) cmd-transpose-sexp)
+    (keymap-bind! km (list (sexp-drag-fwd-key))  cmd-transpose-sexp)
+    (keymap-bind! km (list (sexp-drag-back-key)) cmd-transpose-sexp-backward))
 
   ;; ======================================================================
   ;; Paredit toggle state
@@ -1576,9 +2139,11 @@
       ;; Escape -> normal mode
       (keymap-bind! km (list (make-key-event 'special 'escape 0)) cmd-enter-normal-mode)
 
-      ;; Ctrl+Left/Right: word movement in insert mode (overrides paredit slurp/barf)
+      ;; Ctrl+Left/Right: word movement in insert mode (overrides paredit slurp/barf).
+      ;; Ctrl-Right additionally accepts a showing ghost suggestion before moving,
+      ;; so the entry can be taken through paredit's auto-inserted closers.
       (keymap-bind! km (list (make-key-event 'special 'left MOD_CTRL)) cmd-backward-word)
-      (keymap-bind! km (list (make-key-event 'special 'right MOD_CTRL)) cmd-forward-word)
+      (keymap-bind! km (list (make-key-event 'special 'right MOD_CTRL)) cmd-forward-word-or-accept)
 
       km))
 
@@ -1701,7 +2266,15 @@
       (set! completion-start 0)
       (set! completion-grid-cols 1)
       (set! completion-grid-rows 0)
-      (set! completion-scroll-offset 0)))
+      (set! completion-scroll-offset 0)
+      ;; A completion changed the buffer, so any history ghost computed before it
+      ;; is now stale -- update-suggestion! is suppressed while the menu is up, so
+      ;; suggestion-text still describes the pre-completion line.  Clear it here so
+      ;; the accept path (Right/End) can never lay a stale suffix onto whatever the
+      ;; cursor now sits on; the next render recomputes a fresh ghost.  Guarded
+      ;; inside the unless: the plain-submit ghost-clear in finish! runs with no
+      ;; active menu, where this branch is skipped anyway.
+      (set! suggestion-text "")))
 
   ;; ======================================================================
   ;; Completion helpers
@@ -2052,72 +2625,166 @@
       (set! completion-index new-idx)
       (editor-replace-text! gb new-text new-pos)))
 
-  ;; Track number of completion menu lines currently displayed
+  ;; Track the completion menu currently on screen: how many rows it drew, and
+  ;; which way it was anchored ('down dropdown / 'up drop-up).  completion-menu-lines
+  ;; was written-only before; it now drives the pre-repaint clear.  The place is
+  ;; needed because a drop-up's rows sit ABOVE the prompt, out of reach of the
+  ;; downward clear render-line does, so the menu clear must wipe them explicitly.
   (define completion-menu-lines 0)
+  (define completion-menu-place 'down)
+
+  ;; Predict render-completion-grid's column/row layout for the current candidate
+  ;; list at term-cols WITHOUT drawing it, mirroring the grid's own geometry so the
+  ;; drawn height is known before the draw -- needed to anchor the menu and to bound
+  ;; its rows.  Candidate names never carry an escape, so ansi-display-width matches
+  ;; the grid's own width measure for them, and descriptions force a single column
+  ;; exactly as the grid does.
+  (define (completion-grid-dimensions term-cols)
+    (let* ([n (length completion-candidates)]
+           [has-descs? (not (null? completion-descriptions))]
+           [max-name-w (fold-left
+                         (lambda (mx s) (max mx (ansi-display-width s)))
+                         0 completion-candidates)]
+           [cell-width (if has-descs?
+                           term-cols
+                           (+ 2 (min max-name-w (quotient term-cols 2)) 2))]
+           [grid-cols (if has-descs?
+                          1
+                          (max 1 (quotient term-cols cell-width)))]
+           [grid-rows (let ([q (quotient n grid-cols)]
+                            [r (remainder n grid-cols)])
+                        (if (> r 0) (+ q 1) q))])
+      (values grid-cols grid-rows)))
+
+  ;; The height render-completion-grid draws for grid-rows candidate rows under a
+  ;; visible cap: the capped rows plus a pager row when the list overflows the cap
+  ;; -- exactly the menu-lines the grid returns for the same inputs.
+  (define (completion-menu-drawn-rows grid-rows max-visible)
+    (+ (min grid-rows max-visible)
+       (if (> grid-rows max-visible) 1 0)))
+
+  ;; Choose the menu anchor purely from the room below the edit line and the menu's
+  ;; height: a dropdown by default, a drop-up when the room below cannot hold the
+  ;; menu.  Pure over its two inputs, so the choice is unit-testable off a terminal.
+  (define (menu-anchor-place rows-below menu-height)
+    (if (< rows-below menu-height) 'up 'down))
+
+  ;; The display column of the edit cursor on its own visual row, matching
+  ;; render-line's own final positioning (prompt width on the first row, plus the
+  ;; width since the last newline, one-based) so the cursor sits at the edit point
+  ;; while the menu is shown.  before is escape-free, so ansi-display-width is its
+  ;; display width.
+  (define (edit-cursor-column prompt-width before cursor-row)
+    (let* ([len (string-length before)]
+           [nl-start (let loop ([i (- len 1)])
+                       (cond [(< i 0) 0]
+                             [(char=? (string-ref before i) #\newline) (+ i 1)]
+                             [else (loop (- i 1))]))])
+      (+ (if (= cursor-row 0) prompt-width 0)
+         (ansi-display-width (substring before nl-start len))
+         1)))
 
   ;; Render edit line + optional completion menu + ghost suggestion.
-  ;; Returns new prev-lines value for the next render call.
-  (define (render-with-menu port prompt gb prev-lines)
+  ;; Returns new prev-lines value for the next render call.  es is threaded in so
+  ;; the redisplay can compute the selection span and the mode indicator.
+  (define (render-with-menu port prompt gb prev-lines es)
     ;; Update suggestion on every render (cheap: just a prefix search)
     (when (null? completion-candidates)
       (update-suggestion! gb))
-    ;; render-line with ghost suggestion (prev-lines is cursor-row from last render;
-    ;; \x1b[J from prompt line clears old content + old menu automatically)
     (let* ([term-cols (editor-query-terminal-cols)]
-           [lines (if (and (null? completion-candidates)
-                           (> (string-length suggestion-text) 0))
-                      (render-line/suggestion port prompt gb
-                        prev-lines suggestion-text term-cols)
-                      (render-line port prompt gb prev-lines term-cols))])
+           [ansi? (ansi-ok? port)]
+           ;; Pre-clear a stale drop-up left by the previous render.  render-line
+           ;; (below) moves up to the prompt line and clears to end of screen, which
+           ;; wipes the edit line and every row BELOW it -- so a previous dropdown is
+           ;; cleared for free, and must NOT be over-cleared here (climbing over a
+           ;; below-line span would eat the edit line).  A previous drop-up, though,
+           ;; drew its rows ABOVE the prompt, out of that downward clear's reach; wipe
+           ;; them now, driven by the tracked span.  The cursor sits prev-lines rows
+           ;; below the prompt: climb to the prompt, clear the tracked span above it,
+           ;; and drop back to the prompt row, leaving render-line nothing above to do.
+           [start-lines
+            (if (and ansi? (eq? completion-menu-place 'up) (> completion-menu-lines 0))
+                (begin
+                  (when (> prev-lines 0)
+                    (display "\x1b;[" port) (display prev-lines port) (display "A" port))
+                  (overlay-clear! port completion-menu-lines ansi?)
+                  (display "\x1b;[" port) (display completion-menu-lines port) (display "B" port)
+                  0)
+                prev-lines)]
+           ;; The selection span and the mode indicator, computed once from es.
+           ;; When either is active -- a vi visual / emacs selection to highlight,
+           ;; or a non-insert mode to announce -- the redisplay routes through the
+           ;; selection-aware renderer; the plain and ghost-suggestion paths stay
+           ;; untouched for insert-mode typing.
+           [sel-range (editor-selection-range es)]
+           [indicator (editor-mode-indicator es)]
+           ;; render-line clears from the prompt line down (\x1b[J) and redraws the
+           ;; edit line, wiping any dropdown below it.
+           [lines (cond
+                    [(or sel-range indicator)
+                     (render-line/selection port prompt gb
+                       start-lines sel-range indicator term-cols)]
+                    [(and (null? completion-candidates)
+                          (> (string-length suggestion-text) 0))
+                     (render-line/suggestion port prompt gb
+                       start-lines suggestion-text term-cols)]
+                    [else (render-line port prompt gb start-lines term-cols)])])
       (if (not (null? completion-candidates))
-          ;; Save cursor, move to end of content, render menu, restore cursor
-          (begin
-            (when (ansi-ok? port)
-              (display "\x1b;7" port))  ; save cursor position
-            ;; Move cursor to end of buffer content (past all lines)
-            (let* ([text (string-append (gap-buffer-before-string gb)
-                                        (gap-buffer-after-string gb))]
-                   [before (gap-buffer-before-string gb)]
-                   [total-lines (let ([len (string-length text)])
-                                  (let lp ([i 0] [n 0])
-                                    (if (>= i len) n
-                                        (lp (+ i 1) (if (char=? (string-ref text i) #\newline)
-                                                        (+ n 1) n)))))]
-                   [cursor-row (let ([blen (string-length before)])
-                                 (let lp ([i 0] [n 0])
-                                   (if (>= i blen) n
-                                       (lp (+ i 1) (if (char=? (string-ref before i) #\newline)
-                                                       (+ n 1) n)))))]
-                   [lines-after (- total-lines cursor-row)])
-              ;; Move down to end of content, then to the beginning of the next
-              ;; line -- cursor positioning, gated on the render target.
-              (when (ansi-ok? port)
-                (when (> lines-after 0)
-                  (display "\x1b;[" port)
-                  (display lines-after port)
-                  (display "B" port))
-                (display "\r" port))
-              ;; Render menu (fish-style grid)
-              (let ([term-cols (editor-query-terminal-cols)])
-                (let-values ([(menu-lines gcols grows soff)
-                              (render-completion-grid port
-                                (if (null? completion-descriptions)
-                                    (map cons completion-candidates completion-positions)
-                                    (map list completion-candidates completion-positions completion-descriptions))
-                                completion-index
-                                term-cols
-                                10)])
-                  ;; Restore cursor to edit position
-                  (when (ansi-ok? port)
-                    (display "\x1b;8" port))
-                  (flush-output-port port)
-                  (set! completion-menu-lines menu-lines)
-                  (set! completion-grid-cols gcols)
-                  (set! completion-grid-rows grows)
-                  (set! completion-scroll-offset soff)
-                  lines))))
+          ;; Draw the menu in place as a dropdown or drop-up through the overlay
+          ;; helper -- relative motion only, no cursor save/restore.
+          (let* ([text (string-append (gap-buffer-before-string gb)
+                                      (gap-buffer-after-string gb))]
+                 [before (gap-buffer-before-string gb)]
+                 [prompt-width (ansi-display-width prompt)]
+                 [total-lines (count-visual-lines prompt-width text term-cols)]
+                 [cursor-row (cursor-visual-row prompt-width before term-cols)]
+                 [lines-after (- total-lines cursor-row)]
+                 [term-rows (editor-query-terminal-rows)]
+                 ;; Rows on screen below the edit block, and the room a menu may take
+                 ;; above or below it.  The editor does not track the block's absolute
+                 ;; row, so treat it as top-anchored: an upper bound that keeps the
+                 ;; menu inside the terminal.
+                 [rows-below (max 0 (- (- term-rows 1) total-lines))]
+                 [room (max 1 (- (- term-rows 1) total-lines))]
+                 [entries (if (null? completion-descriptions)
+                              (map cons completion-candidates completion-positions)
+                              (map list completion-candidates completion-positions completion-descriptions))])
+            (let-values ([(grid-cols grid-rows) (completion-grid-dimensions term-cols)])
+              (let* ([cap 10]
+                     [max-visible (min cap room)]
+                     [place (menu-anchor-place
+                              rows-below
+                              (completion-menu-drawn-rows grid-rows cap))]
+                     ;; The height the grid will actually draw under max-visible; the
+                     ;; drop-up offset lifts the menu by exactly that so its foot sits
+                     ;; just above the prompt.
+                     [menu-height (completion-menu-drawn-rows grid-rows max-visible)]
+                     [offset (if (eq? place 'up)
+                                 (+ cursor-row menu-height 1)
+                                 lines-after)]
+                     [cursor-col (edit-cursor-column prompt-width before cursor-row)]
+                     [menu-lines
+                      (overlay-draw port place offset ansi?
+                        (lambda ()
+                          (let-values ([(ml gcols grows soff)
+                                        (render-completion-grid port entries
+                                          completion-index term-cols max-visible)])
+                            (set! completion-grid-cols gcols)
+                            (set! completion-grid-rows grows)
+                            (set! completion-scroll-offset soff)
+                            ml)))])
+                ;; overlay-draw returns the cursor to the edit ROW; put it back on the
+                ;; edit COLUMN too.  An absolute column move is scroll-safe, exactly as
+                ;; render-line's own final column positioning is.
+                (when ansi?
+                  (display "\x1b;[" port) (display cursor-col port) (display "G" port))
+                (flush-output-port port)
+                (set! completion-menu-lines menu-lines)
+                (set! completion-menu-place place)
+                lines)))
           (begin
             (set! completion-menu-lines 0)
+            (set! completion-menu-place 'down)
             lines))))
 
   ;; ======================================================================
@@ -2158,6 +2825,162 @@
             [else (loop)])))))
 
   ;; ======================================================================
+  ;; Dot-repeat change boundary (run at the top of each main-loop pass)
+  ;; ======================================================================
+
+  ;; The change-recording boundary.  It has two jobs, both gated on an idle
+  ;; normal state (normal mode AND not vi-mid-command?): first COMMIT a completed
+  ;; change -- when the buffer text actually differs from the change-start
+  ;; snapshot and the initiating key is not excluded, the recorded bytes become
+  ;; the last change -- then BEGIN a fresh recording.  Recording spans the whole
+  ;; change uniformly because the decoder tee (current-key-recording) captures
+  ;; every consumed byte, so an operator + motion, an insert session across the
+  ;; normal->insert->normal flip, a multi-key surround whose operands are
+  ;; inline-read, and sexp-transpose are all captured with no other call-site
+  ;; changes.  Recording begins only from idle normal mode, so the insert-default
+  ;; line composition before the first Escape is never a recorded change, and
+  ;; never while a completion menu is open.
+  (define (dot-repeat-boundary! es gb)
+    (let ([mode (editor-state-mode es)])
+      ;; Commit a completed change (never one that invoked a replay).
+      (when (and *dot-recording?* (eq? mode 'normal) (not (vi-mid-command?)))
+        (let ([bytes (get-output-string (current-key-recording))])
+          (when (and (not *dot-change-replayed?*)
+                     (not *dot-change-undo/redo/paste?*)
+                     (not (string=? (gap-buffer->string gb) *dot-change-start-text*))
+                     (not (dot-excluded-event? *dot-initiating-evt*)))
+            (set! *dot-last-change* bytes)))
+        (current-key-recording #f)
+        (set! *dot-recording?* #f))
+      ;; Begin a new change from idle normal mode.
+      (when (and (not *dot-recording?*) (eq? mode 'normal) (not (vi-mid-command?))
+                 (null? completion-candidates))
+        (current-key-recording (open-output-string))
+        (set! *dot-change-start-text* (gap-buffer->string gb))
+        (set! *dot-initiating-evt* 'unset)
+        (set! *dot-change-replayed?* #f)
+        (set! *dot-change-undo/redo/paste?* #f)
+        (set! *dot-recording?* #t))))
+
+  ;; Record the initiating event of a fresh recording (the first key read after a
+  ;; recording begins), consulted by dot-excluded-event? at commit time.  Called
+  ;; right after each key is read, by both the main loop and the white-box drive
+  ;; harness, so the two share one capture rule.
+  (define (dot-capture-initiating! evt)
+    (when (and *dot-recording?* (eq? *dot-initiating-evt* 'unset)
+               (not (eof-object? evt)))
+      (set! *dot-initiating-evt* evt)))
+
+  ;; ======================================================================
+  ;; Dot-repeat replay driver (wired below as vi-replay!-proc)
+  ;; ======================================================================
+
+  ;; Dispatch ONE key-event through the real command handlers, exactly as the
+  ;; main loop's normal-dispatch branch does (minus completion / bracketed paste /
+  ;; rendering): in normal mode the vi state machine gets first crack and, when it
+  ;; does not claim the key, the normal keymap is consulted (a prefix keymap reads
+  ;; its follow-up from `in`); in insert mode the insert keymap runs, falling back
+  ;; to cmd-self-insert for a printable char.  `in` is the port inline reads pull
+  ;; from -- a replayed surround / cs / ds / text object satisfies its inline
+  ;; read-key-event calls from it, and a replayed insert re-runs cmd-self-insert so
+  ;; paredit auto-pairing fires exactly once -- never a double-inserted closer.
+  ;; Shared by the replay driver and the white-box drive harness so both exercise
+  ;; the same dispatch the main loop uses.
+  (define (dot-dispatch-event! es gb in out evt)
+    (if (eq? (editor-state-mode es) 'normal)
+        (unless (vi-process-key es evt in out gb editor-kill-ring)
+          (let ([binding (keymap-lookup editor-normal-keymap evt)])
+            (cond
+              [(procedure? binding) (binding es)]
+              [(keymap? binding)
+               (let ([next-evt (read-key-event in)])
+                 (unless (eof-object? next-evt)
+                   (let ([sub (keymap-lookup binding next-evt)])
+                     (when (procedure? sub) (sub es)))))]
+              [else (void)])))
+        (let ([binding (keymap-lookup editor-insert-keymap evt)])
+          (cond
+            [(procedure? binding) (binding es)]
+            [(and (eq? (key-event-type evt) 'char)
+                  (char? (key-event-value evt))
+                  (>= (char->integer (key-event-value evt)) 32))
+             (cmd-self-insert es (key-event-value evt))]
+            [else (void)]))))
+
+  ;; Re-drive a recorded keystroke byte-string through the real dispatch, reading
+  ;; key-events from a synthetic string port until EOF.
+  (define (dot-drive-bytes! es gb out bytes)
+    (let ([in (open-input-string bytes)])
+      (let loop ()
+        (let ([evt (read-key-event in)])
+          (unless (eof-object? evt)
+            (dot-dispatch-event! es gb in out evt)
+            (loop))))))
+
+  ;; The dot-repeat replay driver, wired below as vi-replay!-proc.  Re-feeds the
+  ;; last change (max 1 count) times, with the recording tee parameterized OFF so
+  ;; a replay is never itself recorded -- this, together with . being in the
+  ;; exclusion set, is what bounds the recursion.  Honouring the count by LOOPING
+  ;; (rather than substituting the change's leading digit) repeats an insert
+  ;; change AND an operator change uniformly, because hafod's insert-entry
+  ;; commands ignore a vi count.  A bare . loops once, re-feeding the change
+  ;; verbatim (so an embedded count is reproduced).  A #f / empty last change is a
+  ;; safe no-op.  The vi transient state is cleared before each iteration: the .
+  ;; arm reads the dot's count and calls this hook BEFORE its own vi-reset-state!,
+  ;; so without the reset a bare-. replay of dw would inherit the dot's count and
+  ;; delete N words; clearing it lets the recorded bytes (which carry their own
+  ;; count) drive the change alone.
+  (define (dot-replay! es count)
+    (set! *dot-change-replayed?* #t)
+    (let ([bytes *dot-last-change*])
+      (when (and (string? bytes) (> (string-length bytes) 0))
+        (let ([gb (editor-state-gb es)]
+              [out (editor-state-out-port es)]
+              [n (max 1 count)])
+          (parameterize ([current-key-recording #f])
+            (let lp ([i 0])
+              (when (< i n)
+                (vi-reset-state!)
+                (dot-drive-bytes! es gb out bytes)
+                (lp (+ i 1)))))))))
+
+  ;; PTY-free drive harness (white-box, for the dot-repeat suite).  It runs the
+  ;; SAME recording boundary, initiating-event capture and dispatch the main loop
+  ;; runs, so a test exercises the real record / commit / replay path without the
+  ;; terminal ESC-timing the full decoder loop needs.  INPUTS is a list whose
+  ;; elements are either:
+  ;;   - a STRING, fed as a bounded port and decoded through read-key-event so the
+  ;;     recording tee captures its bytes; a standalone Escape (\x1b) sits at
+  ;;     end-of-port and so decodes to 'escape (mid-stream it would decode to Meta,
+  ;;     matching a real terminal only when isolated), and a change's inline reads
+  ;;     (surround / text object) pull their trailing bytes from the same port; or
+  ;;   - a pre-built KEY-EVENT, dispatched directly, for a key the byte decoder
+  ;;     cannot synthesise (e.g. C-_, which arrives as a raw control byte the
+  ;;     decoder maps to a plain char, never a 'ctrl event).
+  ;; The boundary runs before every key and once more after the last, so a change
+  ;; completed by the final input is committed exactly as the main loop commits it.
+  (define (editor-drive-keys! es inputs)
+    (let ([gb (editor-state-gb es)]
+          [out (editor-state-out-port es)])
+      (for-each
+        (lambda (input)
+          (if (string? input)
+              (let ([in (open-input-string input)])
+                (let loop ()
+                  (dot-repeat-boundary! es gb)
+                  (let ([evt (read-key-event in)])
+                    (unless (eof-object? evt)
+                      (dot-capture-initiating! evt)
+                      (dot-dispatch-event! es gb in out evt)
+                      (loop)))))
+              (begin
+                (dot-repeat-boundary! es gb)
+                (dot-capture-initiating! input)
+                (dot-dispatch-event! es gb (open-input-string "") out input))))
+        inputs)
+      (dot-repeat-boundary! es gb)))
+
+  ;; ======================================================================
   ;; read-expression: the main entry point
   ;; ======================================================================
 
@@ -2183,31 +3006,66 @@
                           (substring prompt (+ last-nl 1) (string-length prompt))
                           prompt)]
               [gb (make-gap-buffer)]
-              [es (make-editor-state gb editor-kill-ring prompt out-port 0 #f #f 'insert)]
+              [es (make-editor-state gb editor-kill-ring prompt out-port 0 #f #f 'insert #f)]
               [finish! (lambda (result)
                          (set! history-prefix #f)
                          (dismiss-completion!)
                          (reset-undo-state!)
-                         ;; Clear ghost suggestion text from screen
+                         ;; Clear the ghost suggestion from the screen. The ghost
+                         ;; is only ever shown at end-of-buffer, so the cursor sits
+                         ;; at the user's typing position; clear-to-end-of-screen
+                         ;; wipes every ghost row -- however many the suggestion
+                         ;; wrapped onto -- without touching the echoed input. Emit
+                         ;; no carriage return first: a CR would jump to column 0 of
+                         ;; the typed line and the clear would then erase the input.
                          (when (> (string-length suggestion-text) 0)
                            (when (ansi-ok? out-port)
-                             (display "\x1b;[K" out-port))  ; erase to end of line
+                             (display "\x1b;[J" out-port))  ; clear to end of screen
                            (flush-output-port out-port))
                          (set! suggestion-text "")
-                         ;; Move cursor past all content lines before newline,
-                         ;; so the result prints below the full expression.
+                         ;; Clear a mode-indicator row (or a reverse-video
+                         ;; selection) the selection-aware renderer drew on the
+                         ;; last frame.  The indicator sits on its own row BELOW
+                         ;; the edit line; left in place it collides with the
+                         ;; result printed next (e.g. a submitted (+ 9 5 4) would
+                         ;; print as "18 NORMAL --").  Re-render once with the
+                         ;; indicator and any selection suppressed -- render-line
+                         ;; climbs to the prompt line and clears to end of screen,
+                         ;; wiping the indicator row and any stale row below it,
+                         ;; then redraws the buffer plain and leaves the cursor on
+                         ;; the typing row.  Gated on a live overlay AND a
+                         ;; terminal, so the common no-overlay path is untouched
+                         ;; and a non-tty sink (which drew nothing to clear, and
+                         ;; must not be sent a duplicated buffer) is left alone.
+                         ;; Captured before the mark is cleared below, so an
+                         ;; emacs-region highlight is seen too.
+                         (when (and (ansi-ok? out-port)
+                                    (or (editor-mode-indicator es)
+                                        (editor-selection-range es)))
+                           (let ([term-cols (editor-query-terminal-cols)])
+                             (render-line out-port prompt gb
+                                          (cursor-visual-row (ansi-display-width prompt)
+                                                             (gap-buffer-before-string gb)
+                                                             term-cols)
+                                          term-cols)))
+                         ;; Clear the emacs mark so a region set on this line never
+                         ;; bleeds a highlight into the next prompt (vi visual is
+                         ;; already cleared by the session reset).  Drop the
+                         ;; expansion stack alongside it, so a structural selection
+                         ;; cannot grow a span on the next line.
+                         (editor-state-mark-set! es #f)
+                         (reset-sexp-stack!)
+                         ;; Move cursor past all content lines before newline, so the
+                         ;; result prints below the full expression -- counting the
+                         ;; wrapped rows via the shared geometry helpers, not just
+                         ;; newlines, so a buffer that wraps is stepped past in full.
                          (let* ([text (gap-buffer->string gb)]
-                                [total-lines (let lp ([i 0] [n 0])
-                                               (cond [(>= i (string-length text)) n]
-                                                     [(char=? (string-ref text i) #\newline)
-                                                      (lp (+ i 1) (+ n 1))]
-                                                     [else (lp (+ i 1) n)]))]
-                                [before (gap-buffer-before-string gb)]
-                                [cursor-row (let lp ([i 0] [n 0])
-                                              (cond [(>= i (string-length before)) n]
-                                                    [(char=? (string-ref before i) #\newline)
-                                                     (lp (+ i 1) (+ n 1))]
-                                                    [else (lp (+ i 1) n)]))]
+                                [term-cols (editor-query-terminal-cols)]
+                                [prompt-width (ansi-display-width prompt)]
+                                [total-lines (count-visual-lines prompt-width text term-cols)]
+                                [cursor-row (cursor-visual-row prompt-width
+                                                               (gap-buffer-before-string gb)
+                                                               term-cols)]
                                 [lines-below (- total-lines cursor-row)])
                            (when (and (ansi-ok? out-port) (> lines-below 0))
                              (display "\x1b;[" out-port)
@@ -2217,6 +3075,14 @@
                          (reset-cursor out-port)
                          (flush-output-port out-port)
                          result)])
+         ;; Clear any vi session state left over from the previous line: a visual
+         ;; mode never dismissed before submit must not bleed a highlight into
+         ;; this fresh prompt, which starts in insert mode.
+         (vi-reset-session!)
+         ;; Discard any half-recorded change from the previous line so this fresh
+         ;; prompt starts clean; the committed last change is left intact so a
+         ;; change made earlier stays repeatable with . on this line.
+         (reset-dot-recording!)
          ;; Display multi-line prefix once (e.g. starship context lines)
          (when (> (string-length prompt-prefix) 0)
            (display prompt-prefix out-port)
@@ -2228,9 +3094,17 @@
          (let ([initial-lines (render-line out-port prompt gb 0 (editor-query-terminal-cols))])
          ;; Command loop — prev-lines tracks screen lines for correct cursor-up
          (let loop ([prev-lines initial-lines])
+           ;; Dot-repeat boundary: commit a completed change and begin the next
+           ;; one before this key is read, so the tee is armed for the keystroke
+           ;; about to be decoded.
+           (dot-repeat-boundary! es gb)
            (let* ([mode (editor-state-mode es)]
                   [km (if (eq? mode 'normal) editor-normal-keymap editor-insert-keymap)]
                   [evt (read-key-event in-port)])
+             ;; Capture the initiating event of a fresh recording (the tee has
+             ;; already recorded evt's bytes inside read-key-event, so any leading
+             ;; count digits are in the byte stream regardless).
+             (dot-capture-initiating! evt)
              (cond
                [(eof-object? evt)
                 (finish! (if (= (gap-buffer-length gb) 0)
@@ -2245,36 +3119,34 @@
                           (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'backtab))
                      (cmd-complete-prev es)
-                     (loop (render-with-menu out-port ep gb prev-lines))]
+                     (loop (render-with-menu out-port ep gb prev-lines es))]
                     ;; Arrow keys during completion: grid navigation
                     [(and compl-active?
                           (eq? (key-event-type evt) 'special)
                           (memq (key-event-value evt) '(up down left right)))
                      (cmd-completion-navigate es (key-event-value evt))
-                     (loop (render-with-menu out-port ep gb prev-lines))]
+                     (loop (render-with-menu out-port ep gb prev-lines es))]
                     [(and compl-active?
                           (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'return))
                      (dismiss-completion!)
-                     (set! completion-menu-lines 0)
-                     (loop (render-with-menu out-port ep gb prev-lines))]
+                     (loop (render-with-menu out-port ep gb prev-lines es))]
                     [(and compl-active?
                           (or (and (eq? (key-event-type evt) 'special)
                                    (eq? (key-event-value evt) 'escape))
                               (and (eq? (key-event-type evt) 'ctrl)
                                    (eqv? (key-event-value evt) #\g))))
                      (dismiss-completion!)
-                     (set! completion-menu-lines 0)
-                     (loop (render-with-menu out-port ep gb prev-lines))]
+                     (loop (render-with-menu out-port ep gb prev-lines es))]
 
                     ;; ------- Bracketed paste -------
                     [(and (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'paste-start))
-                     (when compl-active? (dismiss-completion!) (set! completion-menu-lines 0))
+                     (when compl-active? (dismiss-completion!))
                      (handle-bracketed-paste es in-port)
                      (if (editor-state-done? es)
                          (finish! (editor-state-result es))
-                         (loop (render-with-menu out-port ep gb prev-lines)))]
+                         (loop (render-with-menu out-port ep gb prev-lines es)))]
 
                     ;; ------- Normal dispatch -------
                     [else
@@ -2282,8 +3154,7 @@
                      (when (and compl-active?
                                 (not (and (eq? (key-event-type evt) 'special)
                                           (eq? (key-event-value evt) 'tab))))
-                       (dismiss-completion!)
-                       (set! completion-menu-lines 0))
+                       (dismiss-completion!))
                      ;; Vi state machine gets first crack in normal mode
                      (if (and (eq? mode 'normal)
                               (vi-process-key es evt in-port out-port
@@ -2291,7 +3162,7 @@
                          ;; Vi handled the key
                          (if (editor-state-done? es)
                              (finish! (editor-state-result es))
-                             (loop (render-with-menu out-port prompt gb prev-lines)))
+                             (loop (render-with-menu out-port prompt gb prev-lines es)))
                          ;; Fall through to keymap
                          (let ([binding (keymap-lookup km evt)])
                            (cond
@@ -2299,17 +3170,17 @@
                               (binding es)
                               (if (editor-state-done? es)
                                   (finish! (editor-state-result es))
-                                  (loop (render-with-menu out-port prompt gb prev-lines)))]
+                                  (loop (render-with-menu out-port prompt gb prev-lines es)))]
                              [(keymap? binding)
                               (let ([next-evt (read-key-event in-port)])
                                 (if (eof-object? next-evt)
-                                    (loop (render-with-menu out-port prompt gb prev-lines))
+                                    (loop (render-with-menu out-port prompt gb prev-lines es))
                                     (let ([sub-binding (keymap-lookup binding next-evt)])
                                       (when (procedure? sub-binding)
                                         (sub-binding es))
                                       (if (editor-state-done? es)
                                           (finish! (editor-state-result es))
-                                          (loop (render-with-menu out-port prompt gb prev-lines))))))]
+                                          (loop (render-with-menu out-port prompt gb prev-lines es))))))]
                              [(and (eq? mode 'insert)
                                    (eq? (key-event-type evt) 'char)
                                    (let ([ch (key-event-value evt)])
@@ -2318,7 +3189,7 @@
                               (cmd-self-insert es (key-event-value evt))
                               (if (editor-state-done? es)
                                   (finish! (editor-state-result es))
-                                  (loop (render-with-menu out-port prompt gb prev-lines)))]
+                                  (loop (render-with-menu out-port prompt gb prev-lines es)))]
                              [else
                               (loop prev-lines)])))])
                 ) ; close let*
@@ -2344,5 +3215,8 @@
   (vi-history-prev!-proc (lambda (es) (cmd-history-prev es)))
   (vi-history-next!-proc (lambda (es) (cmd-history-next es)))
   (vi-submit!-proc (lambda (es) (cmd-submit es)))
+  ;; Dot-repeat: the . arm delegates to this driver, which re-feeds the recorded
+  ;; keystrokes of the last change through a synthetic port, count times.
+  (vi-replay!-proc dot-replay!)
 
 ) ; end library

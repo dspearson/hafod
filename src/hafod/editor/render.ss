@@ -7,7 +7,14 @@
           render-completion-menu render-completion-menu/highlight
           render-completion-grid
           render-line/suggestion
+          render-line/selection
+          only-closing-delimiters?
           display-with-highlights
+          display-with-selection
+          ;; Reusable terminal-overlay helpers (editor + tests)
+          overlay-clear! overlay-draw
+          ;; Geometry helpers for external consumers (editor + tests)
+          count-visual-lines cursor-visual-row ansi-display-width
           ;; Colour constants and helpers for external consumers (e.g. finder)
           paren-colours num-paren-colours
           string-colour comment-colour number-colour boolean-colour
@@ -471,8 +478,23 @@
          (flush-output-port port)
          cursor-row)]))
 
-  ;; render-line/suggestion: like render-line but appends dim ghost text after cursor
-  ;; when cursor is at end-of-buffer.
+  ;; only-closing-delimiters?: #t iff every character of str is a closing
+  ;; delimiter or quote; the empty string is vacuously true.  Shared by the ghost
+  ;; display gate here and by the editor's history-ghost-suffix seam: an all-closer
+  ;; (or empty) after-cursor string means the cursor sits at the end of the typed
+  ;; region, so the ghost may still show through paredit's auto-inserted trailing
+  ;; closers.  The set is the auto-pair closers ) ] " plus a harmless } .
+  (define (only-closing-delimiters? str)
+    (let ([len (string-length str)])
+      (let loop ([i 0])
+        (cond
+          [(>= i len) #t]
+          [(memv (string-ref str i) '(#\) #\] #\} #\")) (loop (+ i 1))]
+          [else #f]))))
+
+  ;; render-line/suggestion: like render-line but appends dim ghost text after the
+  ;; cursor when the cursor sits at the end of the typed region (real end-of-buffer
+  ;; or just before paredit's auto-inserted trailing closers).
   (define render-line/suggestion
     (case-lambda
       [(port prompt gb prev-lines suggestion)
@@ -489,7 +511,26 @@
                              (width-after-last-newline before)
                              1)]
               [colour? (colour-ok? port)]
-              [ansi? (ansi-ok? port)])
+              [ansi? (ansi-ok? port)]
+              ;; Is the dim ghost actually drawn?  Only when colour is live and
+              ;; the cursor sits at the end of the typed region -- either the real
+              ;; end-of-buffer (after = "") or just before paredit's auto-inserted
+              ;; trailing closers (after is all closers/quotes).  This mirrors the
+              ;; draw gate below, so the row count and the draw stay in lock-step.
+              [ghost-shown? (and colour?
+                                 (only-closing-delimiters? after)
+                                 (> (string-length suggestion) 0))]
+              ;; Total screen rows drawn.  When the ghost shows, its own wrapped
+              ;; and newlined rows count too, so measure buffer + suggestion
+              ;; through the SAME wrap-aware helper the edit line uses; otherwise
+              ;; the buffer-only count stands.  Counting the ghost's own rows is
+              ;; what keeps the cursor on the user's typing row rather than
+              ;; stranding it on the suggestion's bottom row.
+              [drawn-lines (if ghost-shown?
+                               (count-visual-lines prompt-width
+                                                   (string-append text suggestion)
+                                                   term-cols)
+                               total-lines)])
          (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
            (display prev-lines port)
@@ -501,19 +542,98 @@
              (let ([tokens (tokenize text)])
                (display-colourised port text tokens cursor-pos colour?))
              (display text port))
-         ;; Display ghost suggestion if cursor is at end.  The ghost is a dim
-         ;; overlay the cursor is then drawn back over, so it only makes sense
-         ;; when colour and cursor movement are both live; gate it on colour?
-         ;; (which implies ansi?), leaving zero escapes on a plain target.
-         (when (and colour?
-                    (= cursor-pos (string-length text))
-                    (> (string-length suggestion) 0))
+         ;; Draw the dim grey ghost past the cursor when it applies.  Gated
+         ;; exactly as drawn-lines above (ghost-shown?), so a plain sink still
+         ;; emits zero escapes and no ghost.
+         (when ghost-shown?
            (display "\x1b;[38;5;240m" port)  ; dim grey
            (display suggestion port)
            (display "\x1b;[39m" port))
-         ;; Position cursor
+         ;; Position cursor: climb back over every drawn row (the ghost's rows
+         ;; included) to the user's logical typing row, then to the column.
          (when ansi?
-           (let ([lines-after-cursor (- total-lines cursor-row)])
+           (let ([lines-after-cursor (- drawn-lines cursor-row)])
+             (when (> lines-after-cursor 0)
+               (display "\x1b;[" port)
+               (display lines-after-cursor port)
+               (display "A" port)))
+           (display "\x1b;[" port)
+           (display cursor-col port)
+           (display "G" port))
+         (flush-output-port port)
+         cursor-row)]))
+
+  ;; render-line/selection: like render-line but reverse-video-highlights an
+  ;; active selection span and, optionally, draws a compact mode indicator on its
+  ;; own row below the edit line.  sel-range is a (start . end) index pair into
+  ;; text = before ++ after (the same coordinate space as gap-buffer-cursor-pos)
+  ;; or #f; indicator is a short status string (e.g. "-- VISUAL --") or #f.  The
+  ;; two existing render-line / render-line/suggestion arities are untouched --
+  ;; this is a parallel entry point.  Like render-line/suggestion it folds any
+  ;; indicator row into the climb-back so the cursor lands on the logical typing
+  ;; row, and it returns that same row (identical to render-line) so prev-lines
+  ;; tracking is unchanged.  Off a terminal (ansi?/colour? #f) neither the
+  ;; highlight nor the indicator is drawn and no escape bytes are emitted.
+  (define render-line/selection
+    (case-lambda
+      [(port prompt gb prev-lines sel-range indicator)
+       (render-line/selection port prompt gb prev-lines sel-range indicator 0)]
+      [(port prompt gb prev-lines sel-range indicator term-cols)
+       (let* ([before (gap-buffer-before-string gb)]
+              [after  (gap-buffer-after-string gb)]
+              [text (string-append before after)]
+              [cursor-pos (gap-buffer-cursor-pos gb)]
+              [prompt-width (ansi-display-width prompt)]
+              [total-lines (count-visual-lines prompt-width text term-cols)]
+              [cursor-row (cursor-visual-row prompt-width before term-cols)]
+              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
+                             (width-after-last-newline before)
+                             1)]
+              [colour? (colour-ok? port)]
+              [ansi? (ansi-ok? port)]
+              ;; Is the mode indicator actually drawn?  Only on a terminal
+              ;; (ansi?) with a non-empty string.  This mirrors the draw gate
+              ;; below so the row count and the draw stay in lock-step.
+              [indicator-shown? (and ansi?
+                                     (string? indicator)
+                                     (> (string-length indicator) 0))]
+              ;; Total screen rows drawn.  When the indicator shows, its own
+              ;; row (plus any wrap) counts too: measure the buffer text, a
+              ;; separating newline, and the indicator through the SAME wrap-
+              ;; aware helper the ghost uses, so the cursor climbs back to the
+              ;; user's typing row rather than stranding on the indicator row.
+              [drawn-lines (if indicator-shown?
+                               (count-visual-lines prompt-width
+                                                   (string-append text "\n" indicator)
+                                                   term-cols)
+                               total-lines)])
+         (when (and ansi? (> prev-lines 0))
+           (display "\x1b;[" port)
+           (display prev-lines port)
+           (display "A" port))
+         (when ansi?
+           (display "\r\x1b;[J" port))
+         (display prompt port)
+         ;; Draw the buffer text: reverse-video the selection span when one is
+         ;; given, otherwise the usual colourised (Scheme) / plain path.
+         (if (pair? sel-range)
+             (display-with-selection port text sel-range colour?)
+             (if (eq? (classify-input text) 'scheme)
+                 (let ([tokens (tokenize text)])
+                   (display-colourised port text tokens cursor-pos colour?))
+                 (display text port)))
+         ;; Drop to a new row and draw the compact mode indicator, dimmed.
+         ;; Gated exactly as drawn-lines above, so a plain sink emits zero
+         ;; escapes and no indicator.
+         (when indicator-shown?
+           (display "\n" port)
+           (display "\x1b;[2m" port)    ; dim on
+           (display indicator port)
+           (display "\x1b;[22m" port))  ; dim off
+         ;; Position cursor: climb back over every drawn row (the indicator's
+         ;; row included) to the logical typing row, then to the column.
+         (when ansi?
+           (let ([lines-after-cursor (- drawn-lines cursor-row)])
              (when (> lines-after-cursor 0)
                (display "\x1b;[" port)
                (display lines-after-cursor port)
@@ -717,6 +837,50 @@
                             [else (loop (+ i 1) #f)])))
            (display "\x1b;[22;24m" port)))]))
 
+  ;; Display text with the half-open span [start,end) shown in reverse video.
+  ;; sel-range is a (start . end) integer pair (indices into text) or #f.  The
+  ;; span is clamped defensively — start is pinned into [0,len] and end into
+  ;; [start,len] — so an out-of-range or inverted range can never index past the
+  ;; string or invert; an empty span, a #f range, or colour? #f renders the text
+  ;; verbatim with zero escape bytes.  colour? is an explicit trailing argument
+  ;; (default #t), threaded by the caller rather than derived from the port, so
+  ;; the highlight is assertable on a plain string port.  Each character of text
+  ;; is displayed exactly once, in order.  The span is closed with the narrower
+  ;; [27m reset, which clears only reverse video and leaves any other active
+  ;; attributes intact -- unlike render-completion-menu and flash-matching-paren,
+  ;; which close their reverse video with the full [0m reset.
+  (define display-with-selection
+    (case-lambda
+      [(port text sel-range)
+       (display-with-selection port text sel-range #t)]
+      [(port text sel-range colour?)
+       (let ([len (string-length text)])
+         (if (and colour? (pair? sel-range))
+             (let* ([s (max 0 (min (car sel-range) len))]
+                    [e (max s (min (cdr sel-range) len))])
+               (if (< s e)
+                   ;; Walk char by char, toggling reverse video on the span edges.
+                   (let loop ([i 0] [in-sel? #f])
+                     (cond
+                       [(>= i len)
+                        ;; Span ran to the end of the string: close it off.
+                        (when in-sel? (display "\x1b;[27m" port))]
+                       [(and (= i s) (not in-sel?))
+                        (display "\x1b;[7m" port)          ; reverse video on
+                        (display (string-ref text i) port)
+                        (loop (+ i 1) #t)]
+                       [(and (= i e) in-sel?)
+                        (display "\x1b;[27m" port)         ; reverse video off
+                        (display (string-ref text i) port)
+                        (loop (+ i 1) #f)]
+                       [else
+                        (display (string-ref text i) port)
+                        (loop (+ i 1) in-sel?)]))
+                   ;; Empty span after clamping: nothing to highlight.
+                   (display text port)))
+             ;; No colour, or no range: verbatim, zero escape bytes.
+             (display text port)))]))
+
   ;; ======================================================================
   ;; render-completion-grid — fish/zsh-style multi-column completion
   ;; ======================================================================
@@ -881,5 +1045,68 @@
                      ;; Reset selection
                      (when (and colour? selected?) (display "\x1b;[0m" port))
                      (col-loop (+ col 1))))))]))))
+
+  ;; ======================================================================
+  ;; Reusable terminal-overlay helpers
+  ;; ======================================================================
+
+  ;; A minimal overlay vocabulary: draw a span of rows at an anchor relative to
+  ;; the edit line, and clean-clear a tracked span before the next repaint.  Both
+  ;; move with RELATIVE motion only (ESC[<n>A / ESC[<n>B, a carriage return, and
+  ;; clear-to-end-of-screen) and never a cursor save/restore (ESC7/ESC8): an
+  ;; absolute save cannot survive the screen scrolling when a span is painted near
+  ;; the terminal bottom, so a later restore lands too low and the old paint
+  ;; stacks.  Climbing back over a tracked row count relatively always lands true.
+  ;; ansi? is an explicit argument (not derived from the port) so the escape
+  ;; geometry is assertable on a plain string port and a non-terminal sink can
+  ;; force the zero-escape path.  This is an overlay primitive, deliberately not a
+  ;; window manager.
+
+  ;; overlay-clear!: wipe a tracked N-row overlay span so nothing stacks on the
+  ;; next repaint.  When ansi? is true and rows > 0, climb relatively over the
+  ;; rows drawn, return to column 0, and clear to end of screen; otherwise emit
+  ;; nothing, so a non-terminal sink (or an empty span) stays byte-for-byte empty.
+  ;; Modelled on render-line's own move-up-then-wipe clear idiom.
+  (define (overlay-clear! port rows ansi?)
+    (when (and ansi? (> rows 0))
+      (display "\x1b;[" port)
+      (display rows port)
+      (display "A" port)
+      (display "\r\x1b;[J" port)))
+
+  ;; overlay-draw: paint a span anchored to the edit line, then leave the cursor
+  ;; back on the edit row.  place is 'down for a dropdown (below the edit line) or
+  ;; 'up for a drop-up (above it, chosen when the room below is too small).
+  ;; offset is the number of screen rows between the edit cursor and the anchor:
+  ;; for a dropdown, the rows below the cursor down to the bottom of the (possibly
+  ;; wrapped) edit line; for a drop-up, the rows to climb above the edit line to
+  ;; open the span.  draw-thunk paints the span (in production a thunk that calls
+  ;; render-completion-grid) and returns the row count it drew; overlay-draw
+  ;; returns that same count.  The thunk opens one leading transition row before
+  ;; its content, so the net descent below the edit cursor is offset + rows + 1,
+  ;; and the return climb reverses exactly that — all relative, no save/restore.
+  ;; On a non-terminal target (ansi? #f) the thunk still runs for its content and
+  ;; return value, but overlay-draw emits no motion escapes of its own.
+  (define (overlay-draw port place offset ansi? draw-thunk)
+    ;; Signed displacement to the anchor, positive downward: a dropdown descends,
+    ;; a drop-up climbs.
+    (let ([anchor (if (eq? place 'up) (- offset) offset)])
+      (when ansi?
+        (cond
+          [(> anchor 0)
+           (display "\x1b;[" port) (display anchor port) (display "B" port)]
+          [(< anchor 0)
+           (display "\x1b;[" port) (display (- anchor) port) (display "A" port)])
+        (display "\r" port))
+      (let* ([rows (draw-thunk)]
+             ;; Rows below the edit cursor once the thunk's own descent (its
+             ;; content rows plus the single leading transition row) is added to
+             ;; the anchor move.
+             [net (+ anchor rows 1)])
+        (when (and ansi? (not (= net 0)))
+          (if (> net 0)
+              (begin (display "\x1b;[" port) (display net port) (display "A" port))
+              (begin (display "\x1b;[" port) (display (- net) port) (display "B" port))))
+        rows)))
 
 ) ; end library

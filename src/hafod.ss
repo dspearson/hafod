@@ -479,6 +479,9 @@
     ;; === (hafod editor render) ===
     render-line flash-matching-paren tokenize display-colourised
     render-completion-menu/highlight
+    count-visual-lines cursor-visual-row ansi-display-width
+    overlay-clear! overlay-draw
+    only-closing-delimiters?
     rainbow-identifiers? rainbow-parens? syntax-highlight?
 
     ;; === (hafod editor sqlite3) ===
@@ -497,7 +500,7 @@
     ;; === (hafod editor editor) ===
     read-expression with-raw-mode editor-default-keymap
     editor-insert-keymap editor-normal-keymap
-    shell-completions
+    shell-completions history-ghost-suffix
     bind-base-keys! bind-paredit-keys! unbind-paredit-keys!
     toggle-paredit! paredit-enabled? enable-paredit! disable-paredit!
     show-keybindings run-tutorial
