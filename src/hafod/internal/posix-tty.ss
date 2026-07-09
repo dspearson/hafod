@@ -13,7 +13,8 @@
     c-ioctl)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
-          (hafod internal platform-constants) (hafod internal posix-core))
+          (hafod internal platform-constants) (hafod internal posix-core)
+          (only (hafod internal platform-ftypes) termios-t))
 
   ;; ======================================================================
   ;; TTY / termios
@@ -35,10 +36,8 @@
   (define TCIOFF PLAT-TCIOFF)
   (define TCION  PLAT-TCION)
 
-  (define *termios-size* SIZEOF-TERMIOS)
-
-  (define c-tcgetattr  (foreign-procedure "tcgetattr"  (int u8*) int))
-  (define c-tcsetattr  (foreign-procedure "tcsetattr"  (int int u8*) int))
+  (define c-tcgetattr  (foreign-procedure "tcgetattr"  (int void*) int))
+  (define c-tcsetattr  (foreign-procedure "tcsetattr"  (int int void*) int))
   (define c-isatty     (foreign-procedure "isatty"     (int) int))
   (define c-ttyname    (foreign-procedure "ttyname"    (int) uptr))
   (define c-ctermid    (foreign-procedure "ctermid"    (u8*) uptr))
@@ -58,31 +57,51 @@
 
   ;; posix-tcgetattr: retrieve terminal attributes.
   ;; Returns (values iflag oflag cflag lflag cc-bytevector ispeed-code ospeed-code)
+  ;; The struct termios is read through the termios-t ftype: a foreign block is
+  ;; wrapped once with make-ftype-pointer and each field is read with ftype-ref,
+  ;; so the compiler derives every offset and width from the declared layout and
+  ;; no byte offset is hand rolled. c_cc is an array field, read element by
+  ;; element into a fresh bytevector. with-foreign-buffer frees the block on
+  ;; every exit path.
   (define (posix-tcgetattr fd)
-    (let ([buf (make-bytevector *termios-size* 0)])
+    (with-foreign-buffer ([buf (ftype-sizeof termios-t)])
       (posix-call tcgetattr (c-tcgetattr fd buf))
-      (let ([iflag  (bytevector-u32-native-ref buf TERMIOS-C-IFLAG)]
-            [oflag  (bytevector-u32-native-ref buf TERMIOS-C-OFLAG)]
-            [cflag  (bytevector-u32-native-ref buf TERMIOS-C-CFLAG)]
-            [lflag  (bytevector-u32-native-ref buf TERMIOS-C-LFLAG)]
-            [cc     (let ([v (make-bytevector PLAT-NCCS)])
-                      (bytevector-copy! buf TERMIOS-C-CC v 0 PLAT-NCCS)
-                      v)]
-            [ispeed (bytevector-u32-native-ref buf TERMIOS-C-ISPEED)]
-            [ospeed (bytevector-u32-native-ref buf TERMIOS-C-OSPEED)])
-        (values iflag oflag cflag lflag cc ispeed ospeed))))
+      (let ([p (make-ftype-pointer termios-t buf)])
+        (let ([iflag  (ftype-ref termios-t (c_iflag) p)]
+              [oflag  (ftype-ref termios-t (c_oflag) p)]
+              [cflag  (ftype-ref termios-t (c_cflag) p)]
+              [lflag  (ftype-ref termios-t (c_lflag) p)]
+              [cc     (let ([v (make-bytevector PLAT-NCCS)])
+                        (do ([i 0 (fx+ i 1)]) ((fx= i PLAT-NCCS))
+                          (bytevector-u8-set! v i (ftype-ref termios-t (c_cc i) p)))
+                        v)]
+              [ispeed (ftype-ref termios-t (c_ispeed) p)]
+              [ospeed (ftype-ref termios-t (c_ospeed) p)])
+          (values iflag oflag cflag lflag cc ispeed ospeed)))))
 
   ;; posix-tcsetattr: apply terminal attributes.
+  ;; The struct termios is written through the termios-t ftype. foreign-alloc
+  ;; does not clear the block (unlike the zeroed bytevector this replaced), so we
+  ;; zero-fill it first, keeping c_line and any padding at 0 so no uninitialised
+  ;; bytes reach the kernel. Each field is written with ftype-set!; c_cc is an
+  ;; array field, written element by element, copying at most PLAT-NCCS bytes so
+  ;; a short cc keeps its partial-copy behaviour. with-foreign-buffer frees the
+  ;; block on every exit path.
   (define (posix-tcsetattr fd option iflag oflag cflag lflag cc ispeed ospeed)
-    (let ([buf (make-bytevector *termios-size* 0)])
-      (bytevector-u32-native-set! buf TERMIOS-C-IFLAG iflag)
-      (bytevector-u32-native-set! buf TERMIOS-C-OFLAG oflag)
-      (bytevector-u32-native-set! buf TERMIOS-C-CFLAG cflag)
-      (bytevector-u32-native-set! buf TERMIOS-C-LFLAG lflag)
-      (bytevector-copy! cc 0 buf TERMIOS-C-CC (fxmin (bytevector-length cc) PLAT-NCCS))
-      (bytevector-u32-native-set! buf TERMIOS-C-ISPEED ispeed)
-      (bytevector-u32-native-set! buf TERMIOS-C-OSPEED ospeed)
-      (posix-call tcsetattr (c-tcsetattr fd option buf))))
+    (with-foreign-buffer ([buf (ftype-sizeof termios-t)])
+      (do ([i 0 (fx+ i 1)]) ((fx= i (ftype-sizeof termios-t)))
+        (foreign-set! 'unsigned-8 buf i 0))
+      (let ([p (make-ftype-pointer termios-t buf)])
+        (ftype-set! termios-t (c_iflag) p iflag)
+        (ftype-set! termios-t (c_oflag) p oflag)
+        (ftype-set! termios-t (c_cflag) p cflag)
+        (ftype-set! termios-t (c_lflag) p lflag)
+        (let ([n (fxmin (bytevector-length cc) PLAT-NCCS)])
+          (do ([i 0 (fx+ i 1)]) ((fx= i n))
+            (ftype-set! termios-t (c_cc i) p (bytevector-u8-ref cc i))))
+        (ftype-set! termios-t (c_ispeed) p ispeed)
+        (ftype-set! termios-t (c_ospeed) p ospeed)
+        (posix-call tcsetattr (c-tcsetattr fd option buf)))))
 
   ;; posix-isatty: test if fd is a terminal.
   (define (posix-isatty fd) (= 1 (c-isatty fd)))

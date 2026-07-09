@@ -40,7 +40,7 @@ TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
 # Platform detection
 UNAME_S := $(shell uname -s)
 
-.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-version-guard test-ffi-no-helper test-hafod-so-fresh test-install-launch test-platform-abi test-hang-timeout print-test-timeout verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability print-native-libs version-source chez-version-source $(TEST_TARGETS)
+.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-version-guard test-load test-ffi-no-helper test-hafod-so-fresh test-install-launch test-platform-abi test-hang-timeout print-test-timeout verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability print-native-libs version-source chez-version-source $(TEST_TARGETS)
 
 all: native
 
@@ -78,7 +78,7 @@ TIMEOUT_PREFIX =
 # enumerated rather than matched with test-%, because the standalone .sh proofs
 # (test-ffi-no-helper, test-hafod-so-fresh, test-install-launch, test-platform-abi,
 # test-hang-timeout) do not use the wrapper and must not trigger this warning.
-ifneq ($(filter test $(TEST_TARGETS) test-launcher test-version-guard verify-umbrella,$(MAKECMDGOALS)),)
+ifneq ($(filter test $(TEST_TARGETS) test-launcher test-version-guard test-load verify-umbrella,$(MAKECMDGOALS)),)
 $(warning No 'timeout' or 'gtimeout' found; test suites run WITHOUT a kill-timeout.)
 endif
 else
@@ -313,6 +313,17 @@ test-launcher: compile-wpo
 test-version-guard: compile-wpo
 	@$(TIMEOUT_PREFIX) sh test/test-version-guard.sh </dev/null || { $(HANG_CHECK); }
 
+# Load self-test: assert (hafod) and (hafod posix) import cleanly under BOTH
+# petite (no compiler -- it loads the built fasls) and full scheme, via the
+# source/fasl path (--libdirs src), not the bundled bin/hafod.so image. Depends
+# on compile (which builds src/hafod/*.so via compile-libs), NOT compile-wpo:
+# petite cannot compile, so it needs those fasls first, and a broken
+# inter-library load order or a missing dependency then makes the import fail.
+# SCHEME is passed through so the script derives a matching petite and honours a
+# 'make test-load SCHEME=...' override.
+test-load: compile
+	@SCHEME='$(SCHEME)' $(TIMEOUT_PREFIX) sh test/test-load.sh </dev/null || { $(HANG_CHECK); }
+
 # Standalone proof that the variadic syscalls work with no helper library
 # present: open/fcntl/ioctl call libc directly via Chez's native variadic
 # convention. The harness stashes the helper shared object, runs the full
@@ -380,7 +391,7 @@ verify-umbrella: compile
 	@$(TIMEOUT_PREFIX) $(SCHEME) $(LIBDIRS) --script tools/verify-umbrella.ss </dev/null \
 	  || { $(HANG_CHECK); }
 
-test: compile $(TEST_TARGETS) test-launcher test-version-guard verify-umbrella
+test: compile $(TEST_TARGETS) test-launcher test-version-guard test-load verify-umbrella
 	@printf 'test platform: '; uname -srm
 
 clean:

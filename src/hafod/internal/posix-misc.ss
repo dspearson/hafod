@@ -17,7 +17,8 @@
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
           (hafod internal platform-constants) (hafod internal posix-core)
-          (hafod internal platform))
+          (hafod internal platform)
+          (only (hafod internal platform-ftypes) dirent-t))
 
   ;; ======================================================================
   ;; Directory iteration
@@ -42,7 +43,10 @@
     (let ([ent (c-readdir dirp)])
       (cond
         [(not (= ent 0))
-         (ptr->string (+ ent DIRENT-D-NAME))]
+         ;; ent is a libc-owned pointer into the DIR stream: wrap it as a
+         ;; dirent-t and take the address of d_name -- never alloc or free it.
+         (ptr->string (ftype-pointer-address
+                       (ftype-&ref dirent-t (d_name) (make-ftype-pointer dirent-t ent))))]
         [else
          ;; ent is NULL: check errno
          (let ([err (foreign-ref 'int (__errno_location) 0)])

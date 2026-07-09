@@ -656,7 +656,10 @@ hafod adds several capabilities beyond the original scsh:
   gracefully when the output is not a capable terminal: colour, cursor
   control, editor escapes, the paren flash, completion menus and the
   keybinding cheatsheet are each gated on the actual target, `NO_COLOR`
-  and `TERM=dumb` are honoured, and the line editor engages only when
+  and `TERM=dumb` are honoured, colour can be forced or suppressed with
+  `--color=auto|always|never` or the `CLICOLOR_FORCE` environment
+  variable (`NO_COLOR` takes precedence over `CLICOLOR_FORCE`), and the
+  line editor engages only when
   *both* stdin and stdout are terminals -- so `hafod | cat`,
   `hafod > log`, and `hafod < script` produce clean, escape-free output
   (a broken downstream pipe exits quietly, matching a normal filter).

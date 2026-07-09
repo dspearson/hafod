@@ -15,7 +15,7 @@
     posix-access posix-lseek posix-umask)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
-          (hafod internal platform-constants) (hafod internal posix-core))
+          (only (hafod internal platform-ftypes) stat-t) (hafod internal posix-core))
 
   ;; ======================================================================
   ;; Stat -- struct stat handling
@@ -43,57 +43,45 @@
   (define c-lstat (foreign-procedure "lstat" (string void*) int))
   (define c-fstat (foreign-procedure "fstat" (int void*) int))
 
-  ;; Read an unsigned integer of the given byte-size from a foreign buffer.
-  (define (foreign-ref-uint buf offset size)
-    (case size
-      [(1) (foreign-ref 'unsigned-8 buf offset)]
-      [(2) (foreign-ref 'unsigned-16 buf offset)]
-      [(4) (foreign-ref 'unsigned-32 buf offset)]
-      [(8) (foreign-ref 'unsigned-64 buf offset)]
-      [else (error 'foreign-ref-uint "unsupported size" size)]))
-
-  ;; Read a signed integer of the given byte-size from a foreign buffer.
-  (define (foreign-ref-sint buf offset size)
-    (case size
-      [(4) (foreign-ref 'integer-32 buf offset)]
-      [(8) (foreign-ref 'integer-64 buf offset)]
-      [else (error 'foreign-ref-sint "unsupported size" size)]))
-
-  ;; Extract stat-info from a filled stat buffer.
-  (define (extract-stat-info buf)
+  ;; Extract stat-info from a filled stat block. p is an ftype pointer over the
+  ;; buffer the stat/lstat/fstat syscall wrote; every field is read through the
+  ;; stat-t accessors, which carry the platform's own field widths and offsets.
+  ;; The three time fields read only tv_sec of their nested timespec, discarding
+  ;; tv_nsec, preserving the earlier behaviour.
+  (define (extract-stat-info p)
     (make-stat-info
-      (mode->type (foreign-ref-uint buf STAT-ST-MODE SIZEOF-ST-MODE))
-      (foreign-ref-uint buf STAT-ST-DEV SIZEOF-ST-DEV)
-      (foreign-ref-uint buf STAT-ST-INO SIZEOF-ST-INO)
-      (foreign-ref-uint buf STAT-ST-MODE SIZEOF-ST-MODE)
-      (foreign-ref-uint buf STAT-ST-NLINK SIZEOF-ST-NLINK)
-      (foreign-ref 'unsigned-32 buf STAT-ST-UID)
-      (foreign-ref 'unsigned-32 buf STAT-ST-GID)
-      (foreign-ref-uint buf STAT-ST-RDEV SIZEOF-ST-RDEV)
-      (foreign-ref 'integer-64 buf STAT-ST-SIZE)
-      (foreign-ref-sint buf STAT-ST-BLKSIZE SIZEOF-ST-BLKSIZE)
-      (foreign-ref 'integer-64 buf STAT-ST-BLOCKS)
-      (foreign-ref 'unsigned-64 buf STAT-ST-ATIM)
-      (foreign-ref 'unsigned-64 buf STAT-ST-MTIM)
-      (foreign-ref 'unsigned-64 buf STAT-ST-CTIM)))
+      (mode->type (ftype-ref stat-t (st_mode) p))
+      (ftype-ref stat-t (st_dev) p)
+      (ftype-ref stat-t (st_ino) p)
+      (ftype-ref stat-t (st_mode) p)
+      (ftype-ref stat-t (st_nlink) p)
+      (ftype-ref stat-t (st_uid) p)
+      (ftype-ref stat-t (st_gid) p)
+      (ftype-ref stat-t (st_rdev) p)
+      (ftype-ref stat-t (st_size) p)
+      (ftype-ref stat-t (st_blksize) p)
+      (ftype-ref stat-t (st_blocks) p)
+      (ftype-ref stat-t (st_atim tv_sec) p)
+      (ftype-ref stat-t (st_mtim tv_sec) p)
+      (ftype-ref stat-t (st_ctim tv_sec) p)))
 
   ;; stat: get file status by path (follows symlinks).
   (define (posix-stat path)
-    (with-foreign-buffer ([buf SIZEOF-STAT])
+    (with-foreign-buffer ([buf (ftype-sizeof stat-t)])
       (posix-call stat (c-stat path buf))
-      (extract-stat-info buf)))
+      (extract-stat-info (make-ftype-pointer stat-t buf))))
 
   ;; lstat: get file status by path (does not follow symlinks).
   (define (posix-lstat path)
-    (with-foreign-buffer ([buf SIZEOF-STAT])
+    (with-foreign-buffer ([buf (ftype-sizeof stat-t)])
       (posix-call lstat (c-lstat path buf))
-      (extract-stat-info buf)))
+      (extract-stat-info (make-ftype-pointer stat-t buf))))
 
   ;; fstat: get file status by file descriptor.
   (define (posix-fstat fd)
-    (with-foreign-buffer ([buf SIZEOF-STAT])
+    (with-foreign-buffer ([buf (ftype-sizeof stat-t)])
       (posix-call fstat (c-fstat fd buf))
-      (extract-stat-info buf)))
+      (extract-stat-info (make-ftype-pointer stat-t buf))))
 
   ;; ======================================================================
   ;; Filesystem operations

@@ -69,6 +69,13 @@
   ;; downstream pipe.  A direct (only ...) import (not umbrella-exported), so the
   ;; umbrella surface is unchanged; SIGPIPE itself comes from (hafod).
   (only (hafod signal) reset-signal-to-default!)
+  ;; colour-override backs the --color[=WHEN] flag below: setting it to
+  ;; 'always/'never forces or suppresses SGR colour for any target, while the
+  ;; default #f leaves the automatic NO_COLOR/CLICOLOR_FORCE/tty precedence in
+  ;; charge.  A direct (only ...) import -- it is launcher plumbing, deliberately
+  ;; NOT re-exported from the (hafod) umbrella, so the umbrella surface is
+  ;; unchanged and it introduces no binding that conflicts with (hafod).
+  (only (hafod terminal-caps) colour-override)
   (hafod))
 
 ;; Best-effort version guard for the source path.  This is the first body
@@ -435,6 +442,7 @@
       "  --no-config  Skip loading config files\n"
       "  --norc     Alias for --no-config (backward compat)\n"
       "  --batch    Force the non-editor REPL path (also: HAFOD_BATCH=1)\n"
+      "  --color[=WHEN]  Control colour output (auto, always, never; bare = always)\n"
       "\n"
       "Terminators (at most one):\n"
       "  -s FILE    Load and run FILE as a hafod/scsh script\n"
@@ -468,6 +476,30 @@
 
 (define (load-preload-files preloads)
   (for-each load-script-file (reverse preloads)))
+
+;; --color[=WHEN] helpers.  WHEN is one of the GNU-ls set auto/always/never.
+;; The external flag and its WHEN tokens stay American (--color); every
+;; identifier and comment here is British (colour).
+;;   colour-when?       -- is this string a recognised WHEN token?
+;;   colour-eq-value    -- the value after a leading "--color=" prefix, else #f.
+;;   apply-colour-when! -- map a validated WHEN onto the colour-override
+;;                         parameter: auto -> #f (leave the automatic precedence
+;;                         in charge), always -> 'always, never -> 'never.  It is
+;;                         a plain parameter set, so the last --color wins.
+(define (colour-when? s)
+  (or (string=? s "auto") (string=? s "always") (string=? s "never")))
+
+(define (colour-eq-value arg)
+  (let ([p "--color="])
+    (and (>= (string-length arg) (string-length p))
+         (string=? (substring arg 0 (string-length p)) p)
+         (substring arg (string-length p) (string-length arg)))))
+
+(define (apply-colour-when! when-str)
+  (cond
+    [(string=? when-str "always") (colour-override 'always)]
+    [(string=? when-str "never")  (colour-override 'never)]
+    [else                         (colour-override #f)]))   ; "auto"
 
 (define (parse-and-execute raw-args)
   (let ([args (meta-arg-process-arglist raw-args)])
@@ -561,6 +593,37 @@
               ;; --version
               [(string=? arg "--version")
                (show-version)]
+
+              ;; --color / --color WHEN -- control SGR colour (auto/always/never;
+              ;; bare = always).  Non-terminating: it sets colour-override by a
+              ;; plain call (like --batch's batch-mode?), so the verdict persists
+              ;; through to whichever terminator (-c/-s/-e/-l/--/the REPL) follows.
+              ;; The space form consumes the next arg ONLY when it is a recognised
+              ;; WHEN; otherwise this is a bare --color and rest is left intact, so
+              ;; a following script/positional/terminator is never swallowed.
+              [(string=? arg "--color")
+               (if (and (pair? rest) (colour-when? (car rest)))
+                   (begin (apply-colour-when! (car rest))
+                          (loop (cdr rest) entry preloads login? no-config?))
+                   (begin (colour-override 'always)
+                          (loop rest entry preloads login? no-config?)))]
+
+              ;; --color=WHEN -- validated; an unrecognised WHEN is rejected with a
+              ;; clear message and (exit 1), matching every other launcher bad-arg
+              ;; path.  Placed after the plain --color clause (so --color=never
+              ;; reaches here) and before the unknown-switch guard (so --color... is
+              ;; never mistaken for an unknown switch).
+              [(colour-eq-value arg)
+               => (lambda (when-str)
+                    (if (colour-when? when-str)
+                        (begin (apply-colour-when! when-str)
+                               (loop rest entry preloads login? no-config?))
+                        (begin
+                          (display (string-append
+                                     "hafod: invalid --color value: " when-str
+                                     " (expected auto, always, or never)\n")
+                                   (current-error-port))
+                          (exit 1))))]
 
               ;; Unknown switch
               [(and (> (string-length arg) 0)

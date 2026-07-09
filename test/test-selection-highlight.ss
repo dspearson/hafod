@@ -21,7 +21,8 @@
         (hafod editor gap-buffer)
         (only (hafod editor render)
               display-with-selection render-line/selection
-              tokenize cursor-visual-row ansi-display-width))
+              tokenize cursor-visual-row ansi-display-width)
+        (only (hafod environment) setenv))
 
 ;; ======================================================================
 ;; Helpers (each suite keeps its own copies).
@@ -88,6 +89,14 @@
     (get-output-string sp)))
 
 (test-begin "selection-highlight")
+
+;; Pitfall pin: the render-line/selection block (section (b)) renders through the
+;; live colour-ok? on a plain string port and asserts zero escape bytes.
+;; colour-ok? now reads CLICOLOR_FORCE, so an ambient CLICOLOR_FORCE=1 would
+;; force colour on that non-tty sink and flip the assert.  Pin it unset for the
+;; whole suite.  (The display-with-selection asserts thread an explicit colour?
+;; boolean and are unaffected, but a single suite-top baseline is simplest.)
+(setenv "CLICOLOR_FORCE" #f)
 
 ;; ======================================================================
 ;; display-with-selection: the reverse-video span leaf.

@@ -3,8 +3,8 @@
 ;;; the completion grid they wrap.  The overlay clears a tracked N-row span with
 ;;; RELATIVE motion (cursor-up over the span, a carriage return, clear-to-end-of-
 ;;; screen) and never a cursor save/restore -- an absolute save cannot survive a
-;;; scroll near the terminal bottom, which is what makes the old menu stack.  Four
-;;; layers, all hang-free:
+;;; scroll near the terminal bottom, which is what makes the old menu stack.  The
+;;; layers:
 ;;;   (a) the anchor arithmetic the overlay is handed (rows below the edit cursor),
 ;;;       asserted PTY-free through the shared wrap-aware helpers;
 ;;;   (b) overlay-clear! geometry on a plain string port -- one cursor-up equal to
@@ -14,15 +14,17 @@
 ;;;       climbs back, a drop-up anchors above, both with relative motion only, and
 ;;;       a non-terminal target emits no motion of its own;
 ;;;   (d) render-completion-grid's bounded return values + zero-escape collapse on
-;;;       a plain string port, and, on a real pty slave, the live selection
-;;;       highlight and height-cap pager it still renders on a colour target.
-;;; Hang-free by construction: string ports everywhere plus a single BOUNDED
-;;; master drain (EOF or a hard char cap stops it; a closed-pty read is caught).
-;;; The whole suite runs with stdin redirected from /dev/null.
+;;;       a plain string port, and, through the virtual-terminal harness, the
+;;;       per-cell truecolour selection highlight and the height-cap pager it
+;;;       renders on a colour target.
+;;; Entirely PTY-free: string ports and the virtual-terminal harness everywhere,
+;;; so it opens no terminal and needs no platform gate, running identically on
+;;; every platform.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (test vterm)
         (only (hafod editor render)
               overlay-clear! overlay-draw
               render-completion-grid
@@ -30,10 +32,6 @@
         (only (hafod editor editor)
               read-expression menu-anchor-place)
         (only (hafod environment) with-env* setenv)
-        (only (hafod pty) open-pty)
-        (only (hafod fd-ports) fdes->outport close)
-        (only (hafod posix) posix-open O_WRONLY)
-        (only (hafod internal platform) os-family)
         (chezscheme))
 
 ;; ======================================================================
@@ -57,6 +55,16 @@
         [(> (+ i nl) hl) #f]
         [(string=? (substring hay i (+ i nl)) needle) #t]
         [else (outer (+ i 1))]))))
+
+;; Does ANY row of the folded harness grid contain NEEDLE?  Folds vterm-lines
+;; through contains-substring? so a plain-glyph row (the height-cap pager) is
+;; findable in the rendered grid text rather than in a raw byte stream.
+(define (any-line-has? scr needle)
+  (let loop ([lines (vterm-lines scr)])
+    (cond
+      [(null? lines) #f]
+      [(contains-substring? (car lines) needle) #t]
+      [else (loop (cdr lines))])))
 
 ;; Count non-overlapping occurrences of needle in hay -- how many times a stable
 ;; menu marker was painted, so its growth (or lack of it) across cycles is
@@ -147,6 +155,14 @@
 (define overlay-max-visible 4)
 
 (test-begin "completion-overlay")
+
+;; Pitfall pin: the render-completion-grid asserts (section (d)) and the plain-
+;; sink cycle guard (section (g)) render through the live colour-ok? on a plain
+;; string port and check for zero escape bytes.  colour-ok? now reads
+;; CLICOLOR_FORCE, so an ambient CLICOLOR_FORCE=1 would force colour on that
+;; non-tty sink and flip those asserts.  Pin it unset for the whole suite; the
+;; TERM-only with-env* block in (g) restores back to this baseline.
+(setenv "CLICOLOR_FORCE" #f)
 
 ;; ======================================================================
 ;; (a) Anchor arithmetic -- PTY-free.
@@ -245,8 +261,8 @@
 ;; Six candidates, single column, max-visible 4: the list is capped to four rows
 ;; and a pager row is counted (menu-lines 5), and the scroll window keeps the
 ;; selected row in view.  On a plain string port the whole thing collapses to
-;; zero escape bytes; on a real pty slave the selection highlight and the pager
-;; still render on the colour target.
+;; zero escape bytes; through the virtual-terminal harness the selection highlight
+;; and the pager are read back per cell on a colour target.
 ;; ======================================================================
 
 ;; No selection: bounded return values, zero escapes.
@@ -284,58 +300,47 @@
     (test-assert "grid: the scrolled render still carries zero ESC on a plain sink"
       (not (has-esc? (get-output-string sp))))))
 
-;; On a real pty slave the grid renders escapes: the selection's truecolour
-;; background and the height-cap pager both appear on the colour target.
-;; LINUX-ONLY: closing the last slave write-end makes the master read drain then
-;; EOF on Linux, but on macOS/BSD the master read BLOCKS (no EOF), hanging the
-;; drain loop.  The product render path is identical cross-platform and its
-;; escape-gating is covered by the plain-sink assertions above on every OS, so
-;; gate the pty round-trip (asserting escapes DO appear on a real tty) to Linux.
-(unless (eq? os-family 'linux)
-  (display "  completion-overlay: pty master-drain tests skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
-
-(when (eq? os-family 'linux)  ; see LINUX-ONLY note above
- (let-values ([(master slave-name) (open-pty)])
-  (setenv "NO_COLOR" #f)             ; unset baseline so colour-ok? is not vetoed
-  (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
-    (let ([captured
-           (with-env* '(("TERM" . "xterm"))
-             (lambda ()
-               (let-values ([(ml gc gr so)
-                             (render-completion-grid slave-out overlay-entries 2
-                                                     overlay-cols overlay-max-visible)])
-                 ml)
-               (flush-output-port slave-out)
-               (close slave-out)      ; last slave write-end -> master drains then EOFs
-               (let ([op (open-output-string)])
-                 (guard (e [#t (void)])   ; a closed-pty read may signal; stop cleanly
-                   (let drain ([count 0])
-                     (when (< count 4096)
-                       (let ([ch (read-char master)])
-                         (unless (eof-object? ch)
-                           (write-char ch op)
-                           (drain (+ count 1)))))))
-                 (get-output-string op))))])
-      (close master)
-      (test-assert "pty: the grid emits escapes on a colour target"
-        (has-esc? captured))
-      (test-assert "pty: the selection highlight (truecolour background) renders"
-        (contains-substring? captured "\x1b;[48;2;"))
-      (test-assert "pty: the height-cap pager row renders"
-        (contains-substring? captured " rows"))))))
+;; Through the virtual-terminal harness the same render-completion-grid is driven
+;; under a forced capability verdict, so its selection highlight is read back per
+;; cell on a colour target -- identically on every platform, no gate.  Selected
+;; index 2 sits inside the first visible window (max-visible 4, no scroll), so its
+;; row renders alongside the height-cap pager (menu-lines 5).  The leading newline
+;; the grid emits puts grid row 0 on folded row 1, so the selected grid row 2
+;; lands on folded row 3; the two-space indent puts the candidate's first glyph at
+;; column 2 (mirrors the per-cell truecolour-background sibling in test-vterm-attrs).
+(let* ([scr (render->screen overlay-cols
+              (lambda (p)
+                (render-completion-grid p overlay-entries 2
+                                        overlay-cols overlay-max-visible)))]
+       [sel-cell (vterm-cell scr 3 2)]
+       [blank-cell (vterm-cell scr 0 0)])
+  (test-equal "grid: the selected candidate's first glyph lands at row 3 column 2"
+    #\c (cell-glyph sel-cell))
+  (test-equal "grid: the selected cell carries the truecolour selection background"
+    '(56 62 87) (cell-bg sel-cell))
+  (test-equal "grid: the selected cell carries the truecolour selection foreground"
+    '(195 202 230) (cell-fg sel-cell))
+  (test-equal "grid: a cell outside the selection reads the default background"
+    'default (cell-bg blank-cell))
+  (test-assert "grid: the height-cap pager row renders in the folded grid"
+    (any-line-has? scr " rows")))
 
 ;; ======================================================================
-;; (e) Cycle redraws in place -- bounded PTY, the behavioural no-stacking proof.
-;; Drive the real read-expression on a pty-slave out-port with a Scheme completion
-;; prefix and repeated Tab: the first Tab opens the menu, each further Tab cycles it.
-;; The rewired repaint uses relative motion and a tracked-span clear, never a cursor
-;; save/restore, so the captured bytes carry ZERO DECSC and ZERO DECRC.  The
-;; selection highlight marks each cycled redraw exactly once, so its occurrence
-;; count stays bounded to the handful of cycles rather than growing -- the menu does
-;; not stack.  A "menu did render" sanity check keeps the no-stacking assertion
-;; non-vacuous.  Hang-free: read-key-event yields eof at key-string exhaustion, so
-;; read-expression finishes at once, and the master is drained by a single bounded
-;; loop after the slave write-end closes.
+;; (e) Cycle redraws in place -- the behavioural no-stacking proof, on a
+;; forced-caps STRING capture.  Drive the real read-expression over an
+;; open-input-string with a Scheme completion prefix and repeated Tab: the first
+;; Tab opens the menu, each further Tab cycles it.  A forced capability verdict
+;; makes read-expression emit its full escape stream to a plain string port -- no
+;; terminal, no TERM/NO_COLOR setup -- and end-of-input submits, so the drive
+;; returns at once.  The rewired repaint uses relative motion and a tracked-span
+;; clear, never a cursor save/restore, so the captured bytes carry ZERO DECSC and
+;; ZERO DECRC.  The selection highlight marks each cycled redraw exactly once, so
+;; its occurrence count stays bounded to the handful of cycles rather than growing
+;; -- the menu does not stack.  A "menu did render" sanity check keeps the
+;; no-stacking assertion non-vacuous.  These stay raw-byte assertions because the
+;; virtual terminal CONSUMES ESC7/ESC8 and folds the highlight into cells, so a
+;; folded grid cannot report their raw presence or count -- only the SOURCE of the
+;; bytes changes (a forced-caps string capture), not the assertions.
 ;; ======================================================================
 
 ;; "(ca" opens a Scheme context (the paren) whose prefix "ca" has many stable Chez
@@ -343,33 +348,20 @@
 (define cycle-keys
   (string-append "(ca" (string #\tab) (string #\tab) (string #\tab)))
 
-(when (eq? os-family 'linux)  ; see LINUX-ONLY note above (macOS/BSD pty master does not EOF)
- (let-values ([(master slave-name) (open-pty)])
-  (setenv "NO_COLOR" #f)               ; unset baseline so colour-ok? is not vetoed
-  (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
-    (let ([captured
-           (with-env* '(("TERM" . "xterm"))
-             (lambda ()
-               (read-expression "> " (open-input-string cycle-keys) slave-out)
-               (flush-output-port slave-out)
-               (close slave-out)         ; last slave write-end -> master drains then EOFs
-               (let ([op (open-output-string)])
-                 (guard (e [#t (void)])    ; a closed-pty read may signal; stop cleanly
-                   (let drain ([count 0])
-                     (when (< count 8192)
-                       (let ([ch (read-char master)])
-                         (unless (eof-object? ch)
-                           (write-char ch op)
-                           (drain (+ count 1)))))))
-                 (get-output-string op))))])
-      (close master)
-      (let ([sel-count (count-substring captured "\x1b;[48;2;")])
-        (test-assert "cycle: the menu actually rendered (selection highlight present)"
-          (>= sel-count 1))
-        (test-assert "cycle: the repaint carries no cursor save/restore (no DECSC/DECRC)"
-          (not (has-save-restore? captured)))
-        (test-assert "cycle: the menu marker stays bounded across cycles (no stacking)"
-          (<= sel-count 4)))))))
+;; Forced-caps capture: read-expression emits its full escape stream to a string
+;; port because assume-terminal-caps is forced 'on -- no terminal, no
+;; TERM/NO_COLOR setup.  The existing byte helpers then run unchanged on it.
+(let* ([sp (open-output-string)]
+       [_ (parameterize ([assume-terminal-caps 'on])
+            (read-expression "> " (open-input-string cycle-keys) sp))]
+       [captured (get-output-string sp)]
+       [sel-count (count-substring captured "\x1b;[48;2;")])
+  (test-assert "cycle: the menu actually rendered (selection highlight present)"
+    (>= sel-count 1))
+  (test-assert "cycle: the repaint carries no cursor save/restore (no DECSC/DECRC)"
+    (not (has-save-restore? captured)))
+  (test-assert "cycle: the menu marker stays bounded across cycles (no stacking)"
+    (<= sel-count 4)))
 
 ;; ======================================================================
 ;; (f) Drop-up decision -- PTY-free, the pure anchor predicate.

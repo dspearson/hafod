@@ -27,11 +27,15 @@ fail() {
 	status=1
 }
 
-# 1. Axis-B single dispatch: (machine-type) is read in exactly ONE place -- the
-#    internal platform hub -- plus the (chezscheme) re-export in internal/base.ss
-#    that the hub itself reads. Any other reader has bypassed the hub and would
-#    reintroduce a scattered, silently-Linux-defaulting platform decision.
-mt=$(scan 'machine-type' | grep -vE 'internal/platform\.ss|internal/base\.ss' || true)
+# 1. Axis-B single dispatch: (machine-type) is read only in the internal platform
+#    layer -- the platform hub internal/platform.ss, the (chezscheme) re-export in
+#    internal/base.ss that the hub reads, and internal/platform-ftypes.ss, whose
+#    meta-cond selects a per-platform define-ftype struct layout at expand time (a
+#    decision the runtime os-family cannot express) and which refuses an unknown
+#    machine-type with an explicit syntax-error rather than silently defaulting.
+#    Any OTHER reader has bypassed the platform layer and would reintroduce a
+#    scattered, silently-Linux-defaulting platform decision.
+mt=$(scan 'machine-type' | grep -vE 'internal/platform\.ss|internal/platform-ftypes\.ss|internal/base\.ss' || true)
 if [ -n "$mt" ]; then
 	fail "(machine-type) is read outside the platform hub -- route it through (hafod internal platform):"
 	printf '%s\n' "$mt" >&2

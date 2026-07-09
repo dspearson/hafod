@@ -113,8 +113,7 @@
           (only (hafod signal) with-signal-handler set-signal-handler! die-by-signal)
           (hafod exit-hooks)
           (only (hafod internal posix-tty) c-ioctl)
-          (only (hafod internal platform-constants)
-                WINSZ-WS-ROW WINSZ-WS-COL SIZEOF-WINSZ))
+          (only (hafod internal platform-ftypes) winsize-t))
 
   ;; ======================================================================
   ;; tty-info Record Type
@@ -506,30 +505,34 @@
   ;; ======================================================================
 
   ;; Query the terminal window size via ioctl(TIOCGWINSZ) and return
-  ;; (values rows cols). The struct winsize is read through the generated
-  ;; SIZEOF-WINSZ/WINSZ-WS-ROW/WINSZ-WS-COL accessors so no offset is hand
-  ;; rolled. Without an explicit fd we try stdout, stdin then stderr; with
-  ;; an fd we query that one only. When none is a terminal -- or the
+  ;; (values rows cols). The struct winsize is read through the winsize-t
+  ;; ftype: the buffer is wrapped once with make-ftype-pointer and its
+  ;; ws_row/ws_col fields are read with ftype-ref, so the compiler derives
+  ;; every offset and width from the declared layout and no byte offset is
+  ;; hand rolled. Without an explicit fd we try stdout, stdin then stderr;
+  ;; with an fd we query that one only. When none is a terminal -- or the
   ;; reported size is zero -- we fall back to a sensible 24x80. The buffer
   ;; is freed on every exit path. The shared variadic c-ioctl carries the
-  ;; winsize buffer as a uptr, so the compiler emits the correct call frame
-  ;; without a per-platform C shim.
+  ;; winsize buffer as a uptr, so it takes the pointer's integer address
+  ;; and the compiler emits the correct call frame without a per-platform
+  ;; C shim.
   (define terminal-size
     (case-lambda
       [() (terminal-size #f)]
       [(fd)
-       (let ([buf (foreign-alloc SIZEOF-WINSZ)])
+       (let ([p (make-ftype-pointer winsize-t
+                                    (foreign-alloc (ftype-sizeof winsize-t)))])
          (let try-fd ([fds (if fd (list fd) '(1 0 2))])
            (cond
              [(null? fds)
-              (foreign-free buf)
+              (foreign-free (ftype-pointer-address p))
               (values 24 80)]  ;; fallback when nothing is a terminal
              [else
-              (let ([rc (c-ioctl (car fds) TIOCGWINSZ buf)])
+              (let ([rc (c-ioctl (car fds) TIOCGWINSZ (ftype-pointer-address p))])
                 (if (zero? rc)
-                    (let ([rows (foreign-ref 'unsigned-16 buf WINSZ-WS-ROW)]
-                          [cols (foreign-ref 'unsigned-16 buf WINSZ-WS-COL)])
-                      (foreign-free buf)
+                    (let ([rows (ftype-ref winsize-t (ws_row) p)]
+                          [cols (ftype-ref winsize-t (ws_col) p)])
+                      (foreign-free (ftype-pointer-address p))
                       (values (if (> rows 0) rows 24)
                               (if (> cols 0) cols 80)))
                     (try-fd (cdr fds))))])))]))

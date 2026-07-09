@@ -12,12 +12,15 @@
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        ;; A bare (hafod terminal-caps) import also surfaces the new
+        ;; assume-terminal-caps override parameter exercised below.
         (hafod terminal-caps)
         (only (hafod environment) with-env* getenv setenv)
         (only (hafod pty) open-pty)
         (only (hafod fd-ports) open-file open/read close fdes->outport)
         (only (hafod posix) posix-open O_WRONLY)
-        (only (hafod editor render) tokenize display-colourised)
+        (only (hafod editor render) tokenize display-colourised render-line)
+        (only (hafod editor gap-buffer) make-gap-buffer gap-buffer-set-from-string!)
         (only (hafod editor editor) read-expression)
         (only (hafod editor help) show-keybindings)
         (except (chezscheme) getenv))
@@ -46,7 +49,14 @@
 ;; is provably the resolver's doing, not a missing/dumb TERM.  A passing
 ;; test-assert proves no exception escaped (the runner turns a raise into
 ;; a failure).
+;;
+;; Pitfall pin: colour-ok? now reads CLICOLOR_FORCE, and an ambient
+;; CLICOLOR_FORCE=1 would force colour on a plain (non-tty) string port,
+;; flipping the "colour-ok? on a string port is #f" assert below.  Establish a
+;; fresh CLICOLOR_FORCE-unset baseline first (setenv #f, never a with-env* #f).
 ;; ======================================================================
+
+(setenv "CLICOLOR_FORCE" #f)
 
 (with-env* '(("TERM" . "xterm"))
   (lambda ()
@@ -207,5 +217,196 @@
                   [(>= i (string-length out)) #f]
                   [(char=? (string-ref out i) #\x1b) #t]
                   [else (has-esc? (+ i 1))]))))))
+
+;; ======================================================================
+;; The assume-terminal-caps override seam: a default-off parameter that
+;; forces the capability verdict, so the port-gated render path emits its
+;; full escape stream into a plain string port with no pty and no real tty.
+;; Cases (1)-(3) need no terminal at all; case (4) uses a pty slave only to
+;; prove 'off wins even when the live probe would otherwise say "yes".
+;; ======================================================================
+
+;; A gap buffer pre-filled with s (cursor left at the end of the text).
+(define (buffer-from s)
+  (let ([gb (make-gap-buffer)])
+    (gap-buffer-set-from-string! gb s)
+    gb))
+
+;; Establish an unset baseline so the forced-'on cases prove the override
+;; ignores the environment (unset via setenv #f, never via a with-env* #f).
+(setenv "TERM" #f)
+(setenv "NO_COLOR" #f)
+
+;; (1) DEFAULT-OFF, byte-identical: with the parameter unset, render-line into
+;; a string port emits ZERO escape bytes -- exactly as before the seam existed.
+;; This pins that the seam causes no behavioural change when it is unused (the
+;; additive-API regression guard).
+(test-assert "assume-terminal-caps unset: render-line to a string port emits zero ESC"
+  (let ([sp (open-output-string)])
+    (render-line sp "> " (buffer-from "(+ 1 2)") 0 80)
+    (not (has-esc? (get-output-string sp)))))
+
+;; (2) FORCED-ON predicates: 'on forces both predicates #t for any target,
+;; bypassing the fd/tty/TERM probe -- with no TERM set at all, and even under a
+;; set NO_COLOR (which would veto colour-ok? on the live path).
+(test-assert "assume-terminal-caps 'on forces ansi-ok? #t on a string port (no TERM)"
+  (parameterize ([assume-terminal-caps 'on])
+    (ansi-ok? (open-output-string))))
+(test-assert "assume-terminal-caps 'on forces colour-ok? #t on a string port (no TERM)"
+  (parameterize ([assume-terminal-caps 'on])
+    (colour-ok? (open-output-string))))
+(test-assert "assume-terminal-caps 'on makes colour-ok? bypass the NO_COLOR veto"
+  (with-env* '(("NO_COLOR" . "1"))
+    (lambda ()
+      (parameterize ([assume-terminal-caps 'on])
+        (and (ansi-ok? (open-output-string))
+             (colour-ok? (open-output-string)))))))
+
+;; (3) FORCED-ON emission: inside the same override, render-line into a string
+;; port now DOES emit escape bytes -- the port gate flipped, so the harness can
+;; capture the full escape stream with no pty.
+(test-assert "assume-terminal-caps 'on makes render-line emit ESC to a string port"
+  (parameterize ([assume-terminal-caps 'on])
+    (let ([sp (open-output-string)])
+      (render-line sp "> " (buffer-from "(+ 1 2)") 0 80)
+      (has-esc? (get-output-string sp)))))
+
+;; (4) FORCED-OFF: 'off forces both predicates #f even on a genuine tty (a pty
+;; slave) under a capable TERM -- proving the explicit-off path wins over the
+;; live verdict.  No master read/drain occurs, so this stays cross-platform and
+;; hang-free.
+(let-values ([(master slave-name) (open-pty)])
+  (let ([slave (open-file slave-name open/read)])
+    (with-env* '(("TERM" . "xterm"))
+      (lambda ()
+        (test-assert "assume-terminal-caps 'off forces ansi-ok? #f on a real tty"
+          (parameterize ([assume-terminal-caps 'off])
+            (not (ansi-ok? slave))))
+        (test-assert "assume-terminal-caps 'off forces colour-ok? #f on a real tty"
+          (parameterize ([assume-terminal-caps 'off])
+            (not (colour-ok? slave))))))
+    (close slave)
+    (close master)))
+
+;; ======================================================================
+;; The colour-override seam + the CLICOLOR_FORCE / NO_COLOR precedence.
+;; colour-override is the colour-ONLY override a launcher --color flag sets: it
+;; is consulted AFTER the assume-terminal-caps short-circuit and BEFORE the env
+;; reads, and it NEVER touches ansi-ok?.  With colour-override #f the LOCKED
+;; precedence holds -- an explicit override wins; then NO_COLOR (presence) beats
+;; CLICOLOR_FORCE; then CLICOLOR_FORCE (set and not "0") forces; then the
+;; byte-identical ansi-ok? auto path.  Proven PTY-free by parameterizing the
+;; override and toggling the two env vars, exactly as the seam cases above; the
+;; 'never / auto tty rows reuse the pty-slave idiom.  A fresh unset baseline for
+;; all three variables first (setenv #f, never a with-env* #f delta).
+;; ======================================================================
+
+(setenv "TERM" #f)
+(setenv "NO_COLOR" #f)
+(setenv "CLICOLOR_FORCE" #f)
+
+;; (1) colour-override 'always beats NO_COLOR AND a non-tty target: colour-ok? is
+;; #t on a plain string port even under NO_COLOR=1 (--color=always wins over all).
+(test-assert "colour-override 'always forces colour-ok? on a string port under NO_COLOR=1"
+  (with-env* '(("NO_COLOR" . "1"))
+    (lambda ()
+      (parameterize ([colour-override 'always])
+        (colour-ok? (open-output-string))))))
+
+;; (2) Colour-only scope (authoritative): under 'always, colour-ok? flips #t on a
+;; string port while ansi-ok? on the same port stays #f -- the cursor/alt-screen
+;; rail is untouched, so --color=always | cat emits SGR but no cursor escapes.
+(test-assert "colour-override 'always leaves ansi-ok? #f on a string port (colour-only scope)"
+  (parameterize ([colour-override 'always])
+    (and (colour-ok? (open-output-string))
+         (not (ansi-ok? (open-output-string))))))
+
+;; (3) colour-override 'never suppresses colour on a REAL tty (a pty slave) even
+;; under TERM=xterm and CLICOLOR_FORCE=1 -- --color=never beats force + a tty --
+;; while ansi-ok? on that same tty is unchanged (#t), confirming colour-only scope.
+(let-values ([(master slave-name) (open-pty)])
+  (let ([slave (open-file slave-name open/read)])
+    (with-env* '(("TERM" . "xterm") ("CLICOLOR_FORCE" . "1"))
+      (lambda ()
+        (test-assert "colour-override 'never suppresses colour-ok? on a real tty (beats force + tty)"
+          (parameterize ([colour-override 'never])
+            (not (colour-ok? slave))))
+        (test-assert "colour-override 'never leaves ansi-ok? #t on that same tty (colour-only scope)"
+          (parameterize ([colour-override 'never])
+            (ansi-ok? slave)))))
+    (close slave)
+    (close master)))
+
+;; (4) The auto (colour-override #f) precedence matrix over NO_COLOR x
+;; CLICOLOR_FORCE x {string-port, pty+xterm}.
+;;
+;; (4a) NO_COLOR beats CLICOLOR_FORCE (the locked accessibility-first rule):
+;; NO_COLOR="" present + CLICOLOR_FORCE="1" -> colour-ok? #f, on a string port and
+;; on a real tty alike.
+(test-assert "auto: NO_COLOR beats CLICOLOR_FORCE on a string port"
+  (with-env* '(("NO_COLOR" . "") ("CLICOLOR_FORCE" . "1"))
+    (lambda () (not (colour-ok? (open-output-string))))))
+(let-values ([(master slave-name) (open-pty)])
+  (let ([slave (open-file slave-name open/read)])
+    (test-assert "auto: NO_COLOR beats CLICOLOR_FORCE on a real tty under TERM=xterm"
+      (with-env* '(("TERM" . "xterm") ("NO_COLOR" . "") ("CLICOLOR_FORCE" . "1"))
+        (lambda () (not (colour-ok? slave)))))
+    (close slave)
+    (close master)))
+
+;; (4b) With NO_COLOR absent, CLICOLOR_FORCE forces on a non-tty: ="1" forces
+;; (string port -> #t); the value asymmetry vs NO_COLOR -- ="0" does NOT force,
+;; ="" DOES (being non-"0"), the mirror of the empty-NO_COLOR presence assert.
+(test-assert "auto: CLICOLOR_FORCE=1 forces colour-ok? on a string port"
+  (with-env* '(("CLICOLOR_FORCE" . "1"))
+    (lambda () (colour-ok? (open-output-string)))))
+(test-assert "auto: CLICOLOR_FORCE=0 does NOT force (string port stays #f)"
+  (with-env* '(("CLICOLOR_FORCE" . "0"))
+    (lambda () (not (colour-ok? (open-output-string))))))
+(test-assert "auto: CLICOLOR_FORCE=\"\" DOES force (non-\"0\" value; the asymmetry vs NO_COLOR)"
+  (with-env* '(("CLICOLOR_FORCE" . ""))
+    (lambda () (colour-ok? (open-output-string)))))
+
+;; (4c) CLICOLOR_FORCE="0" declines to force and falls THROUGH to ansi-ok?, so on
+;; a real tty under TERM=xterm it is #t ("0" does not suppress -- it is not
+;; NO_COLOR -- it merely does not force).
+(let-values ([(master slave-name) (open-pty)])
+  (let ([slave (open-file slave-name open/read)])
+    (test-assert "auto: CLICOLOR_FORCE=0 falls through to ansi-ok? (tty+xterm -> #t)"
+      (with-env* '(("TERM" . "xterm") ("CLICOLOR_FORCE" . "0"))
+        (lambda () (colour-ok? slave))))
+    (close slave)
+    (close master)))
+
+;; (4d) colour-override #f with CLICOLOR_FORCE unset is byte-identical to today:
+;; a string port is #f (a non-tty) and a pty slave under TERM=xterm is #t -- the
+;; mirror of the pre-existing tty/NO_COLOR asserts, pinning the no-regression path.
+(setenv "CLICOLOR_FORCE" #f)
+(setenv "NO_COLOR" #f)
+(with-env* '(("TERM" . "xterm"))
+  (lambda ()
+    (test-assert "auto: CLICOLOR_FORCE unset -> a string port stays #f (byte-identical)"
+      (not (colour-ok? (open-output-string))))))
+(let-values ([(master slave-name) (open-pty)])
+  (let ([slave (open-file slave-name open/read)])
+    (test-assert "auto: CLICOLOR_FORCE unset -> a pty slave under TERM=xterm is #t (byte-identical)"
+      (with-env* '(("TERM" . "xterm")) (lambda () (colour-ok? slave))))
+    (close slave)
+    (close master)))
+
+;; (5) The byte-level emission flip.  Under colour-override 'always, render-line
+;; into a plain string port now emits CSI colour bytes (has-csi? #t) -- whereas
+;; the assume-terminal-caps-unset render-line case above emits ZERO ESC -- so the
+;; override flips REAL emitted colour on a non-tty.  render-line is used directly
+;; here, NOT render->screen (which forces the coarse assume-terminal-caps 'on and
+;; so cannot model a colour-only override).  ansi-ok? stays #f on the string port,
+;; so no cursor/clear escapes are emitted: every ESC[ here introduces an SGR run.
+(setenv "CLICOLOR_FORCE" #f)
+(setenv "NO_COLOR" #f)
+(test-assert "colour-override 'always makes render-line emit CSI colour to a string port"
+  (parameterize ([colour-override 'always])
+    (let ([sp (open-output-string)])
+      (render-line sp "> " (buffer-from "(+ 1 2)") 0 80)
+      (has-csi? (get-output-string sp)))))
 
 (test-end)

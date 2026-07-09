@@ -119,6 +119,32 @@ below.
 .B \-\-norc
 Alias for
 .BR \-\-no\-config .
+.TP
+.BI \-\-color [ =WHEN ]
+Control colour (SGR) output.
+.I WHEN
+is
+.BR auto ,
+.BR always ,
+or
+.BR never .
+Also accepted as
+.B \-\-color
+.I WHEN
+or bare
+.B \-\-color
+(equivalent to
+.BR always ).
+An explicit
+.B \-\-color
+overrides the
+.B NO_COLOR
+and
+.B CLICOLOR_FORCE
+environment variables and the automatic terminal detection.
+This affects colour only; cursor and screen-control sequences remain gated on
+a real terminal.
+This is a non-terminating switch.
 .SH REPL MODE
 When
 .B hafod

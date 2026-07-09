@@ -6,24 +6,22 @@
 ;;;       ansi-display-width), asserted PTY-free and deterministically;
 ;;;   (b) a plain string-port sink, which emits zero escape bytes, draws no
 ;;;       ghost, and returns the LOGICAL cursor row (not the drawn total);
-;;;   (c) a real pty slave, where the cursor-up climb spans exactly the ghost-
-;;;       inclusive drawn rows above the logical typing row.
-;;; Hang-free by construction: string ports everywhere plus a single BOUNDED
-;;; master drain (EOF or a hard char cap stops it; a closed-pty read signal is
-;;; caught).  The whole suite runs with stdin redirected from /dev/null.
+;;;   (c) the real ghost frame folded through the (test vterm) virtual terminal:
+;;;       render->screen forces the capability verdict on so the renderer emits
+;;;       its full escape stream, and the cursor read back from the folded grid
+;;;       rests on the logical typing row, above the ghost's own drawn rows.
+;;; Entirely PTY-free -- it opens no terminal and needs no platform gate, so it
+;;; runs identically on every platform.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (test vterm)
         (only (hafod editor render)
               count-visual-lines cursor-visual-row ansi-display-width
-              render-line/suggestion render-line)
+              render-line/suggestion)
         (hafod editor gap-buffer)
-        (only (hafod environment) with-env* setenv)
-        (only (hafod pty) open-pty)
-        (only (hafod fd-ports) fdes->outport close)
-        (only (hafod posix) posix-open O_WRONLY)
-        (only (hafod internal platform) os-family)
+        (only (hafod environment) setenv)
         (chezscheme))
 
 ;; ======================================================================
@@ -56,34 +54,13 @@
         [(string=? (substring hay i (+ i nl)) needle) #t]
         [else (outer (+ i 1))]))))
 
-;; Scan a byte stream for every cursor-up escape ESC[<digits>A and return the
-;; list of parsed counts, in order.  A CSI that is not a bare digits-then-A
-;; sequence (an SGR colour like ESC[38;2;..m, the column move ESC[<n>G, the
-;; clear ESC[J) never matches: the run between '[' and the terminator must be
-;; digits only, and the terminator must be 'A'.
-(define (collect-cursor-ups s)
-  (let ([len (string-length s)]
-        [esc #\x1b])
-    (let scan ([i 0] [acc '()])
-      (cond
-        [(>= i len) (reverse acc)]
-        [(and (char=? (string-ref s i) esc)
-              (< (+ i 1) len)
-              (char=? (string-ref s (+ i 1)) #\[))
-         (let digits ([j (+ i 2)] [n 0] [saw? #f])
-           (cond
-             [(>= j len) (reverse acc)]
-             [(and (char<=? #\0 (string-ref s j)) (char<=? (string-ref s j) #\9))
-              (digits (+ j 1)
-                      (+ (* n 10)
-                         (- (char->integer (string-ref s j)) (char->integer #\0)))
-                      #t)]
-             [(and saw? (char=? (string-ref s j) #\A))
-              (scan (+ j 1) (cons n acc))]
-             [else (scan (+ j 1) acc)]))]
-        [else (scan (+ i 1) acc)]))))
-
 (test-begin "render-geometry")
+
+;; Pitfall pin: the plain-string-port render asserts in section (b) gate on the
+;; live colour-ok?, which now reads CLICOLOR_FORCE; an ambient CLICOLOR_FORCE=1
+;; would force colour on the non-tty sink and flip the zero-escape asserts.  Pin
+;; it unset for the whole suite.
+(setenv "CLICOLOR_FORCE" #f)
 
 ;; ======================================================================
 ;; (a) Pure geometry -- PTY-free, deterministic.
@@ -154,54 +131,35 @@
     1 row))
 
 ;; ======================================================================
-;; (c) Real pty slave -- the cursor climbs back over the ghost's own rows.
-;; On a pty slave ansi-ok?/colour-ok? are #t, so the ghost is drawn and the
-;; cursor repositioned.  With prev-lines 0 the ONLY ESC[<n>A in the stream is
-;; that reposition climb, whose n must equal the ghost-inclusive drawn rows
-;; minus the logical cursor row.  The master is drained with a single bounded
-;; loop after the slave write-end is closed, so it can never block.
+;; (c) The real ghost frame folded through the virtual terminal -- the cursor
+;; climbs back over the ghost's own rows onto the user's logical typing row.
+;; render->screen forces the capability verdict on, so render-line/suggestion
+;; emits its full escape stream (the ghost draw plus the cursor-up climb) to a
+;; string port; the harness folds that climb into vterm-cursor-row.  The derived
+;; cursor must rest on the logical typing row (cursor-visual-row of the buffer
+;; alone), never stranded on the suggestion's bottom row, and the grid must have
+;; genuinely grown extra rows below it, so the assertion is not vacuous.
 ;; ======================================================================
 
-;; LINUX-ONLY pty round-trip: the master read drains then EOFs on Linux after the
-;; slave closes, but on macOS/BSD it is unreliable (blocks or returns partial
-;; data).  The geometry it checks is platform-agnostic; see test-completion-overlay.
-(unless (eq? os-family 'linux)
-  (display "  render-geometry: pty round-trip test skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
-(when (eq? os-family 'linux)
- (let* ([pty-prompt "> "]
-       [pty-before "(a\n(b"]           ; buffer text, cursor left at end
-       [pty-sugg "X\nY\nZ"]            ; multi-line ghost suggestion
-       [pty-cols 80]
-       [pty-pw (ansi-display-width pty-prompt)]
-       [expected-climb
-        (- (count-visual-lines pty-pw (string-append pty-before pty-sugg) pty-cols)
-           (cursor-visual-row pty-pw pty-before pty-cols))])
-  (let-values ([(master slave-name) (open-pty)])
-    (setenv "NO_COLOR" #f)             ; unset baseline so colour-ok? is not vetoed
-    (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
-      (let ([captured
-             (with-env* '(("TERM" . "xterm"))
-               (lambda ()
-                 (let ([gb (buffer-from pty-before)])
-                   (render-line/suggestion slave-out pty-prompt gb 0 pty-sugg pty-cols))
-                 (flush-output-port slave-out)
-                 (close slave-out)     ; last slave write-end -> master drains then EOFs
-                 (let ([op (open-output-string)])
-                   (guard (e [#t (void)])   ; a closed-pty read may signal; stop cleanly
-                     (let drain ([count 0])
-                       (when (< count 4096)
-                         (let ([ch (read-char master)])
-                           (unless (eof-object? ch)
-                             (write-char ch op)
-                             (drain (+ count 1)))))))
-                   (get-output-string op))))])
-        (close master)
-        ;; Sanity: the ghost genuinely adds rows, so the assertion below is not
-        ;; a vacuous "() equals ()".
-        (test-assert "pty: drawn total exceeds the logical cursor row (ghost owns rows)"
-          (> expected-climb 0))
-        (test-equal "pty: cursor climbs exactly the ghost-inclusive rows above the typing row"
-          (list expected-climb)
-          (collect-cursor-ups captured)))))))
+(let* ([prompt "> "]
+       [before "(a\n(b"]               ; multi-line buffer, cursor left at end
+       [suggestion "X\nY\nZ"]          ; multi-line ghost suggestion
+       [cols 80]
+       [typing-row (cursor-visual-row (ansi-display-width prompt) before cols)]
+       [scr (render->screen cols
+              (lambda (p)
+                (render-line/suggestion
+                  p prompt (buffer-from before) 0 suggestion cols)))])
+  ;; The derived cursor -- folded from the renderer's real climb -- rests on the
+  ;; logical typing row the geometry oracle predicts, not the ghost's bottom row.
+  (test-equal "ghost: cursor climbs back to the logical typing row (oracle-agreed)"
+    typing-row (vterm-cursor-row scr))
+  (test-equal "ghost: the logical typing row is row 1 for the two-line buffer"
+    1 (vterm-cursor-row scr))
+  ;; The suggestion genuinely added rows BELOW the typing row (row 1), so the
+  ;; total drawn rows must exceed typing-row + 1.  This fails -- with teeth -- if
+  ;; the ghost drew nothing (rows would then equal the 2-line buffer's 2).
+  (test-assert "ghost: the suggestion genuinely added rows below the typing row"
+    (> (vterm-rows scr) (+ 1 (vterm-cursor-row scr)))))
 
 (test-end)

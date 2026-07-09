@@ -154,6 +154,33 @@ out=$("$HAFOD" "$TMPDIR/args.ss" one two 2>&1)
 assert_eq "bare filename passes args" "one two " "$out"
 
 # ======================================================================
+section "--color[=WHEN] flag (colour control)"
+# ======================================================================
+
+# An invalid WHEN is rejected like the other bad-arg paths (exit 1).
+assert_exit "--color=bogus exits 1" 1 "$HAFOD" --color=bogus -c '(display 1)'
+
+# All three spellings are non-terminating and must NOT swallow a following
+# script: each still runs simple.ss (prints "simple-ok"), proving --color
+# composes with a bare-filename terminator and leaves the positional intact.
+out=$("$HAFOD" --color=never "$TMPDIR/simple.ss" 2>&1)
+assert_eq "--color=WHEN runs following script" "simple-ok" "$out"
+
+out=$("$HAFOD" --color never "$TMPDIR/simple.ss" 2>&1)
+assert_eq "--color WHEN (space form) runs following script" "simple-ok" "$out"
+
+out=$("$HAFOD" --color "$TMPDIR/simple.ss" 2>&1)
+assert_eq "bare --color runs following script" "simple-ok" "$out"
+
+# --color composes with a -c terminator.
+out=$("$HAFOD" --color=always -c '(display 42)' 2>&1)
+assert_eq "--color composes with -c" "42" "$out"
+
+# --help advertises the flag.
+out=$("$HAFOD" --help 2>&1)
+assert_contains "--help mentions --color" "--color" "$out"
+
+# ======================================================================
 section "-e entry point"
 # ======================================================================
 

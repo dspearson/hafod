@@ -2,24 +2,27 @@
 ;;; The active editing mode is always visible through the cursor shape and
 ;;; colour, so the textual "-- NORMAL --" / "-- VISUAL --" row is redundant and
 ;;; OFF by default; a user's init may switch it on with (show-mode-indicator?
-;;; #t).  Four PTY-free-or-bounded layers:
+;;; #t).  Four PTY-free layers:
 ;;;   (A) the gate: editor-mode-indicator is #f in every mode by default, and
 ;;;       yields the mode strings only when the parameter is switched on;
 ;;;   (B) geometry: what the default feeds the renderer -- a #f indicator --
 ;;;       draws no extra row and is byte-identical to a plain render-line on a
 ;;;       non-tty string port;
-;;;   (C) a real pty slave (ansi-ok?/colour-ok? #t): the indicator row IS drawn
-;;;       while editing, and the suppressed re-render the submit path performs
-;;;       clears it, so no "-- NORMAL --" residue remains to collide with the
+;;;   (C) the (test vterm) harness (ansi-ok?/colour-ok? forced on): two frames
+;;;       fold into one virtual-terminal capture -- frame 1 draws the indicator
+;;;       row while editing, frame 2 is the suppressed submit re-render whose
+;;;       \r ESC[J climbs over and erases it -- and the folded grid collapses to
+;;;       the single edit row with no "-- NORMAL --" residue to collide with the
 ;;;       printed result;
 ;;;   (D) regression: the toggle governs only the indicator -- an emacs region
 ;;;       and a vi visual still resolve through editor-selection-range with it on.
-;;; Hang-free by construction: string ports everywhere plus a single BOUNDED
-;;; master drain (EOF or a hard char cap stops it; a closed-pty read is caught).
+;;; Entirely PTY-free: it opens no terminal and needs no platform gate, so it
+;;; runs identically on every platform.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (test vterm)
         (hafod editor editor)
         (hafod editor gap-buffer)
         (hafod editor kill-ring)
@@ -30,11 +33,7 @@
         (only (hafod editor render)
               render-line render-line/selection
               cursor-visual-row ansi-display-width)
-        (only (hafod environment) with-env* setenv)
-        (only (hafod pty) open-pty)
-        (only (hafod fd-ports) fdes->outport close)
-        (only (hafod posix) posix-open O_WRONLY)
-        (only (hafod internal platform) os-family)
+        (only (hafod environment) setenv)
         (chezscheme))
 
 ;; ======================================================================
@@ -83,38 +82,22 @@
         [(string=? (substring hay i (+ i nl)) needle) #t]
         [else (outer (+ i 1))]))))
 
-;; Start index of the LAST occurrence of NEEDLE in HAY, or #f.
-(define (last-index-of hay needle)
-  (let ([hl (string-length hay)]
-        [nl (string-length needle)])
-    (let outer ([i (- hl nl)])
-      (cond
-        [(< i 0) #f]
-        [(string=? (substring hay i (+ i nl)) needle) i]
-        [else (outer (- i 1))]))))
-
-;; Remove every CSI SGR run (ESC '[' ... 'm') from S, leaving the plain text.
-;; The colourised buffer redraw interleaves SGR runs between tokens, so the
-;; buffer text is only contiguous once the SGR is stripped.
-(define (strip-sgr s)
-  (let ([n (string-length s)]
-        [op (open-output-string)])
-    (let loop ([i 0])
-      (cond
-        [(>= i n) (get-output-string op)]
-        [(and (char=? (string-ref s i) #\x1b)
-              (< (+ i 1) n)
-              (char=? (string-ref s (+ i 1)) #\[))
-         (let skip ([j (+ i 2)])
-           (cond
-             [(>= j n) (get-output-string op)]
-             [(char=? (string-ref s j) #\m) (loop (+ j 1))]
-             [else (skip (+ j 1))]))]
-        [else
-         (write-char (string-ref s i) op)
-         (loop (+ i 1))]))))
+;; Does ANY row of the folded grid contain NEEDLE?
+(define (any-line-has? scr needle)
+  (let loop ([lines (vterm-lines scr)])
+    (cond
+      [(null? lines) #f]
+      [(contains-substring? (car lines) needle) #t]
+      [else (loop (cdr lines))])))
 
 (test-begin "mode-indicator")
+
+;; Pitfall pin: section (B) renders through the live colour-ok? on a plain
+;; string port and asserts zero escape bytes.  colour-ok? now reads
+;; CLICOLOR_FORCE, so an ambient CLICOLOR_FORCE=1 would force colour on that
+;; non-tty sink and flip the assert.  Pin it unset for the whole suite (no
+;; with-env* delta here sets it, so this baseline persists).
+(setenv "CLICOLOR_FORCE" #f)
 
 ;; ======================================================================
 ;; (A) The gate: default OFF, opt-in ON.
@@ -194,66 +177,48 @@
     (not (contains-substring? out1 "-- NORMAL --"))))
 
 ;; ======================================================================
-;; (C) Real pty slave: the indicator draws, and the submit re-render clears it.
+;; (C) Harness: the indicator draws, and the submit re-render clears it.
 ;; ======================================================================
 
-;; Two frames on a pty slave (ansi-ok?/colour-ok? #t):
-;;   frame 1: render-line/selection WITH the indicator -- draws "-- NORMAL --"
-;;            on its own row below the edit line (the pre-submit state);
-;;   frame 2: render-line with the indicator suppressed -- the exact call the
-;;            submit path (finish!) makes: it climbs to the prompt line and
-;;            clears to end of screen, wiping the indicator row, then redraws.
-;; After the LAST clear-to-end-of-screen (ESC[J) no "-- NORMAL --" remains, so
-;; the result printed next cannot collide with it.
-;; LINUX-ONLY pty round-trip: closing the slave write-end makes the master read
-;; drain then EOF on Linux, but on macOS/BSD the master read is unreliable (blocks
-;; or returns partial data), so this fails/hangs off Linux.  The render path is
-;; platform-agnostic and its escape-gating is covered by the string-port
-;; assertions above on every OS; see test-completion-overlay for the rationale.
-(unless (eq? os-family 'linux)
-  (display "  mode-indicator: pty round-trip test skipped on non-Linux (EOF-on-slave-close is Linux-specific)\n"))
-(when (eq? os-family 'linux)
- (let* ([prompt "> "]
-       [text "(+ 9 5 4)"]
-       [cols 80])
-  (let-values ([(master slave-name) (open-pty)])
-    (setenv "NO_COLOR" #f)              ; unset so colour-ok? is not vetoed
-    (let ([slave-out (fdes->outport (posix-open slave-name O_WRONLY 0))])
-      (let ([captured
-             (with-env* '(("TERM" . "xterm"))
-               (lambda ()
-                 (let* ([gb (buffer-from text)]
-                        [r (render-line/selection slave-out prompt gb 0
-                                                  #f "-- NORMAL --" cols)])
-                   ;; The suppressed re-render finish! performs on submit.
-                   (render-line slave-out prompt gb r cols))
-                 (flush-output-port slave-out)
-                 (close slave-out)       ; last write-end -> master drains then EOFs
-                 (let ([op (open-output-string)])
-                   (guard (e [#t (void)])   ; a closed-pty read may signal; stop cleanly
-                     (let drain ([count 0])
-                       (when (< count 8192)
-                         (let ([ch (read-char master)])
-                           (unless (eof-object? ch)
-                             (write-char ch op)
-                             (drain (+ count 1)))))))
-                   (get-output-string op))))])
-        (close master)
-        ;; Sanity: the indicator really was drawn (frame 1), else the clear
-        ;; assertion below would be vacuous.
-        (test-assert "pty: the indicator row is drawn while editing"
-          (contains-substring? captured "-- NORMAL --"))
-        ;; The submit re-render clears to end of screen; after that final ESC[J
-        ;; the buffer is redrawn but the indicator is gone.
-        (let* ([j (last-index-of captured "\x1b;[J")]
-               [tail (if j (substring captured (+ j 3) (string-length captured))
-                         captured)])
-          (test-assert "pty: a clear-to-end-of-screen (ESC[J) is emitted on the submit re-render"
-            (and j #t))
-          (test-assert "pty: the buffer is redrawn after the final clear"
-            (contains-substring? (strip-sgr tail) text))
-          (test-assert "pty: no -- NORMAL -- residue remains after the final clear"
-            (not (contains-substring? tail "-- NORMAL --")))))))))
+;; Two frames folded into ONE virtual-terminal capture.  render->screen forces
+;; the capability verdict on, so a plain string port emits its full escape
+;; stream (ansi-ok?/colour-ok? #t) with no terminal:
+;;   frame 1: render-line/selection WITH the indicator draws "-- NORMAL --" on
+;;            its own row below the edit line (the pre-submit state);
+;;   frame 2: the bare render-line the submit path (finish!) performs -- passing
+;;            frame 1's returned cursor row as prev-lines, it climbs to the
+;;            prompt line and clears to end of screen (\r ESC[J), wiping the
+;;            indicator row, then redraws with the indicator suppressed.
+;; Reading the folded grid proves the residue is absent from the SCREEN itself,
+;; strictly stronger than the old scan for "absent after the last ESC[J": the
+;; grid collapses to the single edit row, so the printed result cannot collide
+;; with a leftover indicator.
+
+;; Sanity first: a single frame WITH the indicator really does draw it on its
+;; own row, so the erase assertion below is not vacuously true.
+(let* ([scr (render->screen 80
+              (lambda (p)
+                (render-line/selection p "> " (buffer-from "(+ 9 5 4)")
+                                       0 #f "-- NORMAL --" 80)))])
+  (test-assert "harness: frame 1 has at least the edit row plus an indicator row"
+    (>= (vterm-rows scr) 2))
+  (test-equal "harness: the indicator is drawn on its own row"
+    "-- NORMAL --" (vterm-row-text scr 1)))
+
+;; The two-frame redraw: frame 2's \r ESC[J climbs over and erases the indicator
+;; row.  render-line (indicator suppressed), passed frame 1's returned row as
+;; prev-lines, is exactly the call finish! makes on submit.
+(let* ([gb (buffer-from "(+ 9 5 4)")]
+       [scr (render->screen 80
+              (lambda (p)
+                (let ([r (render-line/selection p "> " gb 0 #f "-- NORMAL --" 80)])
+                  (render-line p "> " gb r 80))))])
+  (test-equal "harness: the final grid collapses to the single edit row"
+    1 (vterm-rows scr))
+  (test-equal "harness: the edit line survives the redraw"
+    "> (+ 9 5 4)" (vterm-row-text scr 0))
+  (test-assert "harness: no -- NORMAL -- residue remains in any row"
+    (not (any-line-has? scr "-- NORMAL --"))))
 
 ;; ======================================================================
 ;; (D) Regression: the toggle governs only the indicator, never the selection.

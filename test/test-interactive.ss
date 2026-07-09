@@ -8,6 +8,11 @@
 
 (test-begin "interactive")
 
+;; Pitfall pin: the REPL-output asserts below render through the live colour-ok?,
+;; which now reads CLICOLOR_FORCE; an ambient CLICOLOR_FORCE=1 would force colour
+;; on the non-tty string sink and flip the zero-escape asserts.  Pin it unset.
+(setenv "CLICOLOR_FORCE" #f)
+
 ;; Helper: string-contains (not built into Chez)
 (define (string-contains haystack needle)
   (let ([hlen (string-length haystack)]
