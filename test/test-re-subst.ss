@@ -2,7 +2,26 @@
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
         (hafod re)
+        (hafod posix)
         (chezscheme))
+
+;; Fail-fast watchdog: fork a sibling that SIGKILLs this process after `seconds`,
+;; so a substitution that regresses to O(M^2) reverse/append or M-deep recursion
+;; dies deterministically instead of stalling the suite. Cancels the watchdog on
+;; the happy path and returns the thunk's value. victim is bound in an OUTER let,
+;; fully evaluated before the inner (posix-fork): Chez evaluates let inits
+;; right-to-left, so a single flat let would fork before (posix-getpid) and the
+;; child would SIGKILL itself, not the test process. The nested lets fix the
+;; order. (Shape copied from test-process.ss.)
+(define (with-watchdog seconds thunk)
+  (let ([victim (posix-getpid)])
+    (let ([wpid (posix-fork)])
+      (if (zero? wpid)
+          (begin (posix-sleep seconds) (posix-kill victim SIGKILL) (posix-_exit 0))
+          (let ([result (thunk)])
+            (posix-kill wpid SIGKILL)
+            (posix-waitpid wpid 0)
+            result)))))
 
 (test-begin "SRE Substitution and Folding")
 
@@ -69,6 +88,18 @@
   "HELLO"
   (regexp-substitute/global #f (rx (submatch alpha)) "hello"
     'pre (lambda (m) (string-upcase (match:substring m 0))) 'post))
+
+;; A large-M global substitution: M adjacent single-char matches, each replaced
+;; by "X". A single-pass O(M+N) accumulator handles this in well under a second
+;; with a bounded stack; a pre-fix implementation instead spends O(M^2) in
+;; per-'post reverse/append (and recurses M deep), which the watchdog kills. The
+;; assertion is byte-exact -- M copies of "X" -- so it also proves the rewrite
+;; preserved the 'pre/replacement/'post interleaving at scale.
+(test-equal "regexp-substitute/global handles a large match count in linear time"
+  (make-string 100000 #\X)
+  (with-watchdog 10
+    (lambda ()
+      (regexp-substitute/global #f (rx "a") (make-string 100000 #\a) 'pre "X" 'post))))
 
 ;; ========== regexp-fold ==========
 

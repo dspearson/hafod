@@ -175,8 +175,25 @@
 
   ;; call-terminally: run thunk, flush ports, then %exit 0. Never returns.
   ;; Used in child processes to ensure they don't return into parent's continuation.
+  ;; An uncaught exception in the thunk is contained here: without the guard a
+  ;; raise unwinds through the child's copy of the fork-time continuation back
+  ;; into the parent's evaluator, so the child starts behaving as a second
+  ;; interactive process. Instead, report one line to the child's own stderr and
+  ;; exit non-zero. The report is flushed explicitly because %exit is _exit and
+  ;; does not flush; an inner guard keeps a formatting or write failure from
+  ;; escaping past the exit, and %exit (not exit) skips the parent's exit-hooks.
   (define (call-terminally thunk)
-    (thunk)
+    (guard (exn [#t
+                 (guard (ignored [#t (void)])
+                   (let ([p (current-error-port)])
+                     (display "hafod: uncaught exception in child process: " p)
+                     (if (condition? exn)
+                         (display-condition exn p)
+                         (display exn p))
+                     (newline p)
+                     (flush-output-port p)))
+                 (%exit 1)])
+      (thunk))
     (flush-all-ports)
     (%exit 0))
 
@@ -468,6 +485,19 @@
                 (posix-close (cdr p)))
               pipes))
 
+  ;; Reap children already launched when a pipeline aborts mid-launch, so a
+  ;; partially-launched pipeline leaves no zombie/orphan behind. SIGKILL is
+  ;; uncatchable, so each child is guaranteed to exit and the following blocking
+  ;; wait on that specific pid cannot hang; the per-child guard keeps one child's
+  ;; cleanup failure from aborting the rest. posix-waitpid is already EINTR-safe.
+  (define (reap-launched-children procs)
+    (for-each
+      (lambda (p)
+        (guard (_ [#t #f])
+          (posix-kill (proc:pid p) SIGKILL)
+          (posix-waitpid (proc:pid p) 0)))
+      procs))
+
   (define (spawn-pipeline cmds)
     (flush-all-ports)
     (let* ([n (length cmds)]
@@ -475,18 +505,22 @@
       (with-cwd+umask-aligned
         (lambda ()
           (let* ([pipes (make-pipes (- n 1))]
-                 [all-fds (append (map car pipes) (map cdr pipes))])
-            (guard (e [#t (close-pipe-fds pipes) (raise e)])
+                 [all-fds (append (map car pipes) (map cdr pipes))]
+                 [launched '()])
+            ;; launched holds the stages spawned so far, visible to the guard so
+            ;; a mid-loop spawn failure reaps them before the fd hygiene + re-raise.
+            (guard (e [#t (reap-launched-children launched)
+                          (close-pipe-fds pipes) (raise e)])
               (let ([procs
-                     (let loop ([cmds cmds] [stage 0] [acc '()])
-                       (if (null? cmds) (reverse acc)
+                     (let loop ([cmds cmds] [stage 0])
+                       (if (null? cmds) (reverse launched)
                            (let* ([cmd (car cmds)]
                                   [prog (stringify (car cmd))]
                                   [args (map stringify (cdr cmd))]
                                   [fa (pipeline-file-actions stage n pipes all-fds #f)]
                                   [pid (posix-spawnp prog (cons prog args) fa env-strs)])
-                             (loop (cdr cmds) (+ stage 1)
-                                   (cons (new-child-proc pid) acc)))))])
+                             (set! launched (cons (new-child-proc pid) launched))
+                             (loop (cdr cmds) (+ stage 1)))))])
                 ;; Close all pipe fds in parent
                 (close-pipe-fds pipes)
                 procs)))))))
@@ -504,15 +538,19 @@
                  [out-rfd (car out-pipe)]
                  [out-wfd (cdr out-pipe)]
                  [all-fds (append (map car pipes) (map cdr pipes)
-                                  (list out-rfd out-wfd))])
+                                  (list out-rfd out-wfd))]
+                 [launched '()])
+            ;; launched holds the stages spawned so far, visible to the guard so
+            ;; a mid-loop spawn failure reaps them before the fd hygiene + re-raise.
             (guard (e [#t
+                       (reap-launched-children launched)
                        (close-pipe-fds pipes)
                        (posix-close out-rfd)
                        (posix-close out-wfd)
                        (raise e)])
               (let ([procs
-                     (let loop ([cmds cmds] [stage 0] [acc '()])
-                       (if (null? cmds) (reverse acc)
+                     (let loop ([cmds cmds] [stage 0])
+                       (if (null? cmds) (reverse launched)
                            (let* ([cmd (car cmds)]
                                   [prog (stringify (car cmd))]
                                   [args (map stringify (cdr cmd))]
@@ -520,8 +558,8 @@
                                   [fa (pipeline-file-actions stage n pipes all-fds
                                         (and last? out-wfd))]
                                   [pid (posix-spawnp prog (cons prog args) fa env-strs)])
-                             (loop (cdr cmds) (+ stage 1)
-                                   (cons (new-child-proc pid) acc)))))])
+                             (set! launched (cons (new-child-proc pid) launched))
+                             (loop (cdr cmds) (+ stage 1)))))])
                 ;; Close all pipe fds in parent
                 (close-pipe-fds pipes)
                 (posix-close out-wfd)

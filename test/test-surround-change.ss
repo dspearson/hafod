@@ -7,7 +7,7 @@
 ;;; quote old preserves it), that the b/B/r/a aliases resolve on both sides, that
 ;;; bracket detection is lexer- and type-aware (the innermost pair of the
 ;;; requested type, a ) inside a string never the closer), that the quote
-;;; families resolve only with the cursor on the opening quote, and that a
+;;; families resolve from the opening quote and from inside the quotes, and that a
 ;;; missing pair, an invalid new delimiter, or a non-delimiter old char is a safe
 ;;; no-op that raises nothing. Everything is driven through vi-process-key with
 ;;; bounded string ports, so the suite needs no terminal and can never block.
@@ -125,15 +125,15 @@
 (test-equal "cs)] on (a \"b)c\" d) ignores the paren inside the string"
   "[a \"b)c\" d]" (cs! "(a \"b)c\" d)" 1 ")]"))
 
-;; --- Quote families: the cursor-on-the-opening-quote limitation (both ways) --
+;; --- Quote families: resolved from the opening quote AND from inside ---------
 
-;; With the cursor ON the opening quote, the same-char scan resolves the pair.
+;; With the cursor ON the opening quote, the enclosing pair resolves.
 (test-equal "cs'\" resolves with the cursor on the opening quote"
   "\"x\"" (cs! "'x'" 0 "'\""))
-;; With the cursor INSIDE the quotes, text-obj-inner-pair yields (#f #f): the
-;; documented no-op for the ' and ` families this phase does not touch.
-(test-equal "cs'\" is a no-op with the cursor inside the quotes"
-  "'x'" (cs! "'x'" 1 "'\""))
+;; And with the cursor INSIDE the quotes: the ' and ` families now resolve the
+;; enclosing pair from any inside position, in step with the double-quote family.
+(test-equal "cs'\" resolves with the cursor inside the quotes"
+  "\"x\"" (cs! "'x'" 1 "'\""))
 
 ;; --- Safe no-ops: buffer unchanged, no exception raised ---------------------
 

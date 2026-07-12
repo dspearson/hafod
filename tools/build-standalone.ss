@@ -224,7 +224,14 @@
 (generate-wpo-files #t)
 (compile-imported-libraries #t)
 (library-directories '(("src" . "src")))
-(compile-program "bin/hafod.sps")
+;; Compile to our own build directory, NOT to bin/hafod.so. The standalone binary
+;; embeds this program alongside an embedded boot image of the libraries, so it does
+;; not want the whole-program merge that tools/compile-launcher.ss applies to the
+;; library-mode launcher. Writing to bin/hafod.so here would overwrite that merged
+;; image with an unmerged one -- and, being newer than its prerequisites, make would
+;; then consider it up to date and never re-merge it.
+(define standalone-program-so (format "~a/hafod-program.so" build-dir))
+(compile-program "bin/hafod.sps" standalone-program-so)
 
 ;; ======================================================================
 ;; Step 4: Generate C byte arrays
@@ -269,7 +276,7 @@
 (emit-c-compressed-array (format "~a/hafod_boot_data.c" build-dir) "hafod_boot"
   hafod-vfasl-file)
 (emit-c-array (format "~a/prog_data.c" build-dir) "hafod_program"
-  "bin/hafod.so")
+  standalone-program-so)
 
 ;; ======================================================================
 ;; Step 5: Compile and link C binary

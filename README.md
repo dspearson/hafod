@@ -99,8 +99,13 @@ hafod supports three build modes:
 | Mode | Command | Output | Size | Startup | Runtime dependencies |
 |------|---------|--------|------|---------|---------------------|
 | Native (default) | `make` | `bin/hafod-native` | ~850KB | ~85ms | boot files + compiled libs (copied in on install) |
-| Library | `make compile` | `bin/hafod` | n/a | ~87ms | `scheme` on PATH |
+| Library | `make compile` | `bin/hafod` | n/a | ~74ms† | `scheme` on PATH |
 | Standalone | `make standalone` | `bin/hafod-standalone` | ~5.1MB | ~62ms | none |
+
+† Since 1.9 the library launcher's image is whole-program-merged: every `(hafod)`
+library is inlined into `bin/hafod.so`, so the launcher loads one image instead of
+some sixty.  On the development host that cut its startup by ~15% (164ms → 140ms,
+best of seven); the figures in the table are indicative and host-dependent.
 
 **Native** (default) links against Chez's `libkernel.a` for a small native
 binary.  In the build tree it loads `petite.boot`/`scheme.boot` and the
@@ -142,8 +147,8 @@ resolves the version from `git describe --tags`, falling back to the tracked
 To cut a release:
 
 ```sh
-git tag v1.7               # what `hafod --version` and the man page report
-printf '1.7\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
+git tag v1.9               # what `hafod --version` and the man page report
+printf '1.9\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
 ```
 
 ## Installation
@@ -589,8 +594,11 @@ hafod adds several capabilities beyond the original scsh:
   lightweight concurrency with Go-style channels
 - **C `glob(3)` fast path** -- brace-free glob patterns use the C
   library directly
-- **Whole-program optimisation** -- `make` produces a merged `.so`
-  via `compile-whole-library` for faster startup
+- **Whole-program optimisation** -- both the umbrella library and the
+  launcher image are whole-program-merged (`compile-whole-library` for the
+  libraries, and `compile-whole-program` inlining every library into
+  `bin/hafod.so`) so the library-mode launcher loads a single image for
+  faster startup
 - **Exit hooks** -- `(hafod exit-hooks)` for registering cleanup actions
 - **Dot-file locking** -- `(hafod dot-locking)` for advisory file locks
 - **Library directory search** -- `(hafod lib-dirs)` for finding files

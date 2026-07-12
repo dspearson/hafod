@@ -67,7 +67,7 @@ mtime() {
     fi
 }
 
-# Build only with the flake-pinned Chez (10.3.0); a different Chez would produce
+# Build only with the flake-pinned Chez; a different Chez would produce
 # an incompatible launcher and is not what this test is about.
 build() {
     nix develop -c make compile </dev/null

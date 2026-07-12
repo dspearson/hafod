@@ -103,7 +103,7 @@ INSTALLED_SS="$PREFIX/lib/hafod/src/hafod/internal/chez-version.ss"
 
 section "Install into a throwaway prefix"
 
-# Build and install with the flake-pinned Chez (10.3.0); a different Chez would
+# Build and install with the flake-pinned Chez; a different Chez would
 # produce an incompatible launcher and is not what this test is about. Empty
 # DESTDIR: the wrapper bakes in the final paths, so it must run from PREFIX.
 make install PREFIX="$PREFIX" </dev/null

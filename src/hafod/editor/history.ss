@@ -8,7 +8,7 @@
           history-prev history-next history-reset-nav!
           history-save-input! history-saved-input
           history-cursor history-cursor-set!
-          history-entries history-entry-mode
+          history-entries history-count history-ref history-entry-mode
           history-set-last-mode!
           history-search-backward history-prefix-search-backward
           string-prefix?)
@@ -18,22 +18,62 @@
           (only (hafod srfi-13) string-prefix?))
 
   ;; History record:
-  ;;   db      — SQLite database handle (or #f if unavailable)
-  ;;   entries — vector of past inputs (strings), most recent last
-  ;;   modes   — parallel vector of mode symbols ('scheme or 'shell), same length as entries
-  ;;   cursor  — navigation index (-1 = at bottom / current input)
-  ;;   saved   — saved current input when navigating away from bottom
+  ;;   db          — SQLite database handle (or #f if unavailable)
+  ;;   entry-store — growable backing vector of past inputs (strings), most
+  ;;                 recent last.  Only the first `count` slots are live; the
+  ;;                 tail is spare capacity that history-add! fills before it
+  ;;                 next has to double the store.
+  ;;   mode-store  — parallel growable vector of mode symbols ('scheme or
+  ;;                 'shell); live slots track entry-store one-for-one.
+  ;;   count       — number of live entries (O(1)); may be < the store length.
+  ;;   cursor      — navigation index (-1 = at bottom / current input)
+  ;;   saved       — saved current input when navigating away from bottom
   (define-record-type history
     (fields (mutable db)
-            (mutable entries)
-            (mutable modes)
+            (mutable entry-store)
+            (mutable mode-store)
+            (mutable count)
             (mutable cursor)
             (mutable saved))
     (protocol (lambda (new)
+                ;; open-history still passes right-sized vectors; the store
+                ;; simply starts exactly full (count = length) and may
+                ;; over-allocate on a later append.
                 (lambda (db entries modes)
-                  (new db entries modes -1 "")))))
+                  (new db entries modes (vector-length entries) -1 "")))))
 
   (define max-history 10000)
+
+  ;; O(1) positional entry access (0-based, most recent last).  Callers
+  ;; guarantee 0 <= i < (history-count h) via history-count, so no bounds
+  ;; check is needed on this hot path.
+  (define (history-ref h i)
+    (vector-ref (history-entry-store h) i))
+
+  ;; O(1) mode access at the same index, under the same caller guarantee.
+  (define (history-mode-ref h i)
+    (vector-ref (history-mode-store h) i))
+
+  ;; A right-sized view of the live entries (length == count).  Reserved for
+  ;; the one-shot / per-submission consumers (deduplicate-history and history
+  ;; expansion) that legitimately want a plain vector; the per-keystroke
+  ;; readers use history-count/history-ref and never allocate here.  When the
+  ;; store is exactly full the backing vector already is the view, so it is
+  ;; returned directly (both consumers only read it); otherwise a right-sized
+  ;; copy of the live prefix is returned, dropping the spare-capacity tail.
+  (define (history-entries h)
+    (let* ([store (history-entry-store h)]
+           [count (history-count h)]
+           [capacity (vector-length store)])
+      (if (= count capacity)
+          store
+          (let ([view (make-vector count)])
+            (let loop ([i 0])
+              (if (< i count)
+                  (begin
+                    (vector-set! view i (vector-ref store i))
+                    (loop (+ i 1)))
+                  view))))))
 
   ;; Default path: ~/.hafod_history.db
   (define (default-history-path)
@@ -92,9 +132,9 @@
   (define (history-add! h input)
     (when (and (string? input)
                (> (string-length input) 0))
-      (let ([entries (history-entries h)])
-        (unless (and (> (vector-length entries) 0)
-                     (string=? input (vector-ref entries (- (vector-length entries) 1))))
+      (let ([count (history-count h)])
+        (unless (and (> count 0)
+                     (string=? input (history-ref h (- count 1))))
           ;; Persist to DB
           (let ([db (history-db h)])
             (when db
@@ -105,29 +145,34 @@
                   (sqlite3-bind-text stmt 2 "scheme")
                   (sqlite3-step stmt)
                   (sqlite3-finalize stmt)))))
-          ;; Append to in-memory vectors
-          (let* ([old (history-entries h)]
-                 [old-m (history-modes h)]
-                 [len (vector-length old)]
-                 [new (make-vector (+ len 1))]
-                 [new-m (make-vector (+ len 1))])
-            (let copy ([i 0])
-              (when (< i len)
-                (vector-set! new i (vector-ref old i))
-                (vector-set! new-m i (vector-ref old-m i))
-                (copy (+ i 1))))
-            (vector-set! new len input)
-            (vector-set! new-m len 'scheme)
-            (history-entries-set! h new)
-            (history-modes-set! h new-m))))))
+          ;; Append in amortised constant time: write into the next free slot
+          ;; and bump the count.  Only when the store is full do we double it —
+          ;; copying the live `count` elements once (the sole copy, amortised
+          ;; across the appends that filled it).
+          (when (= count (vector-length (history-entry-store h)))
+            (let* ([old (history-entry-store h)]
+                   [old-m (history-mode-store h)]
+                   [capacity (vector-length old)]
+                   [new-capacity (if (= capacity 0) 1 (* 2 capacity))]
+                   [new (make-vector new-capacity)]
+                   [new-m (make-vector new-capacity)])
+              (let copy ([i 0])
+                (when (< i count)
+                  (vector-set! new i (vector-ref old i))
+                  (vector-set! new-m i (vector-ref old-m i))
+                  (copy (+ i 1))))
+              (history-entry-store-set! h new)
+              (history-mode-store-set! h new-m)))
+          (vector-set! (history-entry-store h) count input)
+          (vector-set! (history-mode-store h) count 'scheme)
+          (history-count-set! h (+ count 1))))))
 
   ;; Update the mode of the most recent history entry.
   ;; Called by interactive.ss after input classification.
   (define (history-set-last-mode! h mode)
-    (let* ([modes (history-modes h)]
-           [len (vector-length modes)])
-      (when (> len 0)
-        (vector-set! modes (- len 1) mode)
+    (let ([count (history-count h)])
+      (when (> count 0)
+        (vector-set! (history-mode-store h) (- count 1) mode)
         ;; Update DB
         (let ([db (history-db h)])
           (when db
@@ -140,45 +185,42 @@
 
   ;; Look up the mode for a given history entry index.
   (define (history-entry-mode h idx)
-    (let ([modes (history-modes h)])
-      (if (and (>= idx 0) (< idx (vector-length modes)))
-          (vector-ref modes idx)
-          'scheme)))
+    (if (and (>= idx 0) (< idx (history-count h)))
+        (history-mode-ref h idx)
+        'scheme))
 
   ;; Navigate to previous (older) entry.
   ;; Returns the history entry string, or #f if at the oldest.
   (define (history-prev h)
-    (let* ([entries (history-entries h)]
-           [len (vector-length entries)]
-           [cur (history-cursor h)])
+    (let ([len (history-count h)]
+          [cur (history-cursor h)])
       (cond
         [(= len 0) #f]
         [(= cur -1)
          ;; First upward press: go to most recent entry
          (let ([idx (- len 1)])
            (history-cursor-set! h idx)
-           (vector-ref entries idx))]
+           (history-ref h idx))]
         [(> cur 0)
          ;; Move to older entry
          (let ([idx (- cur 1)])
            (history-cursor-set! h idx)
-           (vector-ref entries idx))]
+           (history-ref h idx))]
         [else #f])))  ; already at oldest
 
   ;; Navigate to next (newer) entry.
   ;; Returns the history entry string, or the saved input if at bottom.
   ;; Returns #f if already at bottom.
   (define (history-next h)
-    (let* ([entries (history-entries h)]
-           [len (vector-length entries)]
-           [cur (history-cursor h)])
+    (let ([len (history-count h)]
+          [cur (history-cursor h)])
       (cond
         [(= cur -1) #f]  ; already at bottom
         [(< cur (- len 1))
          ;; Move to newer entry
          (let ([idx (+ cur 1)])
            (history-cursor-set! h idx)
-           (vector-ref entries idx))]
+           (history-ref h idx))]
         [else
          ;; At most recent → return to current input
          (history-cursor-set! h -1)
@@ -228,22 +270,20 @@
   ;; h: history object, query: search string, start-idx: index to start from (inclusive).
   ;; Returns the index of the first matching entry, or #f.
   (define (history-search-backward h query start-idx)
-    (let ([entries (history-entries h)])
-      (let loop ([i start-idx])
-        (cond
-          [(< i 0) #f]
-          [(fuzzy-match query (vector-ref entries i)) i]
-          [else (loop (- i 1))]))))
+    (let loop ([i start-idx])
+      (cond
+        [(< i 0) #f]
+        [(fuzzy-match query (history-ref h i)) i]
+        [else (loop (- i 1))])))
 
   ;; Search backward through history entries for a prefix match.
   ;; h: history object, prefix: prefix string, start-idx: index to start from (inclusive).
   ;; Returns the index of the first matching entry, or #f.
   (define (history-prefix-search-backward h prefix start-idx)
-    (let ([entries (history-entries h)])
-      (let loop ([i start-idx])
-        (cond
-          [(< i 0) #f]
-          [(string-prefix? prefix (vector-ref entries i)) i]
-          [else (loop (- i 1))]))))
+    (let loop ([i start-idx])
+      (cond
+        [(< i 0) #f]
+        [(string-prefix? prefix (history-ref h i)) i]
+        [else (loop (- i 1))])))
 
 ) ; end library

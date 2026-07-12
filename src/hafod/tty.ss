@@ -84,6 +84,11 @@
 
     ;; Terminal window size
     terminal-size
+    ;; SIGWINCH-refreshed width cache: one live query on resize/entry, O(1)
+    ;; reads on the render hot path.  Leaf-only exports -- deliberately NOT
+    ;; re-exported from the (hafod) umbrella; consumers reach them via
+    ;; (only (hafod tty) ...) or the editor's wholesale leaf import.
+    refresh-terminal-size-cache! cached-terminal-size set-terminal-size-cache!
 
     ;; Raw-mode ownership and last-resort cooked-mode restore net
     with-raw-mode* current-cooked-tty-info reassert-cooked-tty!
@@ -522,19 +527,59 @@
       [(fd)
        (let ([p (make-ftype-pointer winsize-t
                                     (foreign-alloc (ftype-sizeof winsize-t)))])
-         (let try-fd ([fds (if fd (list fd) '(1 0 2))])
-           (cond
-             [(null? fds)
-              (foreign-free (ftype-pointer-address p))
-              (values 24 80)]  ;; fallback when nothing is a terminal
-             [else
-              (let ([rc (c-ioctl (car fds) TIOCGWINSZ (ftype-pointer-address p))])
-                (if (zero? rc)
-                    (let ([rows (ftype-ref winsize-t (ws_row) p)]
-                          [cols (ftype-ref winsize-t (ws_col) p)])
-                      (foreign-free (ftype-pointer-address p))
-                      (values (if (> rows 0) rows 24)
-                              (if (> cols 0) cols 80)))
-                    (try-fd (cdr fds))))])))]))
+         ;; The query runs inside a dynamic-wind whose after-thunk foreign-frees
+         ;; the winsize buffer, so it is released on every exit -- the fallback
+         ;; return, a successful return, or an unexpected raise from c-ioctl or
+         ;; ftype-ref -- never only on the two success paths.
+         (dynamic-wind
+           (lambda () #f)
+           (lambda ()
+             (let try-fd ([fds (if fd (list fd) '(1 0 2))])
+               (cond
+                 [(null? fds)
+                  (values 24 80)]  ;; fallback when nothing is a terminal
+                 [else
+                  (let ([rc (c-ioctl (car fds) TIOCGWINSZ (ftype-pointer-address p))])
+                    (if (zero? rc)
+                        (let ([rows (ftype-ref winsize-t (ws_row) p)]
+                              [cols (ftype-ref winsize-t (ws_col) p)])
+                          (values (if (> rows 0) rows 24)
+                                  (if (> cols 0) cols 80)))
+                        (try-fd (cdr fds))))])))
+           (lambda () (foreign-free (ftype-pointer-address p)))))]))
+
+  ;; ======================================================================
+  ;; Terminal window size cache
+  ;; ======================================================================
+  ;;
+  ;; A SIGWINCH-refreshed width cache, so the line editor's per-render column
+  ;; and row reads consult an O(1) cell instead of issuing a fresh TIOCGWINSZ
+  ;; ioctl (and its foreign-alloc/foreign-free) on every render.  The one live
+  ;; query runs only when the size can actually change -- on a resize (SIGWINCH)
+  ;; or at editor/finder entry -- and stores its result here; the readers on the
+  ;; hot path never touch the kernel.  The default matches terminal-size's own
+  ;; 24x80 fallback, so a read taken before the first refresh degrades exactly
+  ;; as a live query off a non-terminal would.  Held as a plain (rows . cols)
+  ;; pair: the REPL is single-threaded, so an unguarded cell store is race-free.
+  (define %terminal-size-cache (cons 24 80))
+
+  ;; Perform the ONE live terminal-size query and store its (rows . cols) in the
+  ;; cache.  Called on a resize and at editor/finder entry -- never per render.
+  (define (refresh-terminal-size-cache!)
+    (let-values ([(rows cols) (terminal-size)])
+      (set-car! %terminal-size-cache rows)
+      (set-cdr! %terminal-size-cache cols)))
+
+  ;; The O(1) cache read: (values rows cols) with no ioctl.  This is the source
+  ;; the editor's per-render column/row queries draw from.
+  (define (cached-terminal-size)
+    (values (car %terminal-size-cache) (cdr %terminal-size-cache)))
+
+  ;; Deterministic test seam: seed the cache to a known size directly, so a
+  ;; PTY-free test can prove a reader consults the cache (a distinct sentinel)
+  ;; rather than issuing a live ioctl (which off a non-terminal returns 24x80).
+  (define (set-terminal-size-cache! rows cols)
+    (set-car! %terminal-size-cache rows)
+    (set-cdr! %terminal-size-cache cols))
 
 ) ; end library

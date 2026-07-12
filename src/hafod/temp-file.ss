@@ -27,17 +27,39 @@
         (posix-close fd)
         path)))
 
+  ;; Unlink a temp file on an error path, tolerating its prior removal.
+  ;; Mirrors the ENOENT-tolerant cleanup in (hafod fileinfo): swallow "no such
+  ;; file" (the file was never created, or already unlinked) and re-raise any
+  ;; other error.
+  (define (unlink-temp-file path)
+    (guard (e [(posix-error? e)
+               (unless (= (posix-errno e) 2) (raise e))])  ; ENOENT=2 -> already gone
+      (posix-unlink path)))
+
   ;; temp-file-channel: create a temp file, unlink it, return (values inport outport).
   ;; The file has no name on the filesystem but stays alive via open fds.
   ;; This is used by run/collecting* to buffer multi-fd output without deadlock.
   (define (temp-file-channel)
     (let ([template (string-append (temp-dir) "/hafod-chan-XXXXXX")])
       (receive (path fd) (posix-mkstemp template)
-        (let ([oport (fdes->outport fd)])
-          (let ([iport (open-file path open/read)])
-            ;; Unlink immediately -- file stays alive via open fds
-            (posix-unlink path)
-            (values iport oport))))))
+        ;; Stage the cleanup of the window between mkstemp and the successful
+        ;; return.  If any step raises, release the descriptor's current owner
+        ;; -- the raw fd before the port wraps it, otherwise the port (closing
+        ;; the raw fd as well would double-close a port-owned descriptor) -- and
+        ;; unlink the temp path, then re-raise.  The success path is unchanged:
+        ;; the file is unlinked exactly once and (values inport outport) returned.
+        (let ([oport #f])
+          (guard (e [#t
+                     (if oport
+                         (guard (inner [#t #f]) (close oport))
+                         (guard (inner [#t #f]) (posix-close fd)))
+                     (unlink-temp-file path)
+                     (raise e)])
+            (set! oport (fdes->outport fd))
+            (let ([iport (open-file path open/read)])
+              ;; Unlink immediately -- file stays alive via open fds
+              (posix-unlink path)
+              (values iport oport)))))))
 
   ;; temp-file-iterate: try candidate names until maker succeeds.
   ;; MAKER is called with a filename string and should either return a value

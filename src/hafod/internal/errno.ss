@@ -5,7 +5,8 @@
 (library (hafod internal errno)
   (export &posix-error make-posix-error posix-error? posix-errno posix-syscall
           raise-posix-error posix-call with-foreign-buffer __errno_location c-strerror)
-  (import (chezscheme) (hafod internal platform))
+  (import (chezscheme) (hafod internal platform)
+          (only (hafod internal platform-constants) PLAT-EINTR))
 
   ;; Load libc symbols from the current process.  Using #f instead of a
   ;; library name works on every platform because libc is always linked
@@ -36,16 +37,34 @@
           (format "~a: ~a (errno ~a)" who (c-strerror err) err))
         (make-irritants-condition (list err)))))
 
-  ;; Core macro: call a POSIX function, check for -1 return, raise condition.
+  ;; Core macro: call a POSIX function, retry a signal-interrupted call, else
+  ;; check for -1 and raise a condition.
+  ;;
+  ;; A caught signal (a window resize, Ctrl-C, an alarm) can interrupt a
+  ;; blocking syscall, which then returns -1 with errno = PLAT-EINTR. We
+  ;; re-issue the call transparently so an interrupted waitpid/read/write does
+  ;; not abort a foreground command with a spurious &posix-error. Only EINTR
+  ;; loops; every other errno raises exactly as before, and errno is read once
+  ;; per attempt. The expression is the raw c-* call; its buffers are allocated
+  ;; outside posix-call (in with-foreign-buffer) and are reused across retries.
+  ;;
+  ;; close() is included in this uniform retry deliberately: on Linux a close
+  ;; returning EINTR has already released the descriptor, so a retry could in
+  ;; principle touch a reused fd -- but hafod's fd paths are single-threaded and
+  ;; the only reachable EINTR here is waitpid, so the single choke-point wins.
+  ;;
   ;; Usage: (posix-call name expr) where name is the syscall symbol for error messages.
   (define-syntax posix-call
     (syntax-rules ()
       [(_ name expr)
-       (let ([result expr])
-         (when (= result -1)
-           (let ([err (foreign-ref 'int (__errno_location) 0)])
-             (raise-posix-error 'name err)))
-         result)]))
+       (let retry ()
+         (let ([result expr])
+           (if (= result -1)
+               (let ([err (foreign-ref 'int (__errno_location) 0)])
+                 (if (= err PLAT-EINTR)
+                     (retry)
+                     (raise-posix-error 'name err)))
+               result)))]))
 
   ;; Macro: safely allocate one or two foreign buffers with automatic cleanup.
   ;; Usage: (with-foreign-buffer ([buf size]) body ...)

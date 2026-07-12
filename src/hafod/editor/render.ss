@@ -14,7 +14,7 @@
           ;; Reusable terminal-overlay helpers (editor + tests)
           overlay-clear! overlay-draw
           ;; Geometry helpers for external consumers (editor + tests)
-          count-visual-lines cursor-visual-row ansi-display-width
+          count-visual-lines cursor-visual-row cursor-visual-row+col ansi-display-width
           ;; Colour constants and helpers for external consumers (e.g. finder)
           paren-colours num-paren-colours
           string-colour comment-colour number-colour boolean-colour
@@ -408,14 +408,27 @@
                      (lp (+ i 1) cw (+ extra 1))
                      (lp (+ i 1) new-col extra)))])))))
 
-  ;; Count visual row of cursor position within text (for cursor-up after render).
-  (define (cursor-visual-row prompt-width before-text term-cols)
+  ;; Visual row AND column of the cursor within the text before it, in a single
+  ;; wrap-aware walk.  The column is the display width consumed on the FINAL
+  ;; visual row: it starts at prompt-width, resets to 0 at an explicit newline (a
+  ;; continuation line carries no prompt) and to the wrapped character's own width
+  ;; at a wrap boundary, so on a line that overruns term-cols it is the position
+  ;; WITHIN the final wrapped row -- not the wrap-blind width-since-the-last-
+  ;; newline that overshoots the terminal edge.  Returns a (row . col) pair;
+  ;; cursor-visual-row is a thin wrapper that keeps the original single return.
+  (define (cursor-visual-row+col prompt-width before-text term-cols)
     (if (<= term-cols 0)
-        (count-newlines before-text)
+        ;; Unknown width: no wrapping, so the column is the same wrap-blind value
+        ;; the render paths emitted before -- prompt-width on row 0 (else 0) plus
+        ;; the width after the last newline -- keeping this path byte-identical.
+        (let ([row (count-newlines before-text)])
+          (cons row
+                (+ (if (= row 0) prompt-width 0)
+                   (width-after-last-newline before-text))))
         (let ([len (string-length before-text)])
           (let lp ([i 0] [col prompt-width] [row 0])
             (cond
-              [(>= i len) row]
+              [(>= i len) (cons row col)]
               [(char=? (string-ref before-text i) #\newline)
                (lp (+ i 1) 0 (+ row 1))]
               [else
@@ -424,6 +437,48 @@
                  (if (> new-col term-cols)
                      (lp (+ i 1) cw (+ row 1))
                      (lp (+ i 1) new-col row)))])))))
+
+  ;; Count visual row of cursor position within text (for cursor-up after render).
+  (define (cursor-visual-row prompt-width before-text term-cols)
+    (car (cursor-visual-row+col prompt-width before-text term-cols)))
+
+  ;; The bundle of buffer + geometry values the three renderers each need up
+  ;; front.  Computed once by render-prologue and read back through these
+  ;; accessors, so render-line, render-line/suggestion and render-line/selection
+  ;; share one prologue rather than three verbatim copies.  Immutable: every
+  ;; field is set once at construction.
+  (define-record-type render-geom
+    (fields before after text cursor-pos prompt-width total-lines
+            cursor-row cursor-col colour? ansi?))
+
+  ;; Compute the buffer + geometry prologue shared VERBATIM by the three
+  ;; renderers.  Splitting the gap buffer, measuring the prompt and computing the
+  ;; wrap-aware cursor row/column is identical work for all three, so it is done
+  ;; here ONCE; each renderer then adds only its own tail (the ghost suggestion
+  ;; or the selection indicator).  Every step is a pure query -- no bytes are
+  ;; emitted here -- so sharing this prologue leaves each renderer's escape
+  ;; output byte-identical.
+  (define (render-prologue port prompt gb term-cols)
+    (let* ([before (gap-buffer-before-string gb)]
+           [after  (gap-buffer-after-string gb)]
+           [text (string-append before after)]
+           [cursor-pos (gap-buffer-cursor-pos gb)]
+           [prompt-width (ansi-display-width prompt)]
+           [total-lines (count-visual-lines prompt-width text term-cols)]
+           [cursor-row/col (cursor-visual-row+col prompt-width before term-cols)]
+           ;; The emitted 1-based column is the wrap-aware visual column plus 1.
+           ;; That column already carries the prompt width on row 0 and resets at
+           ;; each wrap boundary, so a line wider than the terminal lands the
+           ;; cursor within its final wrapped row rather than past the right edge.
+           [cursor-col (+ (cdr cursor-row/col) 1)]
+           ;; Decide once from the output target: colour on colour-ok?, and
+           ;; cursor/movement on ansi-ok?.  A non-terminal target (a pipe or a
+           ;; file) yields #f for both, so editing degrades to plain text with
+           ;; no escape bytes.
+           [colour? (colour-ok? port)]
+           [ansi? (ansi-ok? port)])
+      (make-render-geom before after text cursor-pos prompt-width total-lines
+                        (car cursor-row/col) cursor-col colour? ansi?)))
 
   ;; render-line: redraw prompt + buffer.  prev-lines is the cursor row
   ;; (0-indexed from prompt line) left by the *previous* render call (0 on first call).
@@ -434,22 +489,14 @@
       [(port prompt gb prev-lines)
        (render-line port prompt gb prev-lines 0)]
       [(port prompt gb prev-lines term-cols)
-       (let* ([before (gap-buffer-before-string gb)]
-              [after  (gap-buffer-after-string gb)]
-              [text (string-append before after)]
-              [cursor-pos (gap-buffer-cursor-pos gb)]
-              [prompt-width (ansi-display-width prompt)]
-              [total-lines (count-visual-lines prompt-width text term-cols)]
-              [cursor-row (cursor-visual-row prompt-width before term-cols)]
-              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
-                             (width-after-last-newline before)
-                             1)]
-              ;; Decide once from the output target: colour on colour-ok?, and
-              ;; cursor/movement on ansi-ok?.  A non-terminal target (a pipe or a
-              ;; file) yields #f for both, so editing degrades to plain text with
-              ;; no escape bytes.
-              [colour? (colour-ok? port)]
-              [ansi? (ansi-ok? port)])
+       (let* ([geom (render-prologue port prompt gb term-cols)]
+              [text (render-geom-text geom)]
+              [cursor-pos (render-geom-cursor-pos geom)]
+              [total-lines (render-geom-total-lines geom)]
+              [cursor-row (render-geom-cursor-row geom)]
+              [cursor-col (render-geom-cursor-col geom)]
+              [colour? (render-geom-colour? geom)]
+              [ansi? (render-geom-ansi? geom)])
          ;; Move up from cursor to prompt line (prev-lines = previous cursor-row)
          (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
@@ -500,18 +547,16 @@
       [(port prompt gb prev-lines suggestion)
        (render-line/suggestion port prompt gb prev-lines suggestion 0)]
       [(port prompt gb prev-lines suggestion term-cols)
-       (let* ([before (gap-buffer-before-string gb)]
-              [after  (gap-buffer-after-string gb)]
-              [text (string-append before after)]
-              [cursor-pos (gap-buffer-cursor-pos gb)]
-              [prompt-width (ansi-display-width prompt)]
-              [total-lines (count-visual-lines prompt-width text term-cols)]
-              [cursor-row (cursor-visual-row prompt-width before term-cols)]
-              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
-                             (width-after-last-newline before)
-                             1)]
-              [colour? (colour-ok? port)]
-              [ansi? (ansi-ok? port)]
+       (let* ([geom (render-prologue port prompt gb term-cols)]
+              [after (render-geom-after geom)]
+              [text (render-geom-text geom)]
+              [cursor-pos (render-geom-cursor-pos geom)]
+              [prompt-width (render-geom-prompt-width geom)]
+              [total-lines (render-geom-total-lines geom)]
+              [cursor-row (render-geom-cursor-row geom)]
+              [cursor-col (render-geom-cursor-col geom)]
+              [colour? (render-geom-colour? geom)]
+              [ansi? (render-geom-ansi? geom)]
               ;; Is the dim ghost actually drawn?  Only when colour is live and
               ;; the cursor sits at the end of the typed region -- either the real
               ;; end-of-buffer (after = "") or just before paredit's auto-inserted
@@ -579,18 +624,15 @@
       [(port prompt gb prev-lines sel-range indicator)
        (render-line/selection port prompt gb prev-lines sel-range indicator 0)]
       [(port prompt gb prev-lines sel-range indicator term-cols)
-       (let* ([before (gap-buffer-before-string gb)]
-              [after  (gap-buffer-after-string gb)]
-              [text (string-append before after)]
-              [cursor-pos (gap-buffer-cursor-pos gb)]
-              [prompt-width (ansi-display-width prompt)]
-              [total-lines (count-visual-lines prompt-width text term-cols)]
-              [cursor-row (cursor-visual-row prompt-width before term-cols)]
-              [cursor-col (+ (if (= cursor-row 0) prompt-width 0)
-                             (width-after-last-newline before)
-                             1)]
-              [colour? (colour-ok? port)]
-              [ansi? (ansi-ok? port)]
+       (let* ([geom (render-prologue port prompt gb term-cols)]
+              [text (render-geom-text geom)]
+              [cursor-pos (render-geom-cursor-pos geom)]
+              [prompt-width (render-geom-prompt-width geom)]
+              [total-lines (render-geom-total-lines geom)]
+              [cursor-row (render-geom-cursor-row geom)]
+              [cursor-col (render-geom-cursor-col geom)]
+              [colour? (render-geom-colour? geom)]
+              [ansi? (render-geom-ansi? geom)]
               ;; Is the mode indicator actually drawn?  Only on a terminal
               ;; (ansi?) with a non-empty string.  This mirrors the draw gate
               ;; below so the row count and the draw stay in lock-step.

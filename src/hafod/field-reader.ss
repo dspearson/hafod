@@ -325,8 +325,10 @@
       ((lst) (join-strings lst " "))
       ((lst delim)
        (if (null? lst) ""
-           (let loop ((rest (cdr lst)) (acc (car lst)))
-             (if (null? rest) acc
-                 (loop (cdr rest) (string-append acc delim (car rest)))))))))
+           (let ((port (open-output-string)))
+             (display (car lst) port)
+             (for-each (lambda (s) (display delim port) (display s port))
+                       (cdr lst))
+             (get-output-string port))))))
 
   ) ; end library

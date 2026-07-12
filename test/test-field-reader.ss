@@ -6,7 +6,29 @@
         (hafod rdelim)
         (hafod compat)
         (hafod internal char-sets)
+        (only (hafod posix)
+              posix-fork posix-getpid posix-kill posix-waitpid
+              posix-sleep posix-_exit SIGKILL)
         (chezscheme))
+
+;; Fail-fast watchdog: fork a sibling that SIGKILLs this process after `seconds`,
+;; so a join that degrades to a growing-accumulator O(n^2) build dies
+;; deterministically instead of stalling the suite. Cancels the watchdog on the
+;; happy path and returns the thunk's value.
+;;
+;; victim is captured in an OUTER let, fully bound before the inner (posix-fork):
+;; Chez evaluates let inits right-to-left, so a single flat let would run the fork
+;; before (posix-getpid) and the watchdog child would capture its own pid and
+;; SIGKILL itself, never the test process. The nested lets fix the order.
+(define (with-watchdog seconds thunk)
+  (let ([victim (posix-getpid)])
+    (let ([wpid (posix-fork)])
+      (if (zero? wpid)
+          (begin (posix-sleep seconds) (posix-kill victim SIGKILL) (posix-_exit 0))
+          (let ([result (thunk)])
+            (posix-kill wpid SIGKILL)
+            (posix-waitpid wpid 0)
+            result)))))
 
 (test-begin "Field Readers")
 
@@ -31,6 +53,33 @@
 (test-equal "join-strings: two elements"
   "hello world"
   (join-strings '("hello" "world")))
+
+;; Single-pass build: exercise both arities and the delimiter grammar so a
+;; port-accumulator rewrite keeps the exact n-1-delimiters-for-n-elements shape.
+
+(test-equal "join-strings: single element ignores delimiter"
+  "a"
+  (join-strings '("a")))
+
+(test-equal "join-strings: comma delimiter"
+  "a,b,c"
+  (join-strings '("a" "b" "c") ","))
+
+(test-equal "join-strings: empty delimiter concatenates"
+  "ab"
+  (join-strings '("a" "b") ""))
+
+;; Large-input throughput guard: a growing-accumulator join copies the whole
+;; result on every element (O(n^2)) and blows past the watchdog at this size,
+;; while the single-pass port build returns in milliseconds. The watchdog
+;; SIGKILLs the suite if the join has not returned within the bound, so a
+;; quadratic regression fails deterministically rather than hanging. The result
+;; length is 300000 one-char elements plus 299999 one-char delimiters.
+(test-equal "join-strings: large input joins in one linear pass"
+  (+ (* 300000 1) (* 299999 1))
+  (with-watchdog 8
+    (lambda ()
+      (string-length (join-strings (make-list 300000 "x") ",")))))
 
 ;; ========== field-splitter ==========
 

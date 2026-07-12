@@ -50,10 +50,14 @@
   ;; POSIX special characters that need escaping in string literals.
   (define posix-specials (string->char-set "{}[.*?()|\\$^+"))
 
-  ;; Pattern that can never match (assumes 7-bit ASCII).
-  ;; Equivalent to never-match-pattern but built at runtime to avoid R6RS octal restriction.
+  ;; Pattern that can never match an ASCII subject.  The low bound is \x01, not
+  ;; \x00: a literal NUL byte would terminate the C string when the pattern is
+  ;; marshalled to regcomp, truncating it to "[^" (an unterminated bracket that
+  ;; regcomp rejects).  Excluding \x01-\x7f still never-matches every ASCII
+  ;; code unit, and the bracket stays a single level-1 atom so a quantifier
+  ;; composes over it (e.g. a zero-or-more of it matches empty).
   (define never-match-pattern
-    (string #\[ #\^ (integer->char 0) #\- (integer->char 127) #\]))
+    (string #\[ #\^ (integer->char 1) #\- (integer->char 127) #\]))
 
   ;; Top-level entry point.
   (define (regexp->posix-string re)
@@ -357,10 +361,21 @@
                                   (not (char=? c #\-))
                                   (not (char=? c #\^))))
                            loose))
+           ;; A positive class must never begin with a bare ^ -- glibc would read
+           ;; it as a negation ([^-] means "not dash", not "dash or caret").  When
+           ;; ^ is the only member that could lead the interior (no ], no normal
+           ;; chars, no ranges) and - is also a member, lead with a literal -
+           ;; instead: a leading - is a POSIX-legal literal, so [-^] shields the ^
+           ;; and matches exactly - and ^.
+           (lead-dash (and in? has-caret has-dash
+                           (not has-rbracket) (null? normal) (null? ranges)))
            ;; Build the interior string:
            ;; ] must come first, ^ must not be first (for IN), - must be last
            (interior
             (string-append
+             ;; Leading - shield: only when a positive class would otherwise start
+             ;; with a bare ^ (see lead-dash above).
+             (if lead-dash "-" "")
              ;; ] first (if present)
              (if has-rbracket "]" "")
              ;; Normal chars
@@ -368,7 +383,7 @@
              ;; ^ (safe after other chars; for IN, not first)
              (if (and has-caret
                       ;; Only safe if there's something before it OR it's NOT-IN
-                      (or (not in?) has-rbracket (pair? normal)))
+                      (or (not in?) has-rbracket (pair? normal) lead-dash))
                  "^"
                  "")
              ;; Ranges
@@ -376,14 +391,14 @@
                     (map (lambda (r) (string (car r) #\- (cdr r))) ranges))
              ;; ^ at end if it would be first in IN and nothing precedes it
              (if (and has-caret in?
-                      (not has-rbracket) (null? normal))
+                      (not has-rbracket) (null? normal) (not lead-dash))
                  ;; ^ is the only char or first -- must handle specially
                  ;; For IN: if ranges exist, put ^ after ranges
                  ;; If no ranges and no other loose, it's a singleton (shouldn't get here)
                  "^"
                  "")
-             ;; - last
-             (if has-dash "-" ""))))
+             ;; - last (unless it already led the interior as the ^ shield)
+             (if (and has-dash (not lead-dash)) "-" ""))))
       (string-append (if in? "[" "[^") interior "]")))
 
 

@@ -261,15 +261,33 @@
           [nargv (length argv)]
           [c-envp (if env-list (strings->c-argv env-list) 0)]
           [nenv (if env-list (length env-list) 0)])
-      (let ([fa (if actions (foreign-alloc FILEACT-SIZE) 0)])
-        (guard (e [#t
-                   (when actions (c-spawn-fa-destroy fa) (foreign-free fa))
-                   (free-c-argv c-argv nargv)
-                   (when env-list (free-c-argv c-envp nenv))
-                   (foreign-free pid-buf)
-                   (raise e)])
+      (let ([fa (if actions (foreign-alloc FILEACT-SIZE) 0)]
+            [fa-live? #f]
+            [released? #f])
+        ;; Release every foreign block exactly once, however we leave.
+        ;;
+        ;; A spawn failure has to free before it raises (the raise happens inside
+        ;; the guard below, whose handler also frees), so without this latch the
+        ;; failure path would free each block twice. That is not a benign leak in
+        ;; reverse: posix_spawn_file_actions_t is an opaque pointer to a heap
+        ;; block on some platforms, so a second destroy frees an already-freed
+        ;; allocation and the allocator aborts the process.
+        ;;
+        ;; fa-live? gates the destroy on the init having actually run: foreign-alloc
+        ;; hands back uninitialised memory, so destroying before init would hand the
+        ;; allocator a garbage pointer.
+        (define (release!)
+          (unless released?
+            (set! released? #t)
+            (when fa-live? (c-spawn-fa-destroy fa))
+            (when actions (foreign-free fa))
+            (free-c-argv c-argv nargv)
+            (when env-list (free-c-argv c-envp nenv))
+            (foreign-free pid-buf)))
+        (guard (e [#t (release!) (raise e)])
           (when actions
             (c-spawn-fa-init fa)
+            (set! fa-live? #t)
             (for-each (lambda (act)
                         (case (car act)
                           [(dup2)  (c-spawn-fa-adddup2 fa (cadr act) (caddr act))]
@@ -278,17 +296,13 @@
                                      (cadddr act) (car (cddddr act)))]))
                       actions))
           (let ([rc (c-posix-spawnp pid-buf program fa 0 c-argv c-envp)])
-            (when actions
-              (c-spawn-fa-destroy fa)
-              (foreign-free fa))
-            (free-c-argv c-argv nargv)
-            (when env-list (free-c-argv c-envp nenv))
             (if (zero? rc)
+                ;; Read the pid out before the buffer holding it is released.
                 (let ([pid (foreign-ref 'int pid-buf 0)])
-                  (foreign-free pid-buf)
+                  (release!)
                   pid)
                 (begin
-                  (foreign-free pid-buf)
+                  (release!)
                   (raise-posix-error 'posix-spawnp rc))))))))
 
   ;; posix-spawnp/pipe: spawn with stdout piped back to parent.

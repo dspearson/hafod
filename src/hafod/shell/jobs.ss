@@ -12,6 +12,7 @@
           (only (hafod posix) posix-setpgid posix-kill posix-tcsetpgrp posix-tcgetpgrp
                 posix-getpgrp SIGCONT SIGTSTP SIGTTIN SIGTTOU)
           (only (hafod procobj) proc? proc:pid proc:finished? proc:status
+                proc:stopped? mark-proc-continued!
                 wait reap-zombies wait/poll wait/stopped-children)
           (only (hafod posix) status:exit-val status:stop-sig status:term-sig)
           (only (hafod signal) signal-process-group set-signal-handler!)
@@ -76,7 +77,8 @@
     (for-each
       (lambda (j)
         (when (and (not (eq? (job-status j) 'done))
-                   (proc:finished? (job-proc j)))
+                   (or (proc:finished? (job-proc j))
+                       (proc:stopped? (job-proc j))))
           (let ([st (proc:status (job-proc j))])
             (cond
               [(and st (status:stop-sig st))
@@ -169,9 +171,12 @@
                   ;; Give terminal to job's process group
                   (guard (e [#t (void)])
                     (posix-tcsetpgrp 0 (job-pgid j)))
-                  ;; Send SIGCONT if stopped
+                  ;; Send SIGCONT if stopped, clearing the proc's one-shot stop
+                  ;; flag BEFORE the blocking wait so a resumed child is never
+                  ;; later re-reported as stopped.
                   (when (eq? (job-status j) 'stopped)
                     (job-status-set! j 'running)
+                    (mark-proc-continued! (job-proc j))
                     (guard (e [#t (void)])
                       (signal-process-group (job-pgid j) SIGCONT)))
                   ;; Wait with WUNTRACED
@@ -211,6 +216,7 @@
                   1)
                 (begin
                   (job-status-set! j 'running)
+                  (mark-proc-continued! (job-proc j))
                   (guard (e [#t (void)])
                     (signal-process-group (job-pgid j) SIGCONT))
                   (display (format #f "[~a]  ~a &\n" (job-id j) (job-command j))

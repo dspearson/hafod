@@ -398,13 +398,37 @@
                  (loop (cdr rest) entry (cons (car rest) preloads)))]
             [else (loop rest entry preloads)])))))
 
+;; Evaluate a source string as hafod/scsh code.  Applies the | -> pipe
+;; preprocessing pass, reads EVERY form from the string into a list, then
+;; evaluates them together as one (begin ...) in the interaction environment.
+;; Reading all forms BEFORE evaluating any is load-bearing: a read/parse error
+;; aborts before a single form runs, so a malformed source never partially
+;; evaluates and then crashes.  Shared by load-script-file and the -c branch so
+;; both turn a source string into evaluated forms by exactly the same route.
+(define (eval-source-string source)
+  (let ([preprocessed (preprocess-pipe-symbols source)])
+    (eval (cons 'begin
+                (let ([p (open-input-string preprocessed)])
+                  (let loop ([forms '()])
+                    (let ([form (read p)])
+                      (if (eof-object? form)
+                          (reverse forms)
+                          (loop (cons form forms)))))))
+          (interaction-environment))))
+
+;; Report a missing script file the friendly way: name the file on stderr and
+;; exit non-zero.  Shared by load-script-file's guard and the bare-filename
+;; branch so there is exactly one "No such file" message and one exit status.
+(define (report-missing-file fname)
+  (display (string-append "hafod: " fname ": No such file\n") (current-error-port))
+  (exit 1))
+
 ;; Load a script file, stripping !# header if present.
 ;; Auto-imports (hafod) into the interaction environment before eval.
 ;; Preprocesses | -> pipe for scsh compatibility.
 (define (load-script-file fname)
   (unless (file-exists? fname)
-    (display (string-append "hafod: " fname ": No such file\n") (current-error-port))
-    (exit 1))
+    (report-missing-file fname))
   ;; Ensure (hafod) is available in the interaction environment
   (ensure-hafod-interaction-environment!)
   (let ([has-header?
@@ -417,15 +441,7 @@
     (let ([body (if has-header?
                     (strip-script-header fname)
                     (call-with-input-file fname port->string))])
-      (let ([preprocessed (preprocess-pipe-symbols body)])
-        (eval (cons 'begin
-                    (let ([p (open-input-string preprocessed)])
-                      (let loop ([forms '()])
-                        (let ([form (read p)])
-                          (if (eof-object? form)
-                              (reverse forms)
-                              (loop (cons form forms)))))))
-              (interaction-environment))))))
+      (eval-source-string body))))
 
 ;; ======================================================================
 ;; Usage
@@ -574,8 +590,7 @@
                (set-command-line! (cons "hafod" (cdr rest)))
                (load-preload-files preloads)
                (ensure-hafod-interaction-environment!)
-               (let ([expr (read (open-input-string (car rest)))])
-                 (eval expr (interaction-environment)))]
+               (eval-source-string (car rest))]
 
               ;; -- explicit REPL (terminating)
               [(string=? arg "--")
@@ -639,6 +654,11 @@
               [else
                (set-command-line! (cons arg rest))
                (load-preload-files preloads)
+               ;; Guard existence BEFORE extract-script-header-args opens the
+               ;; file to parse a #!...!# header, so a missing bare filename is
+               ;; reported with the same friendly message as -s instead of a raw
+               ;; Chez condition.
+               (unless (file-exists? arg) (report-missing-file arg))
                (let-values ([(hdr-entry hdr-preloads)
                              (parse-header-flags
                                (extract-script-header-args arg))])

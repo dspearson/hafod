@@ -211,21 +211,27 @@
   (define (directory-files . args)
     (let-optionals* args ([dir "."] [dotfiles? #f])
       (check-arg string? dir directory-files)
+      ;; opendir is acquired OUTSIDE the dynamic-wind (if it raises there is no
+      ;; DIR* to close); the readdir loop + final sort/filter run in the middle
+      ;; thunk and the after-thunk closes the DIR* on every exit -- so a
+      ;; posix-readdir raise mid-loop closes the stream instead of leaking it.
       (let ([dirp (posix-opendir dir)])
-        (let loop ([acc '()])
-          (let ([name (posix-readdir dirp)])
-            (if name
-                (loop (if (or (string=? name ".") (string=? name ".."))
-                          acc
-                          (cons name acc)))
-                (begin
-                  (posix-closedir dirp)
-                  (let ([filtered (if dotfiles?
-                                      acc
-                                      (filter (lambda (f)
-                                                (not (char=? (string-ref f 0) #\.)))
-                                              acc))])
-                    (sort string<? filtered)))))))))
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (let loop ([acc '()])
+              (let ([name (posix-readdir dirp)])
+                (if name
+                    (loop (if (or (string=? name ".") (string=? name ".."))
+                              acc
+                              (cons name acc)))
+                    (let ([filtered (if dotfiles?
+                                        acc
+                                        (filter (lambda (f)
+                                                  (not (char=? (string-ref f 0) #\.)))
+                                                acc))])
+                      (sort string<? filtered))))))
+          (lambda () (posix-closedir dirp))))))
 
   ;; ======================================================================
   ;; file-info-* type predicates (operate on stat-info records, not paths)

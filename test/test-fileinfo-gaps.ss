@@ -261,4 +261,36 @@
       (posix-unlink path)
       result)))
 
+;;; ============================================================
+;;; read-symlink / posix-readlink target decoding
+;;; (multi-byte UTF-8 targets and buffer growth for long targets)
+;;; ============================================================
+
+(test-assert "read-symlink round-trips a multi-byte UTF-8 target exactly"
+  ;; The target need not resolve; readlink returns the raw target bytes.
+  ;; A per-byte (Latin-1) decode double-encodes every multi-byte character,
+  ;; so the round-trip must decode the bytes as UTF-8 to compare equal.
+  (let ([link "/tmp/hafod-readlink-utf8-link"]
+        [target "/tmp/hafod-café-日本"])
+    (guard (e [#t #f]) (posix-unlink link))
+    (posix-symlink target link)
+    (let ([result (read-symlink link)])
+      (posix-unlink link)
+      (string=? result target))))
+
+(test-assert "posix-readlink grows a small initial buffer to fit a longer target"
+  ;; A symlink target cannot exceed PATH_MAX-1: symlink(2) raises ENAMETOOLONG
+  ;; at 4096 bytes and beyond, so a target longer than the default buffer is
+  ;; impossible to create. Drive the grow-and-retry loop instead with a
+  ;; creatable 200-byte target read back through a deliberately tiny 16-byte
+  ;; initial buffer: a single-shot read truncates to 16 bytes, so only the
+  ;; doubling loop returns the whole 200-byte target.
+  (let ([link "/tmp/hafod-readlink-grow-link"]
+        [target (make-string 200 #\a)])
+    (guard (e [#t #f]) (posix-unlink link))
+    (posix-symlink target link)
+    (let ([result (posix-readlink link 16)])
+      (posix-unlink link)
+      (string=? result target))))
+
 (test-end)

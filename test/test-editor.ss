@@ -207,6 +207,83 @@
   (history-close! h))
 
 ;; ======================================================================
+;; Growable history store: append order, O(1) count/ref, navigation, dedup.
+;; The backing store appends in amortised constant time, doubling only on
+;; overflow; these cases drive it past several doublings and pin the
+;; positional, most-recent-last contract the navigation and search readers
+;; rely on.
+;; ======================================================================
+
+;; A fresh in-memory history starts empty, so appending these six distinct
+;; inputs doubles the backing store from capacity 0 -> 1 -> 2 -> 4 -> 8: the
+;; append-order and reference checks below therefore land both mid-capacity
+;; (index 3, added while spare capacity remained) and right after a doubling.
+(let ([h (open-history ":memory:")])
+  (for-each (lambda (s) (history-add! h s))
+            '("one" "two" "three" "four" "five" "six"))
+
+  ;; O(1) count is exactly the number of live entries.
+  (test-equal "history-count after six distinct adds"
+    6 (history-count h))
+
+  ;; Positional, most-recent-last access via the O(1) reader.
+  (test-equal "history-ref 0 is the oldest add"
+    "one" (history-ref h 0))
+  (test-equal "history-ref (count - 1) is the newest add"
+    "six" (history-ref h (- (history-count h) 1)))
+  (test-equal "history-ref reads a mid-store slot"
+    "four" (history-ref h 3))
+
+  ;; The right-sized view mirrors the live entries exactly (length == count),
+  ;; dropping the spare-capacity tail left by the last doubling.
+  (let ([view (history-entries h)])
+    (test-equal "history-entries view length equals count"
+      6 (vector-length view))
+    (test-equal "history-entries view is most-recent-last"
+      "six" (vector-ref view (- (vector-length view) 1)))
+    (test-equal "history-entries view keeps the oldest first"
+      "one" (vector-ref view 0)))
+
+  (history-close! h))
+
+;; Navigation after the same six adds walks most-recent-first, then wraps back
+;; to the saved current input at the bottom -- byte-identical to the behaviour
+;; before the store grew.
+(let ([h (open-history ":memory:")])
+  (for-each (lambda (s) (history-add! h s))
+            '("one" "two" "three" "four" "five" "six"))
+  (history-save-input! h "typed-so-far")
+
+  (test-equal "history-prev from the bottom yields the newest entry"
+    "six" (history-prev h))
+  (test-equal "history-prev steps to the next older entry"
+    "five" (history-prev h))
+  (test-equal "history-next steps back toward newer"
+    "six" (history-next h))
+  (test-equal "history-next at the newest returns the saved input"
+    "typed-so-far" (history-next h))
+  (test-equal "history-next at the bottom returns #f"
+    #f (history-next h))
+  (history-close! h))
+
+;; Dedup-of-most-recent: re-adding the current newest is a no-op for the count,
+;; but a distinct add afterwards still appends.
+(let ([h (open-history ":memory:")])
+  (history-add! h "alpha")
+  (history-add! h "beta")
+  (test-equal "count before a duplicate add"
+    2 (history-count h))
+  (history-add! h "beta")            ; duplicate of the most recent -- ignored
+  (test-equal "a duplicate of the newest does not change the count"
+    2 (history-count h))
+  (history-add! h "gamma")           ; distinct -- appends
+  (test-equal "a distinct add after a duplicate bumps the count by one"
+    3 (history-count h))
+  (test-equal "the newest entry is the distinct add"
+    "gamma" (history-ref h (- (history-count h) 1)))
+  (history-close! h))
+
+;; ======================================================================
 ;; History ghost-suggestion tests (typed-prefix match + display gate)
 ;; ======================================================================
 
@@ -214,6 +291,15 @@
 ;; paredit's auto-inserted trailing closers.  Assert the pure seam directly,
 ;; PTY-free, over an in-memory history.
 (let ([h (open-history ":memory:")])
+  ;; Seed several unrelated entries first so the backing store has doubled
+  ;; before the matching entry goes in: the ghost path then reads a GROWN store
+  ;; through history-count/history-ref, exercising the O(1) reader on a store
+  ;; with spare-capacity slots -- never a right-sized per-render copy.  None of
+  ;; the seeds share the "(+" prefix, so the most-recent match stays the entry
+  ;; whose suffix each assertion below expects.
+  (for-each (lambda (s) (history-add! h s))
+            '("unrelated one" "unrelated two" "unrelated three"
+              "unrelated four" "unrelated five"))
   (history-add! h "(+ 3 4 (+ 5 6 7 8))")
 
   ;; Typed-prefix match through a trailing closer.  With paredit on, typing "(+"

@@ -49,17 +49,38 @@
   ;; Returns an input port for reading the content back.
   ;; ======================================================================
 
+  ;; Unlink a temp file on an error path, tolerating its prior removal.
+  ;; Mirrors the ENOENT-tolerant cleanup in (hafod fileinfo): swallow "no such
+  ;; file" and re-raise any other error.
+  (define (unlink-temp-file path)
+    (guard (e [(posix-error? e)
+               (unless (= (posix-errno e) 2) (raise e))])  ; ENOENT=2 -> already gone
+      (posix-unlink path)))
+
   (define (open-string-source obj)
     (receive (path fd) (posix-mkstemp (string-append
                                         (or (getenv "TMPDIR") "/tmp")
                                         "/hafod-heredoc-XXXXXX"))
-      (let ([outp (fdes->outport fd)])
-        (display obj outp)
-        (close outp)
-        ;; Reopen for reading, then unlink (fd keeps data alive)
-        (let ([inp (open-file path open/read)])
-          (posix-unlink path)
-          inp))))
+      ;; Stage the cleanup of the window between mkstemp and the successful
+      ;; return, exactly as temp-file-channel does: if display, the close, or the
+      ;; reopen raises, release the descriptor's current owner -- the raw fd
+      ;; before the port wraps it, otherwise the port (closing the raw fd as well
+      ;; would double-close a port-owned descriptor) -- and unlink the temp path,
+      ;; then re-raise.  The success path is unchanged.
+      (let ([outp #f])
+        (guard (e [#t
+                   (if outp
+                       (guard (inner [#t #f]) (close outp))
+                       (guard (inner [#t #f]) (posix-close fd)))
+                   (unlink-temp-file path)
+                   (raise e)])
+          (set! outp (fdes->outport fd))
+          (display obj outp)
+          (close outp)
+          ;; Reopen for reading, then unlink (fd keeps data alive)
+          (let ([inp (open-file path open/read)])
+            (posix-unlink path)
+            inp)))))
 
   ;; with-stdio-ports* is imported from (hafod fd-ports)
 

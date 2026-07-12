@@ -35,6 +35,31 @@
     (and (vector? result)
          (equal? (vector-ref result 0) '(0 . 5)))))
 
+;; A slice end past the subject buffer would make regexec (REG_STARTEND) read
+;; past the bytevector; the primitive must reject the offsets, not over-read.
+(test-error "posix-regexec rejects an end past the subject buffer"
+  (let ((rt (posix-regcomp "a" REG_EXTENDED)))
+    (dynamic-wind
+      (lambda () #f)
+      (lambda () (posix-regexec rt (string->utf8 "abc") 1 0 0 100))
+      (lambda () (posix-regfree rt)))))
+
+;; nmatch = 0 is a bare "does it match at all?" query: REG_STARTEND still needs
+;; an internal pmatch[0] to seed, but the caller asked for no groups, so a match
+;; yields an empty result vector (truthy) and a non-match yields #f -- not an
+;; opaque bytevector-index error.
+(test-assert "posix-regexec with nmatch=0 reports a match as an empty vector"
+  (let* ((rt (posix-regcomp "hello" REG_EXTENDED))
+         (result (posix-regexec rt "say hello world" 0 0)))
+    (posix-regfree rt)
+    (and (vector? result) (= 0 (vector-length result)))))
+
+(test-assert "posix-regexec with nmatch=0 reports a non-match as #f"
+  (let* ((rt (posix-regcomp "xyz" REG_EXTENDED))
+         (result (posix-regexec rt "hello world" 0 0)))
+    (posix-regfree rt)
+    (eq? result #f)))
+
 ;; ========== Char-set algebra ==========
 
 (test-assert "char-set-complement works"
@@ -220,6 +245,48 @@
   (let ((m (regexp-search (rx "hello") "hello hello" 1)))
     (and m (= (match:start m) 6))))
 
+;; An out-of-range start index is a caller error (fail-loud), matching the
+;; pre-rewrite substring contract -- not a silent #f or a glibc-clamped match.
+(test-error "regexp-search raises on a start past the subject"
+  (regexp-search (rx "a") "abc" 10))
+(test-error "regexp-search raises on a negative start"
+  (regexp-search (rx "a") "abc" -1))
+;; regexp-search? shares the entry, so it fails loud on a bad start too.
+(test-error "regexp-search? raises on a start past the subject"
+  (regexp-search? (rx "a") "abc" 10))
+;; The bound is the CHARACTER length the old substring used: a start past the
+;; char length still fails loud even when it is a valid UTF-8 byte offset (the
+;; 2-char "a\xe9;" encodes to 3 bytes, so index 3 is in byte range but not char
+;; range).
+(test-error "regexp-search raises on a start past the character length"
+  (regexp-search (rx "a") "a\xe9;" 3))
+
+;; ========== Anchored / absolute-offset search from a non-zero start ==========
+
+;; A begin-of-string anchor searched from a non-zero start must NOT match at
+;; the offset -- the offset is mid-subject, not a line start.
+(test-assert "bos does not match at a non-zero start offset"
+  (not (regexp-search? (rx bos "abc") "xxxabc" 3)))
+
+;; Offsets returned from a non-zero start are absolute (relative to the whole
+;; subject), so "bc" first found at index 4 reports 4..6, not 7..9.
+(test-assert "match offsets from a non-zero start are absolute"
+  (let ((m (regexp-search (rx "bc") "xxxabcabc" 3)))
+    (and m
+         (= (match:start m) 4)
+         (= (match:end m) 6))))
+
+;; An iterated search over a long subject must encode it once, not once per
+;; step; the exact match count over 20000 repeats is the correctness proxy.
+(test-assert "iterated search over a long subject counts every match"
+  (let ((s (let ((p (open-output-string)))
+             (do ((i 0 (+ i 1))) ((= i 20000))
+               (display "ab" p))
+             (get-output-string p)))
+        (count 0))
+    (regexp-for-each (rx "ab") (lambda (m) (set! count (+ count 1))) s)
+    (= count 20000)))
+
 ;; ========== Non-participating submatches ==========
 
 (test-assert "non-participating submatch returns #f"
@@ -254,5 +321,80 @@
 
 (test-assert "nested quantifiers"
   (regexp-search? (rx (seq bos (+ (seq alpha (* digit))) eos)) "a1b2c"))
+
+;; ========== char-class bracket emission edge cases ==========
+;; These exercise the runtime SRE compiler (sre->regexp -> regexp->posix-string),
+;; where a char-set value is turned into a POSIX bracket string.
+
+;; A bracket whose only members are ^ and - must be a POSITIVE class matching ^
+;; and - only -- not a negation.  A caret leading a positive bracket would read
+;; as "not ...", so the compiler leads with a literal - instead: [-^].
+(test-assert "caret-dash class matches a dash"
+  (regexp-search? (sre->regexp '("^-")) "-"))
+(test-assert "caret-dash class matches a caret"
+  (regexp-search? (sre->regexp '("^-")) "^"))
+(test-equal "caret-dash class does not match a letter"
+  #f (regexp-search? (sre->regexp '("^-")) "x"))
+(test-equal "caret-dash class compiles to a positive bracket"
+  (string #\[ #\- #\^ #\])
+  (let-values (((s lev pc sm) (regexp->posix-string (sre->regexp '("^-"))))) s))
+
+;; A nested unmatchable -- (seq "a" (or)) -- must COMPILE and never match.  The
+;; never-match bracket must carry no NUL byte: a literal NUL truncates the
+;; pattern at regcomp to an unterminated "[^", which the engine rejects.
+(test-assert "nested unmatchable compiles and never matches"
+  (not (regexp-search? (sre->regexp '(seq "a" (or))) "axyz")))
+(test-assert "nested empty alternation in a sequence compiles without error"
+  (guard (e (#t #f))
+    (begin (regexp-search? (sre->regexp '(seq "a" (or))) "") #t)))
+(test-equal "never-match bracket is free of a NUL byte"
+  (string #\a #\[ #\^ (integer->char 1) #\- (integer->char 127) #\])
+  (let-values (((s lev pc sm) (regexp->posix-string (sre->regexp '(seq "a" (or)))))) s))
+
+;; A zero-or-more of an unmatchable still matches the empty string (the bracket
+;; stays a single atom the quantifier can bind to).
+(test-assert "star of an unmatchable matches the empty string"
+  (regexp-search? (sre->regexp '(* (or))) ""))
+
+;; Regression guard: the ascii class was never the bug -- it must still compile
+;; to a valid [\x01-\x7f] range and match an ASCII character.
+(test-assert "ascii still matches an ASCII character"
+  (regexp-search? (sre->regexp 'ascii) "a"))
+(test-equal "ascii still compiles to the expected range bracket"
+  (string #\[ (integer->char 1) #\- (integer->char 127) #\])
+  (let-values (((s lev pc sm) (regexp->posix-string (sre->regexp 'ascii)))) s))
+
+;; ========== rx-macro char-class bracket emission (expand-time compiler) =====
+;; The rx macro compiles its SRE literal at expand time through the separate
+;; (hafod internal sre-compile) compiler, not the runtime regexp->posix-string
+;; path exercised above.  These pin the same bracket edges on that macro path.
+
+;; A {^,-} char-set literal must expand to a POSITIVE bracket matching ^ and -
+;; only, led by a literal - so the leading ^ is not misread as a negation.
+(test-assert "rx caret-dash class matches a dash"
+  (regexp-search? (rx ("^-")) "-"))
+(test-assert "rx caret-dash class matches a caret"
+  (regexp-search? (rx ("^-")) "^"))
+(test-equal "rx caret-dash class does not match a letter"
+  #f (regexp-search? (rx ("^-")) "x"))
+
+;; The ascii class must expand to a real byte range, not the literal text
+;; [\x00-\x7f] (POSIX ERE has no \xHH escape); a real [\x01-\x7f] matches an
+;; ordinary ASCII character.
+(test-assert "rx ascii matches an ASCII character"
+  (regexp-search? (rx ascii) "a"))
+
+;; A nested empty alternation must expand to a never-match bracket built from
+;; real bytes (no literal NUL), so it compiles yet never matches a subject.
+(test-assert "rx nested empty alternation compiles and never matches"
+  (not (regexp-search? (rx (seq "a" (or))) "ay")))
+(test-assert "rx nested empty alternation compiles without error"
+  (guard (e (#t #f))
+    (begin (regexp-search? (rx (seq "a" (or))) "") #t)))
+
+;; A zero-or-more of that unmatchable still matches the empty string (the bracket
+;; stays a single atom the quantifier binds to).
+(test-assert "rx star of an empty alternation matches the empty string"
+  (regexp-search? (rx (* (or))) ""))
 
 (test-end)

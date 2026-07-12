@@ -7,7 +7,7 @@
 (library (hafod procobj)
   (export
     ;; Process record
-    proc? proc:pid proc:finished? proc:status proc:zombie?
+    proc? proc:pid proc:finished? proc:status proc:zombie? proc:stopped?
 
     ;; Process table
     new-child-proc pid->proc maybe-pid->proc ->proc pid/proc?
@@ -20,6 +20,9 @@
 
     ;; Internal (for process.ss)
     obituary mark-proc-waited!
+
+    ;; Job control (for shell/jobs.ss)
+    mark-proc-continued!
 
     ;; Background job count
     background-job-count
@@ -40,15 +43,19 @@
   ;; - finished?: #f while running, #t when terminated
   ;; - status: the wait(2) status integer, set when reaped (#f until then)
   ;; - zombie?: #t when reaped but not yet waited on by user code
+  ;; - stopped?: #t while the child is stopped-but-alive (SIGSTOP/SIGTSTP),
+  ;;   #f otherwise. Independent of finished? — a stopped child is still alive.
   (define-record-type proc
-    (fields pid (mutable finished?) (mutable status) (mutable zombie?))
-    (protocol (lambda (new) (lambda (pid) (new pid #f #f #t)))))
+    (fields pid (mutable finished?) (mutable status) (mutable zombie?)
+            (mutable stopped?))
+    (protocol (lambda (new) (lambda (pid) (new pid #f #f #t #f)))))
 
   ;; scsh-compatible accessor names
   (define proc:pid proc-pid)
   (define proc:finished? proc-finished?)
   (define proc:status proc-status)
   (define proc:zombie? proc-zombie?)
+  (define proc:stopped? proc-stopped?)
 
   ;; ======================================================================
   ;; Process table: pid -> proc mapping
@@ -105,9 +112,23 @@
   ;; ======================================================================
 
   ;; Mark a proc as finished and cache its wait status.
+  ;; A finished proc is never stopped, so clear the stopped flag as well.
   (define (obituary p status)
     (proc-status-set! p status)
+    (proc-stopped?-set! p #f)
     (proc-finished?-set! p #t))
+
+  ;; Record a stopped-but-alive child: cache the wait status and flag it stopped,
+  ;; without marking it finished. Internal — only reap-zombies records a stop.
+  (define (mark-proc-stopped! p status)
+    (proc-status-set! p status)
+    (proc-stopped?-set! p #t))
+
+  ;; Clear the stopped flag when the child is continued (SIGCONT). The kernel's
+  ;; WUNTRACED stop is one-shot and a continue is not reported, so the flag would
+  ;; otherwise go stale and a resumed child would be falsely reported stopped.
+  (define (mark-proc-continued! p)
+    (proc-stopped?-set! p #f))
 
   ;; Mark that user code has consumed this proc's status.
   (define (mark-proc-waited! p)
@@ -130,12 +151,18 @@
           ;; Not yet finished — call waitpid
           (receive (wpid status)
             (posix-waitpid (proc:pid p) flags)
-            (if (zero? wpid)
-                #f  ;; wait/poll and process not ready
-                (begin
-                  (obituary p status)
-                  (mark-proc-waited! p)
-                  status))))))
+            (cond
+              [(zero? wpid) #f]  ;; wait/poll and process not ready
+              [(status:stop-sig status)
+               ;; Stopped, not dead (WUNTRACED). Record the one-shot stop so a
+               ;; foregrounded job can re-foreground it; leave finished? #f — a
+               ;; stopped child is still alive. Mirrors the reap-zombies stop path.
+               (mark-proc-stopped! p status)
+               status]
+              [else
+               (obituary p status)
+               (mark-proc-waited! p)
+               status])))))
 
   ;; (wait-any [flags]) => (values proc status)
   ;; Wait for any child process.
@@ -171,7 +198,11 @@
           (posix-waitpid -1 (bitwise-ior wait/poll wait/stopped-children))
           (cond
             [(zero? wpid) #f]  ;; Some children still live
-            [(status:stop-sig status) #f]  ;; Stopped, not dead — don't reap
+            [(status:stop-sig status)
+             ;; Stopped, not dead. Record the one-shot WUNTRACED stop on the proc
+             ;; so job control can report it; do not reap (the child is alive).
+             (mark-proc-stopped! (pid->proc wpid 'create) status)
+             #f]
             [else
              (let ([p (pid->proc wpid 'create)])
                (obituary p status)

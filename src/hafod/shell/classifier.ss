@@ -4,9 +4,11 @@
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library (hafod shell classifier)
-  (export classify-input rebuild-path-cache! path-cache scheme-prefix-chars)
+  (export classify-input rebuild-path-cache! path-cache scheme-prefix-chars
+          path-cache-keys command-not-found-suppress? command-not-found-suggestions)
   (import (chezscheme)
-          (only (hafod process) exec-path-list))
+          (only (hafod process) exec-path-list)
+          (only (hafod fuzzy) fuzzy-filter))
 
   ;; Characters that unambiguously start Scheme expressions
   (define scheme-prefix-chars '(#\( #\' #\` #\# #\, #\[))
@@ -38,6 +40,18 @@
 
   (define (path-cache) path-cache-ht)
 
+  ;; Memoised list of the PATH cache keys, held in a mutable box (#f = stale).
+  ;; The suggestion path materialises the key set once and reuses it, rather
+  ;; than allocating a fresh list on every line; rebuild-path-cache! clears the
+  ;; box so a PATH change refreshes the key-list together with the command cache.
+  (define path-cache-keys-box (vector #f))
+
+  (define (path-cache-keys)
+    (or (vector-ref path-cache-keys-box 0)
+        (let ([keys (vector->list (hashtable-keys path-cache-ht))])
+          (vector-set! path-cache-keys-box 0 keys)
+          keys)))
+
   (define (rebuild-path-cache!)
     (hashtable-clear! path-cache-ht)
     (for-each
@@ -47,7 +61,9 @@
             (lambda (name)
               (hashtable-set! path-cache-ht name #t))
             (directory-list dir))))
-      (exec-path-list)))
+      (exec-path-list))
+    ;; Invalidate the memoised key-list so the next path-cache-keys rebuilds it.
+    (vector-set! path-cache-keys-box 0 #f))
 
   ;; Extract the first whitespace-delimited token from a string,
   ;; starting at position i. Returns "" if no token found.
@@ -78,6 +94,33 @@
              (and (> (string-length tok) 1)
                   (char=? (string-ref tok 0) #\#)
                   (memv (string-ref tok 1) '(#\t #\f #\\))))))
+
+  ;; Command-not-found gate: return #t when the first token should NOT trigger a
+  ;; "command not found" suggestion -- because it is empty, a builtin, a Scheme
+  ;; keyword, a self-evaluating literal, an already-known PATH command, or a
+  ;; bound top-level identifier (a procedure or variable such as car, list, or a
+  ;; user define).  Only a genuinely-unknown token returns #f -- the sole case
+  ;; that should yield a suggestion.  Keep the keyword check: top-level-bound?
+  ;; reports #f for macros/keywords, which are bound as syntax rather than as
+  ;; top-level variables.
+  (define (command-not-found-suppress? cmd)
+    (and (or (= (string-length cmd) 0)
+             (hashtable-ref builtin-names-set cmd #f)
+             (hashtable-ref scheme-keywords cmd #f)
+             (self-evaluating-literal? cmd)
+             (hashtable-ref path-cache-ht cmd #f)
+             (top-level-bound? (string->symbol cmd)))
+         #t))
+
+  ;; At most three fuzzy suggestions for an unknown command, drawn from the
+  ;; memoised PATH key-list.  Callers invoke this lazily -- only after
+  ;; command-not-found-suppress? has declined to suppress -- so no PATH scan runs
+  ;; on a suppressed line.
+  (define (command-not-found-suggestions cmd)
+    (let ([filtered (fuzzy-filter cmd (path-cache-keys))])
+      (if (> (length filtered) 3)
+          (list (car filtered) (cadr filtered) (caddr filtered))
+          filtered)))
 
   ;; Main classifier: returns 'scheme, 'builtin, or 'shell
   (define (classify-input str)

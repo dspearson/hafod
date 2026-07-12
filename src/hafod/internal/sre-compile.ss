@@ -32,13 +32,42 @@
                                   (not (char=? c #\^))
                                   (not (char=? c #\-))))
                            chars))
-           ;; Build bracket interior: ] first, then others, then ^, then - last
+           ;; A positive class must never begin with a bare ^ -- POSIX would read
+           ;; it as a negation ([^-] means "not dash", not "dash or caret").  When
+           ;; ^ is the only member that could lead the interior (no ], no other
+           ;; chars) and - is also present, lead with a literal - instead: a
+           ;; leading - is a POSIX-legal literal, so [-^] shields the ^ and matches
+           ;; exactly - and ^.
+           (lead-dash (and has-caret has-dash
+                           (not has-rbracket) (null? others)))
+           ;; Build bracket interior: optional leading - shield, then ] first,
+           ;; then others, then ^ (never first), then - last (unless it already
+           ;; led the interior as the shield).
            (parts (append
+                    (if lead-dash '(#\-) '())
                     (if has-rbracket '(#\]) '())
                     others
                     (if has-caret '(#\^) '())
-                    (if has-dash '(#\-) '()))))
+                    (if (and has-dash (not lead-dash)) '(#\-) '()))))
       (list->string parts)))
+
+  ;; Bracket interior spanning every ASCII code unit except NUL.  These are real
+  ;; bytes (via integer->char), NOT the literal text "\x01-\x7f": POSIX ERE has
+  ;; no \xHH escape, so a textual form would match the characters \, x, 0, 7, f.
+  ;; The low bound is \x01, not \x00: a literal NUL would terminate the C string
+  ;; handed to regcomp and truncate the bracket to an unterminated "[" / "[^".
+  (define ascii-range-interior
+    (string (integer->char 1) #\- (integer->char 127)))
+
+  ;; The ascii class: [\x01-\x7f], matching any (non-NUL) ASCII character.
+  (define ascii-class-pattern
+    (string-append "[" ascii-range-interior "]"))
+
+  ;; A pattern that can never match an ASCII subject: [^\x01-\x7f].  Stays a
+  ;; single level-1 atom so a quantifier composes over it (a zero-or-more of it
+  ;; matches the empty string).
+  (define never-match-pattern
+    (string-append "[^" ascii-range-interior "]"))
 
   ;; Named character class -> POSIX bracket expression
   (define (named-class->posix name)
@@ -55,7 +84,7 @@
       ((cntrl control) "[[:cntrl:]]")
       ((xdigit hex-digit hex) "[[:xdigit:]]")
       ((blank) "[[:blank:]]")
-      ((ascii) "[\\x00-\\x7f]")
+      ((ascii) ascii-class-pattern)
       ((any) ".")
       ((nonl) "[^\n]")
       (else #f)))
@@ -286,7 +315,7 @@
                ((or)
                 (if (null? rest)
                     ;; Empty alternation: unmatchable
-                    (values "[^\\x00-\\x7f]" 0 fold? '())
+                    (values never-match-pattern 0 fold? '())
                     (let loop ((forms rest) (acc '()) (np 0) (first? #t) (smap '()))
                       (if (null? forms)
                           (values (apply string-append (reverse acc)) np fold? (reverse smap))

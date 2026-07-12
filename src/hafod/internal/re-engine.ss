@@ -69,12 +69,58 @@
          (regex-guardian crx)
          crx))))
 
+  ;; ======================================================================
+  ;; Bounded compiled-regexp cache (guardian-safe)
+  ;; ======================================================================
+  ;; A raw string pattern searched repeatedly in a loop should be compiled
+  ;; ONCE, not re-compiled on every call. This table, consulted at the
+  ;; string->regexp boundary, memoises (pattern . flags) -> compiled record.
+  ;;
+  ;; Lifetime rule (do NOT break it): the table holds a STRONG reference, so a
+  ;; cached record is always reachable and the guardian above never reclaims it
+  ;; while it is cached. Eviction drops that strong reference with
+  ;; hashtable-delete! ONLY -- it must NEVER free the underlying regex. The
+  ;; guardian (finalize-regexes!) frees each compiled regex exactly once, when
+  ;; its record has become fully unreachable; a second free on eviction would be
+  ;; a double-free, and freeing a record a caller still holds would be a
+  ;; use-after-free. Insertion-order eviction bounds the table under a loop of
+  ;; distinct patterns. Every symbol here stays internal (unexported) so the
+  ;; umbrella surface does not grow. Single-threaded, so a plain hashtable needs
+  ;; no lock. (Shape modelled on procobj's *process-table*.)
+  (define regexp-cache-capacity 256)
+  (define *regexp-cache* (make-hashtable equal-hash equal?))
+  ;; Keys in insertion order, oldest first; the head is the eviction victim.
+  (define *regexp-cache-order* '())
+
+  (define (regexp-cache-ref key)
+    (hashtable-ref *regexp-cache* key #f))
+
+  (define (regexp-cache-evict-oldest!)
+    (when (pair? *regexp-cache-order*)
+      (let ((victim (car *regexp-cache-order*)))
+        (set! *regexp-cache-order* (cdr *regexp-cache-order*))
+        ;; Drop the strong ref ONLY. The guardian frees the compiled regex once
+        ;; the record is unreachable; never free it here (double-free / UAF).
+        (hashtable-delete! *regexp-cache* victim))))
+
+  (define (regexp-cache-insert! key crx)
+    (when (>= (hashtable-size *regexp-cache*) regexp-cache-capacity)
+      (regexp-cache-evict-oldest!))
+    (hashtable-set! *regexp-cache* key crx)
+    (set! *regexp-cache-order* (append *regexp-cache-order* (list key)))
+    crx)
+
   ;; Convenience: compile from a POSIX regex string.
-  ;; Counts unescaped parens to determine number of submatches.
+  ;; Counts unescaped parens to determine number of submatches. Compiled records
+  ;; are memoised on (pattern . flags) so a pattern reused in a hot loop is
+  ;; compiled once (see the cache note above).
   (define (string->regexp pattern . maybe-flags)
-    (let ((extra-flags (if (null? maybe-flags) 0 (car maybe-flags)))
-          (nsub (count-posix-parens pattern)))
-      (make-regexp pattern extra-flags nsub #f)))
+    (let* ((extra-flags (if (null? maybe-flags) 0 (car maybe-flags)))
+           (key (cons pattern extra-flags)))
+      (or (regexp-cache-ref key)
+          (regexp-cache-insert!
+            key
+            (make-regexp pattern extra-flags (count-posix-parens pattern) #f)))))
 
   ;; Count unescaped ( in a POSIX regex string (runtime version).
   (define (count-posix-parens s)
@@ -188,19 +234,36 @@
      ((string? re) (string->regexp re))
      (else (error 'coerce-regexp "not a regexp, RE ADT, or string" re))))
 
-  (define (regexp-search re str . maybe-start)
-    (finalize-regexes!)
-    (let* ((crx (coerce-regexp re))
-           (start (if (null? maybe-start) 0 (car maybe-start)))
-           (search-str (if (= start 0) str (substring str start (string-length str))))
-           (nsub (+ 1 (compiled-regexp-type-num-submatches crx)))
-           (result (posix-regexec (compiled-regexp-type-regex-t crx) search-str nsub 0)))
+  ;; Internal search primitive over a pre-encoded UTF-8 buffer. STR is the
+  ;; original string (kept by the match object for match:substring), BUF is
+  ;; (string->utf8 str), and START is a byte offset. A caller that iterates
+  ;; encodes BUF once and only varies START, so the encode is not repeated per
+  ;; step. The subject is searched over [start, length); posix-regexec returns
+  ;; absolute (buffer-relative) offsets, so the match vector is rebased with 0.
+  (define (regexp-search/bytes crx str buf start)
+    (let* ((nsub (+ 1 (compiled-regexp-type-num-submatches crx)))
+           (result (posix-regexec (compiled-regexp-type-regex-t crx)
+                                  buf nsub 0 start (bytevector-length buf))))
       (and result
            (make-regexp-match-type
              str
              (build-match-vector result
                                  (compiled-regexp-type-submatch-map crx)
-                                 start)))))
+                                 0)))))
+
+  (define (regexp-search re str . maybe-start)
+    (finalize-regexes!)
+    (let* ((crx (coerce-regexp re))
+           (start (if (null? maybe-start) 0 (car maybe-start)))
+           (buf (string->utf8 str)))
+      ;; Restore the fail-loud contract the pre-rewrite (substring str start ...)
+      ;; gave: an out-of-range start is a caller error, not a silent #f or a
+      ;; glibc-clamped spurious match. The bound is the character length, as the
+      ;; old substring used and the sibling iterators (regexp-fold /
+      ;; regexp-for-each) still enforce.
+      (when (or (< start 0) (> start (string-length str)))
+        (error 'regexp-search "start index out of range" start))
+      (regexp-search/bytes crx str buf start)))
 
   (define (regexp-search? re str . maybe-start)
     (and (apply regexp-search re str maybe-start) #t))
@@ -246,66 +309,85 @@
                               (substring str (car r) (cdr r))))))
                       items)))))
 
+  ;; Global substitution accumulates left-to-right into a single output-string
+  ;; port in one O(M+N) pass (M matches over an N-char subject). A 'post item
+  ;; denotes "the rest of the substitution": when it is the template's final
+  ;; item -- the ordinary shape -- its continuation is in tail position and
+  ;; drives the enclosing loop, so the walk uses a bounded stack with no
+  ;; per-match reverse/append. Only a 'post that is followed by further template
+  ;; items (which no ordinary caller writes) recurses, and then solely to keep
+  ;; the exact left-to-right order the earlier list-building code produced.
   (define (regexp-substitute/global port re str . items)
+    (finalize-regexes!)
     (let* ((crx (coerce-regexp re))
-           (str-len (string-length str)))
-      (let ((pieces
-              (let recur ((start 0))
-                (if (> start str-len)
-                    '()
-                    (let ((match (regexp-search crx str start)))
-                      (if match
-                          (let* ((m-start (match:start match 0))
-                                 (m-end (match:end match 0))
-                                 (empty? (= m-start m-end)))
-                            (let process-items ((items items) (acc '()))
-                              (if (null? items)
-                                  (reverse acc)
-                                  (let ((item (car items)))
-                                    (cond
-                                      ((string? item)
-                                       (process-items (cdr items) (cons item acc)))
-                                      ((integer? item)
-                                       (let ((s (match:substring match item)))
-                                         (process-items (cdr items) (cons (or s "") acc))))
-                                      ((eq? 'pre item)
-                                       (process-items (cdr items)
-                                                      (cons (substring str start m-start) acc)))
-                                      ((eq? 'post item)
-                                       (let* ((next-start (if empty? (+ m-end 1) m-end))
-                                              (rest (recur next-start))
-                                              (skip (if (and empty? (< m-end str-len))
-                                                        (list (string (string-ref str m-end)))
-                                                        '())))
-                                         (process-items (cdr items)
-                                                        (append (reverse rest) (reverse skip) acc))))
-                                      ((procedure? item)
-                                       (process-items (cdr items) (cons (item match) acc)))
-                                      (else
-                                       (error 'regexp-substitute/global "illegal item" item)))))))
-                          ;; No match: return rest of string
-                          (list (substring str start str-len))))))))
-        (let ((result (apply string-append pieces)))
-          (if port
-              (display result port)
-              result)))))
+           (str-len (string-length str))
+           (buf (string->utf8 str))
+           (out (open-output-string)))
+      ;; Emit the global substitution of the subject from START into OUT.
+      (define (substitute-from start0)
+        (let loop ((start start0))
+          (let ((match (and (<= start str-len)
+                            (regexp-search/bytes crx str buf start))))
+            (if (not match)
+                ;; No match: emit the untouched tail (nothing past the end).
+                (when (<= start str-len)
+                  (display (substring str start str-len) out))
+                (let* ((m-start (match:start match 0))
+                       (m-end (match:end match 0))
+                       (empty? (= m-start m-end))
+                       (next-start (if empty? (+ m-end 1) m-end)))
+                  (let emit ((its items))
+                    (cond
+                      ;; Template exhausted with no 'post encountered: scsh stops
+                      ;; here -- only this first match is emitted, no tail, no
+                      ;; further matches.
+                      ((null? its) (if #f #f))
+                      ((eq? 'post (car its))
+                       ;; For an empty match, emit the single skipped char before
+                       ;; continuing past it.
+                       (when (and empty? (< m-end str-len))
+                         (display (string (string-ref str m-end)) out))
+                       (if (null? (cdr its))
+                           (loop next-start)              ; tail: bounded stack
+                           (begin                          ; rare: items after 'post
+                             (substitute-from next-start)
+                             (emit (cdr its)))))
+                      (else
+                       (let ((item (car its)))
+                         (cond
+                           ((string? item) (display item out))
+                           ((integer? item)
+                            (display (or (match:substring match item) "") out))
+                           ((eq? 'pre item)
+                            (display (substring str start m-start) out))
+                           ((procedure? item) (display (item match) out))
+                           (else
+                            (error 'regexp-substitute/global "illegal item" item))))
+                       (emit (cdr its))))))))))
+      (substitute-from 0)
+      (let ((result (get-output-string out)))
+        (if port
+            (display result port)
+            result))))
 
   ;; ======================================================================
   ;; Fold / iteration
   ;; ======================================================================
 
   (define (regexp-fold re kons knil s . rest)
+    (finalize-regexes!)
     (let* ((crx (coerce-regexp re))
            (finish (if (and (pair? rest) (car rest))
                        (car rest)
                        (lambda (i x) x)))
            (start (if (and (pair? rest) (pair? (cdr rest)))
                       (cadr rest)
-                      0)))
+                      0))
+           (buf (string->utf8 s)))
       (when (> start (string-length s))
         (error 'regexp-fold "start index exceeds string length" start))
       (let loop ((i start) (val knil))
-        (let ((m (regexp-search crx s i)))
+        (let ((m (regexp-search/bytes crx s buf i)))
           (if m
               (let ((next-i (match:end m 0)))
                 (when (= next-i (match:start m 0))
@@ -316,12 +398,14 @@
               (finish i val))))))
 
   (define (regexp-for-each re proc s . maybe-start)
+    (finalize-regexes!)
     (let* ((crx (coerce-regexp re))
-           (start (if (null? maybe-start) 0 (car maybe-start))))
+           (start (if (null? maybe-start) 0 (car maybe-start)))
+           (buf (string->utf8 s)))
       (when (> start (string-length s))
         (error 'regexp-for-each "start index exceeds string length" start))
       (let loop ((i start))
-        (let ((m (regexp-search crx s i)))
+        (let ((m (regexp-search/bytes crx s buf i)))
           (when m
             (let ((next-i (match:end m 0)))
               (when (= (match:start m 0) next-i)
@@ -340,22 +424,24 @@
   ;; finish: (first-match-start value) -> value
 
   (define (regexp-fold-right re kons knil s . rest)
+    (finalize-regexes!)
     (let* ((crx (coerce-regexp re))
            (finish (if (and (pair? rest) (car rest))
                        (car rest)
                        (lambda (i x) x)))
            (start (if (and (pair? rest) (pair? (cdr rest)))
                       (cadr rest)
-                      0)))
+                      0))
+           (buf (string->utf8 s)))
       (when (> start (string-length s))
         (error 'regexp-fold-right "start index exceeds string length" start))
       (cond
-       ((regexp-search crx s start) =>
+       ((regexp-search/bytes crx s buf start) =>
         (lambda (m)
           (finish (match:start m 0)
                   (let recur ((last-m m))
                     (cond
-                     ((regexp-search crx s (match:end last-m 0)) =>
+                     ((regexp-search/bytes crx s buf (match:end last-m 0)) =>
                       (lambda (m)
                         (let ((i (match:start m 0)))
                           (when (= i (match:end m 0))

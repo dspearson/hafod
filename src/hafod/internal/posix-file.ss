@@ -122,15 +122,30 @@
   ;; umask always succeeds, returns old mask
   (define (posix-umask mask) (c-umask mask))
 
-  ;; readlink: read the target of a symbolic link.
-  (define (posix-readlink path)
-    (with-foreign-buffer ([buf 4096])
-      (let ([n (posix-call readlink (c-readlink path buf 4095))])
-        (let loop ([i 0] [chars '()])
-          (if (= i n)
-              (list->string (reverse chars))
-              (loop (+ i 1)
-                    (cons (integer->char (foreign-ref 'unsigned-8 buf i))
-                          chars)))))))
+  ;; readlink: read the target of a symbolic link, decoded as UTF-8.
+  ;;
+  ;; readlink does not NUL-terminate and silently truncates to the buffer size,
+  ;; so a return equal to the buffer size means the target may not have fit --
+  ;; double the buffer and retry until it does. The exact n bytes written are
+  ;; copied into a bytevector and decoded with utf8->string (mirroring
+  ;; ptr->string in posix-core), matching the outbound string->utf8 path so a
+  ;; non-ASCII target round-trips instead of being mangled by a per-byte
+  ;; (Latin-1) decode. The size is passed in full (not size-1): decoding is
+  ;; length-bounded by n, not NUL-bounded. An optional initial buffer size
+  ;; (default 4096) is accepted so the growth path can be driven with a small
+  ;; buffer; the single-argument form used throughout the tree starts at 4096.
+  (define posix-readlink
+    (case-lambda
+      [(path) (posix-readlink path 4096)]
+      [(path initial-size)
+       (let loop ([sz initial-size])
+         (with-foreign-buffer ([buf sz])
+           (let ([n (posix-call readlink (c-readlink path buf sz))])
+             (if (= n sz)
+                 (loop (* sz 2))
+                 (let ([bv (make-bytevector n)])
+                   (do ([i 0 (+ i 1)]) ((= i n))
+                     (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 buf i)))
+                   (utf8->string bv))))))]))
 
   ) ; end library

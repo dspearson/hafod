@@ -9,6 +9,9 @@
           (only (hafod process-state) chdir cwd)
           (only (hafod environment) getenv setenv)
           (only (hafod user-group) home-directory)
+          (only (hafod process) init-exec-path-list)
+          (only (hafod shell parser) parse-command-words)
+          (only (hafod shell classifier) rebuild-path-cache!)
           (only (hafod shell jobs) list-jobs job-fg! job-bg-resume!))
 
   ;; Directory stack for pushd/popd
@@ -22,52 +25,6 @@
 
   (define (builtin? name)
     (and (member name builtin-name-list) #t))
-
-  ;; Parse arguments from the input string after the first token.
-  ;; Returns a list of argument strings. Respects double and single quotes.
-  (define (parse-args str)
-    (let ([len (string-length str)])
-      ;; Skip the first token (command name)
-      (let skip-cmd ([i 0])
-        (cond
-          [(>= i len) '()]
-          [(char-whitespace? (string-ref str i)) (parse-rest str i len)]
-          [else (skip-cmd (+ i 1))]))))
-
-  (define (parse-rest str i len)
-    ;; Skip whitespace, then collect tokens
-    (let loop ([j i] [args '()])
-      (cond
-        [(>= j len) (reverse args)]
-        [(char-whitespace? (string-ref str j)) (loop (+ j 1) args)]
-        [else
-         (let-values ([(tok next) (scan-token str j len)])
-           (loop next (cons tok args)))])))
-
-  (define (scan-token str i len)
-    ;; Read one token, handling quotes
-    (let ([c (string-ref str i)])
-      (cond
-        [(or (char=? c #\") (char=? c #\'))
-         (read-quoted str (+ i 1) len c '())]
-        [else
-         (read-unquoted str i len '())])))
-
-  (define (read-quoted str i len q acc)
-    (cond
-      [(>= i len) (values (list->string (reverse acc)) i)]
-      [(char=? (string-ref str i) q)
-       (values (list->string (reverse acc)) (+ i 1))]
-      [else
-       (read-quoted str (+ i 1) len q (cons (string-ref str i) acc))]))
-
-  (define (read-unquoted str i len acc)
-    (cond
-      [(>= i len) (values (list->string (reverse acc)) i)]
-      [(char-whitespace? (string-ref str i))
-       (values (list->string (reverse acc)) i)]
-      [else
-       (read-unquoted str (+ i 1) len (cons (string-ref str i) acc))]))
 
   ;; --- cd ---
   (define (builtin-cd args)
@@ -128,31 +85,45 @@
             (setenv "PWD" (cwd))))))
 
   ;; --- export ---
+  ;; Apply every VAR=value pair, not just the first: split each argument on its
+  ;; first `=` and set the variable. A bare NAME with no `=` marks an
+  ;; already-set variable exported by re-setting its current value (a not-yet-set
+  ;; bare name is left alone), so `export A=1 B=2 C` sets A and B and marks C.
+  ;;
+  ;; When an assignment changes PATH, re-read $PATH into the exec-path search
+  ;; list and repopulate the classifier's command cache once, so a command that
+  ;; has just become reachable classifies as a shell command within the session.
+  ;; The rebuild fires only for a PATH assignment, not on every export.
   (define (builtin-export args)
-    (when (pair? args)
-      (let* ([arg (car args)]
-             [eqpos (let loop ([i 0])
-                      (cond
-                        [(>= i (string-length arg)) #f]
-                        [(char=? (string-ref arg i) #\=) i]
-                        [else (loop (+ i 1))]))])
-        (if eqpos
-            (let ([var (substring arg 0 eqpos)]
-                  [val (substring arg (+ eqpos 1) (string-length arg))])
-              (setenv var val))
-            ;; No =, just mark for export (setenv with current value)
-            (let ([cur (getenv arg)])
-              (when cur (setenv arg cur)))))))
+    (let ([path-changed? #f])
+      (for-each
+        (lambda (arg)
+          (let ([eqpos (let loop ([i 0])
+                         (cond
+                           [(>= i (string-length arg)) #f]
+                           [(char=? (string-ref arg i) #\=) i]
+                           [else (loop (+ i 1))]))])
+            (if eqpos
+                (let ([var (substring arg 0 eqpos)])
+                  (setenv var (substring arg (+ eqpos 1) (string-length arg)))
+                  (when (string=? var "PATH")
+                    (set! path-changed? #t)))
+                (let ([cur (getenv arg)])
+                  (when cur (setenv arg cur))))))
+        args)
+      (when path-changed?
+        (init-exec-path-list)
+        (rebuild-path-cache!))))
 
   ;; --- Dispatcher ---
+  ;; Split and expand the whole line once through the shared parser tokeniser,
+  ;; so builtin arguments undergo the same $/~/quote/escape/glob expansion as an
+  ;; external command's. Because the tokeniser skips a leading empty word,
+  ;; leading whitespace before the command name is tolerated ("   cd /tmp").
   (define (run-builtin! str)
-    (let ([args (parse-args str)]
-          ;; Extract command name (first token)
-          [cmd (let loop ([i 0] [len (string-length str)])
-                 (cond
-                   [(>= i len) (substring str 0 len)]
-                   [(char-whitespace? (string-ref str i)) (substring str 0 i)]
-                   [else (loop (+ i 1) len)]))])
+    (let* ([words (parse-command-words str)]
+           [cmd (if (null? words) "" (car words))]
+           [args (if (null? words) '() (cdr words))])
       (cond
           [(string=? cmd "cd") (builtin-cd args)]
           [(string=? cmd "pushd") (builtin-pushd args)]

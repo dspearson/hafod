@@ -201,6 +201,10 @@ int main(void) {
     P_S("PLAT-SIGINFO", -1);
 #endif
 
+    /* errno constants -- signed; EINTR is a small positive int on every platform.
+       Named-keyed against the generator, so this line must match it exactly. */
+    P_S("PLAT-EINTR", EINTR);
+
     /* TTY input flags -- unsigned masks. */
     P_U("PLAT-IGNBRK", IGNBRK);
     P_U("PLAT-BRKINT", BRKINT);
@@ -305,9 +309,11 @@ int main(void) {
     P_U("PLAT-REG-NOTBOL",   REG_NOTBOL);
     P_U("PLAT-REG-NOTEOL",   REG_NOTEOL);
     P_U("PLAT-REG-NOMATCH",  REG_NOMATCH);
+    P_U("PLAT-REG-STARTEND", REG_STARTEND);
 
     /* Locale category -- signed. */
     P_S("PLAT-LC-ALL", LC_ALL);
+    P_S("PLAT-LC-COLLATE", LC_COLLATE);
 
     return 0;
 }

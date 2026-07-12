@@ -5,6 +5,33 @@
 (import (test runner) (hafod process) (hafod procobj) (hafod posix) (hafod fd-ports)
         (hafod compat) (chezscheme))
 
+;; True if `needle` occurs anywhere in `haystack`.
+(define (substring? needle haystack)
+  (let ([nl (string-length needle)] [hl (string-length haystack)])
+    (let loop ([i 0])
+      (cond [(> (+ i nl) hl) #f]
+            [(string=? needle (substring haystack i (+ i nl))) #t]
+            [else (loop (+ i 1))]))))
+
+;; Fail-fast watchdog: fork a sibling that SIGKILLs this process after `seconds`,
+;; so a regression that hangs a blocking wait dies deterministically instead of
+;; stalling the suite. Cancels the watchdog on the happy path and returns the
+;; thunk's value.
+;;
+;; victim is captured in an OUTER let, fully bound before the inner (posix-fork):
+;; Chez evaluates let inits right-to-left, so a single flat let would run the fork
+;; before (posix-getpid) and the watchdog child would capture its own pid and
+;; SIGKILL itself, never the test process. The nested lets fix the order.
+(define (with-watchdog seconds thunk)
+  (let ([victim (posix-getpid)])
+    (let ([wpid (posix-fork)])
+      (if (zero? wpid)
+          (begin (posix-sleep seconds) (posix-kill victim SIGKILL) (posix-_exit 0))
+          (let ([result (thunk)])
+            (posix-kill wpid SIGKILL)
+            (posix-waitpid wpid 0)
+            result)))))
+
 (test-begin "Process Operations")
 
 ;; =============================================================================
@@ -194,5 +221,73 @@
         (wait child)
         (move->fdes saved-stdin 0)
         (string=? "tail-pipe-test" line)))))
+
+;; =============================================================================
+;; forked-child exception containment
+;; =============================================================================
+
+;; An uncaught exception raised inside a forked-child thunk must terminate the
+;; child cleanly with a non-zero exit (status 1), reporting a single line to the
+;; child's own stderr — it must never unwind back into the parent's continuation.
+;; We point the child's error port at a pipe (so its report is captured rather
+;; than reaching the console) and confirm both the report and the clean exit
+;; (exit-val 1, no terminating signal). Watchdog-guarded so a regression that
+;; unwinds and hangs fails fast.
+(test-assert "a raising forked-child thunk exits with status 1 and reports on its own stderr"
+  (with-watchdog 10
+    (lambda ()
+      (receive (r w) (pipe)
+        (let ([p (with-current-error-port* w
+                   (lambda () (fork (lambda () (error 'boom "child explode")))))])
+          (close w)
+          (let ([line (get-line r)])
+            (let ([st (wait p)])
+              (close r)
+              (and (string? line)
+                   (substring? "uncaught exception in child process" line)
+                   (= 1 (status:exit-val st))
+                   (not (status:term-sig st))))))))))
+
+;; =============================================================================
+;; partial pipeline-spawn failure reaps already-launched stages
+;; =============================================================================
+
+;; When a pipeline fails to launch its Nth stage, the stages already launched
+;; (1..N-1) must be signalled and reaped, not left behind as zombie/orphan
+;; children. We build a 3-stage pipeline whose first two stages are a real,
+;; fast-exiting program at an absolute path and whose final stage names a
+;; non-existent absolute path, so posix-spawnp raises for the final stage after
+;; the first two have launched.
+;;
+;; The reap teardown runs under a watchdog so a regressed (e.g. non-lethal
+;; signal) blocking wait fails the suite deterministically rather than stalling
+;; it. The pre-existing-child drain and the leftover-child probe use
+;; (posix-waitpid -1 0), which would block on the watchdog's own live child, so
+;; they sit OUTSIDE the watchdog window — with-watchdog reaps its child before it
+;; returns, so the probe then observes only this pipeline's stages.
+(test-assert "a partial pipeline-spawn failure leaves no reapable child"
+  (let ([spawn-failed #f])
+    ;; Clear any child an earlier case left reapable so the probe sees only ours.
+    (let drain ()
+      (when (guard (_ [#t #f]) (posix-waitpid -1 0) #t)
+        (drain)))
+    ;; Launch the pipeline; the final stage cannot be spawned, so posix-spawnp
+    ;; raises after stages 1-2 have launched. Swallow the expected error and
+    ;; record that it fired, so the test proves it exercised the failure path.
+    (with-watchdog 8
+      (lambda ()
+        (guard (_ [#t (set! spawn-failed #t)])
+          (spawn-pipeline (list (list "/bin/echo")
+                                (list "/bin/echo")
+                                (list "/nonexistent/hafod-spawn-fail-xyz"))))))
+    (and
+      ;; The failure path actually fired (not a silently-successful pipeline).
+      spawn-failed
+      ;; No launched stage survives as a reapable child: post-fix the teardown
+      ;; reaped them, so waitpid raises ECHILD (no children -> #t); pre-fix a
+      ;; leaked stage is reapable, so the blocking wait returns a pid (-> #f).
+      (guard (_ [#t #t])
+        (posix-waitpid -1 0)
+        #f))))
 
 (test-end)

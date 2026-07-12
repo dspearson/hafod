@@ -5,6 +5,7 @@
 
 (library (hafod shell completers)
   (export register-completer! lookup-completer completer-names
+          completers-registered?
           git-completer ssh-completer kill-completer make-completer)
   (import (chezscheme)
           (hafod fuzzy))
@@ -14,14 +15,25 @@
   ;; where context is an alist with keys like 'args (previous args on line).
   (define *completers* (make-hashtable string-hash string=?))
 
+  ;; The built-in completers register on the first lookup, not at library
+  ;; instantiation, so a non-interactive invocation never pays for them.  The
+  ;; flag doubles as a probe; set before registering, it keeps
+  ;; ensure-builtin-completers! idempotent and non-re-entrant.  Single-threaded
+  ;; REPL, so a bare flag guard is sufficient.
+  (define %completers-registered? #f)
+
   (define (register-completer! cmd proc)
     (hashtable-set! *completers* cmd proc))
 
   (define (lookup-completer cmd)
+    (ensure-builtin-completers!)
     (hashtable-ref *completers* cmd #f))
 
   (define (completer-names)
+    (ensure-builtin-completers!)
     (vector->list (hashtable-keys *completers*)))
+
+  (define (completers-registered?) %completers-registered?)
 
   ;; ======================================================================
   ;; Helper: run a command and collect output lines
@@ -302,15 +314,20 @@
            (fuzzy-filter/positions prefix targets))))
 
   ;; ======================================================================
-  ;; Register built-in completers
+  ;; Register built-in completers (on first lookup, not at instantiation)
   ;; ======================================================================
 
-  (register-completer! "git" git-completer)
-  (register-completer! "ssh" ssh-completer)
-  (register-completer! "scp" ssh-completer)
-  (register-completer! "kill" kill-completer)
-  (register-completer! "killall" kill-completer)
-  (register-completer! "make" make-completer)
-  (register-completer! "gmake" make-completer)
+  ;; Set the flag first so a lookup that re-enters during registration sees the
+  ;; built-ins as already in progress and the second call is a no-op.
+  (define (ensure-builtin-completers!)
+    (unless %completers-registered?
+      (set! %completers-registered? #t)
+      (register-completer! "git" git-completer)
+      (register-completer! "ssh" ssh-completer)
+      (register-completer! "scp" ssh-completer)
+      (register-completer! "kill" kill-completer)
+      (register-completer! "killall" kill-completer)
+      (register-completer! "make" make-completer)
+      (register-completer! "gmake" make-completer)))
 
 ) ; end library

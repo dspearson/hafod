@@ -13,9 +13,10 @@
     vi-mode-indicator vi-pending-state
     ;; Search
     vi-search-pattern vi-search-direction
-    ;; Register read + paste seam (white-box; read by editor.ss paste and the
-    ;; tests — deliberately not re-exported by the (hafod) umbrella)
-    vi-reg-fetch vi-take-paste-register!
+    ;; Register read + paste seam, plus the keymap-count seam (white-box; read
+    ;; by editor.ss paste / keymap dispatch and the tests — deliberately not
+    ;; re-exported by the (hafod) umbrella)
+    vi-reg-fetch vi-take-paste-register! vi-take-keymap-count!
     ;; Dot-repeat: mid-command signal + replay delegation (white-box; the hook
     ;; is set by editor.ss — deliberately not re-exported by the (hafod) umbrella)
     vi-mid-command? vi-replay!-proc
@@ -80,7 +81,9 @@
             (mutable pending)           ;; 'normal|'operator|'replace|'find|'register
             (mutable find-dir)          ;; 'f|'F|'t|'T
             (mutable last-edit)         ;; (keys . initial-state) for . repeat
-            (mutable recording-edit)))  ;; list of key events being recorded
+            (mutable recording-edit)    ;; list of key events being recorded
+            (mutable operator-count)    ;; count stashed on operator entry (2 in 2d3w)
+            (mutable keymap-count)))    ;; count surfaced to the editor keymap (3 in 3x)
 
   (define *vi*
     (make-vi-state
@@ -97,27 +100,34 @@
       'normal        ;; pending
       #f             ;; find-dir
       #f             ;; last-edit
-      #f))           ;; recording-edit
+      #f             ;; recording-edit
+      0              ;; operator-count
+      0))            ;; keymap-count
 
   ;; Public accessors
   (define (vi-visual-mode) (vi-state-vis-mode *vi*))
   (define (vi-visual-anchor) (vi-state-vis-anchor *vi*))
   (define (vi-visual-end gb) (gap-buffer-cursor-pos gb))
   ;; Resolve the active visual selection into a (start . end) index span in the
-  ;; buffer's coordinate space, or #f when no visual mode is active. The span
-  ;; reproduces exactly what a visual d/y operates on: characterwise is inclusive
-  ;; of the cursor character (min..max+1, clamped to the text length), linewise is
-  ;; the whole single-line buffer (0..len). This mirrors the visual-operator span
-  ;; so the visible highlight and the characterwise/linewise delete or yank always
-  ;; agree on the same text.
+  ;; buffer's coordinate space, or #f when no visual mode is active. The span is
+  ;; the highlighted text: characterwise is inclusive of the cursor character
+  ;; (min..max+1, clamped to the text length); linewise covers the WHOLE logical
+  ;; line(s) the selection spans -- from the start of the lower endpoint's line
+  ;; to the end of the upper endpoint's line -- via the shared line-bounds helper
+  ;; (so on a single-line buffer this is still 0..len). The highlight is the line
+  ;; content; the linewise delete/yank in the operator arm additionally takes the
+  ;; bounding newline so the line is actually removed.
   (define (vi-visual-range gb)
     (let ([mode (vi-state-vis-mode *vi*)])
       (and mode
-           (let* ([len (string-length (gap-buffer->string gb))]
+           (let* ([text (gap-buffer->string gb)]
+                  [len (string-length text)]
                   [pos (gap-buffer-cursor-pos gb)]
                   [anchor (vi-state-vis-anchor *vi*)])
              (if (eq? mode 'line)
-                 (cons 0 len)
+                 (let-values ([(lo-start lo-end) (current-line-bounds text (min pos anchor))]
+                              [(hi-start hi-end) (current-line-bounds text (max pos anchor))])
+                   (cons lo-start hi-end))
                  ;; characterwise: min..max+1, clamped into [0, len], start <= end
                  (let* ([start (max 0 (min (min pos anchor) len))]
                         [end (max start (min (+ (max pos anchor) 1) len))])
@@ -151,6 +161,8 @@
   (define (vi-reset-state!)
     (vi-state-count-set! *vi* 0)
     (vi-state-operator-set! *vi* #f)
+    (vi-state-operator-count-set! *vi* 0)
+    (vi-state-keymap-count-set! *vi* 0)
     (vi-state-register-char-set! *vi* #\")
     (vi-state-pending-set! *vi* 'normal)
     (vi-state-find-dir-set! *vi* #f)
@@ -184,6 +196,34 @@
         (char=? ch #\-) (char=? ch #\?) (char=? ch #\!)))
 
   (define (blank? ch) (or (char=? ch #\space) (char=? ch #\tab)))
+
+  ;; ======================================================================
+  ;; Logical-line bounds
+  ;; ======================================================================
+
+  ;; The half-open span [start, end) of the logical line containing POS: start is
+  ;; one past the newline at-or-before POS (0 when there is none), end is the
+  ;; index of the next newline at-or-after POS (the text length when there is
+  ;; none -- i.e. the final line). POS is clamped into [0, len] first and both
+  ;; results stay within [0, len], so a malformed position or an empty buffer can
+  ;; never yield a negative or overrunning index, nor an unbounded scan. This is
+  ;; the single definition of where a logical line begins and ends, shared by the
+  ;; line operators (dd/cc/yy), the line-relative motions (0/^/$/gg/G) and the
+  ;; visual-line span so all three agree on the same line.
+  (define (current-line-bounds text pos)
+    (let* ([len (string-length text)]
+           [p (max 0 (min pos len))]
+           [start (let scan ([i (- p 1)])
+                    (cond
+                      [(< i 0) 0]
+                      [(char=? (string-ref text i) #\newline) (+ i 1)]
+                      [else (scan (- i 1))]))]
+           [end (let scan ([i p])
+                  (cond
+                    [(>= i len) len]
+                    [(char=? (string-ref text i) #\newline) i]
+                    [else (scan (+ i 1))]))])
+      (values start end)))
 
   ;; ======================================================================
   ;; Motion functions: (text pos) -> new-pos or #f
@@ -365,12 +405,15 @@
                      (motion-match-paren text i)]
                     [else (lp (+ i 1))]))])))))
 
-  ;; First non-blank (vim ^)
-  (define (motion-first-non-blank text _pos)
-    (let ([len (string-length text)])
-      (let lp ([i 0])
+  ;; First non-blank of the current line (vim ^). Scans forward from the line
+  ;; start, staying within the current logical line, and falls back to the line
+  ;; start when the whole line is blank -- so ^ never crosses a newline into a
+  ;; neighbouring line.
+  (define (motion-first-non-blank text pos)
+    (let-values ([(start end) (current-line-bounds text pos)])
+      (let lp ([i start])
         (cond
-          [(>= i len) 0]
+          [(>= i end) start]
           [(char-whitespace? (string-ref text i)) (lp (+ i 1))]
           [else i]))))
 
@@ -438,21 +481,40 @@
                                       (lp (- i 1)) i))])
                     (values start2 end))))))))
 
+  ;; A quote/tick delimiter at index I is escaped when it is preceded by an ODD
+  ;; run of backslashes -- \" is an escaped quote, \\" is a literal backslash
+  ;; then a live quote. This mirrors the forward backslash-skip string-bounds-at
+  ;; uses, so the backward opener walk and the forward closer walk agree on which
+  ;; delimiters are live; an escaped quote never opens or closes the span.
+  (define (delimiter-escaped? text i)
+    (let lp ([j (- i 1)] [n 0])
+      (if (and (>= j 0) (char=? (string-ref text j) #\\))
+          (lp (- j 1) (+ n 1))
+          (odd? n))))
+
   ;; Inner/around delimited pair: parens, brackets, braces, quotes
   (define (text-obj-inner-pair text pos open close)
     (let ([len (string-length text)])
       ;; Find enclosing open
       (let ([op (if (char=? open close)
-                    ;; For quotes: scan backward for nearest odd quote
-                    (let lp ([i (- pos 1)] [count 0])
-                      (cond
-                        [(< i 0) (if (odd? count) #f
-                                     ;; Maybe pos is on the open quote
-                                     (and (< pos len)
-                                          (char=? (string-ref text pos) open)
-                                          pos))]
-                        [(char=? (string-ref text i) open) (lp (- i 1) (+ count 1))]
-                        [else (lp (- i 1) count)]))
+                    ;; For quotes/ticks: resolve the pair ENCLOSING the cursor,
+                    ;; mirroring string-bounds-at. A live delimiter under the
+                    ;; cursor is taken as the opener (the on-opening-quote case);
+                    ;; otherwise walk BACKWARD from just before the cursor to the
+                    ;; nearest UNescaped delimiter -- an escaped one is skipped so
+                    ;; it never opens the span. No opener before the cursor leaves
+                    ;; op #f (a safe no-op). Every index stays within [0, len].
+                    (if (and (< pos len)
+                             (char=? (string-ref text pos) open)
+                             (not (delimiter-escaped? text pos)))
+                        pos
+                        (let lp ([i (- pos 1)])
+                          (cond
+                            [(< i 0) #f]
+                            [(and (char=? (string-ref text i) open)
+                                  (not (delimiter-escaped? text i)))
+                             i]
+                            [else (lp (- i 1))])))
                     ;; For paired delimiters: find matching open with nesting
                     (let lp ([i (if (and (< pos len) (char=? (string-ref text pos) open))
                                    pos (- pos 1))]
@@ -467,7 +529,10 @@
             (values #f #f)
             ;; Find matching close
             (let ([cl (if (char=? open close)
-                          ;; For quotes: find next quote after open
+                          ;; For quotes/ticks: the nearest UNescaped delimiter
+                          ;; forward of the opener, skipping a backslash-escaped
+                          ;; one (\X consumes two chars) so an internal escaped
+                          ;; delimiter never closes the span.
                           (let lp ([i (+ op 1)])
                             (cond
                               [(>= i len) #f]
@@ -741,6 +806,18 @@
       (if (char=? reg #\")
           #f
           (vi-reg-fetch (if (char<=? #\A reg #\Z) (char-downcase reg) reg)))))
+
+  ;; Hand the count typed before a keymap-dispatched command to the editor, then
+  ;; reset it. The fall-through arm parks the pending count here (before zeroing
+  ;; the running count) whenever vi-process-key returns #f, so editor.ss can read
+  ;; it and repeat the bound command that many times -- 3x deletes three chars,
+  ;; 5p pastes five times. Defaults to 1 when no count was given, and clears the
+  ;; slot on the read so the next uncounted command runs exactly once. Mirrors
+  ;; vi-take-paste-register!, which hands the pending register to a keymap paste.
+  (define (vi-take-keymap-count!)
+    (let ([n (vi-state-keymap-count *vi*)])
+      (vi-state-keymap-count-set! *vi* 0)
+      (max 1 n)))
 
   ;; ======================================================================
   ;; Operator application
@@ -1042,11 +1119,13 @@
              [(#\B) motion-B]
              [(#\e) motion-e]
              [(#\E) motion-E]
-             [(#\0) (lambda (text _pos) 0)]
+             [(#\0) (lambda (text pos)
+                      (let-values ([(start end) (current-line-bounds text pos)])
+                        start))]
              [(#\^) motion-first-non-blank]
-             [(#\$) (lambda (text _pos)
-                      (let ([len (string-length text)])
-                        (if (> len 0) (- len 1) 0)))]
+             [(#\$) (lambda (text pos)
+                      (let-values ([(start end) (current-line-bounds text pos)])
+                        (if (> end start) (- end 1) start)))]
              [(#\h) (lambda (text pos)
                       (if (> pos 0) (- pos 1) #f))]
              [(#\l) (lambda (text pos)
@@ -1165,14 +1244,35 @@
                               (- (char->integer val) (char->integer #\0))))
             #t]
 
-           ;; Operator keys: d c y
+           ;; Operator keys: d c y. Skipped while a visual selection is active so
+           ;; d/c/y fall through to the visual-operator arm below (which deletes
+           ;; or changes the selection); otherwise a visual d would start an
+           ;; operator-pending instead of acting on the selection.
            [(and (eq? type 'char) (memv val '(#\d #\c #\y))
-                 (not (vi-state-operator *vi*)))
+                 (not (vi-state-operator *vi*))
+                 (not (vi-state-vis-mode *vi*)))
             (vi-state-operator-set! *vi* (case val [(#\d) 'd] [(#\c) 'c] [(#\y) 'y]))
+            ;; Stash the prefix count as the operator's count and reset the
+            ;; running count, so the following motion's digits accumulate a
+            ;; FRESH motion count. The motion arm then multiplies the two
+            ;; (2d3w = 2x3 = 6 words) instead of the old digit-concatenation
+            ;; (2 then 3 -> 23). A bare operator (no prefix) stashes 0, which
+            ;; the arm reads as 1, so d3w still deletes 3.
+            (vi-state-operator-count-set! *vi* (vi-state-count *vi*))
+            (vi-state-count-set! *vi* 0)
             (vi-state-pending-set! *vi* 'operator)
             #t]
 
-           ;; Double operator: dd cc yy → whole line
+           ;; Double operator: dd cc yy → the CURRENT logical line (never the
+           ;; whole buffer). The span is derived from the shared line-bounds
+           ;; helper and shaped per operator:
+           ;;   dd  the line plus its trailing newline; on the final line take the
+           ;;       PRECEDING newline instead (so no blank line is left behind);
+           ;;       a single-line buffer has no newline and is simply emptied.
+           ;;   cc  the line's text only -- the newline stays, so the line
+           ;;       survives as an empty line for the insert that follows.
+           ;;   yy  the line's text only (no newline), so a charwise p re-inserts
+           ;;       just the line -- matching the current single-line yy/p.
            [(and (eq? type 'char) (vi-state-operator *vi*)
                  (case (vi-state-operator *vi*)
                    [(d) (char=? val #\d)]
@@ -1180,8 +1280,26 @@
                    [(y) (char=? val #\y)]
                    [else #f]))
             (let* ([text (gap-buffer->string gb)]
-                   [len (string-length text)])
-              (vi-apply-operator! es gb kr 0 len))
+                   [len (string-length text)]
+                   [pos (gap-buffer-cursor-pos gb)]
+                   [op (vi-state-operator *vi*)])
+              (let-values ([(ls le) (current-line-bounds text pos)])
+                (let-values ([(start end)
+                              (case op
+                                ;; cc / yy: the line's text only (no newline).
+                                ;; cc then keeps the now-empty line for the
+                                ;; insert; yy copies just the line content, so a
+                                ;; charwise p re-inserts the line's text -- the
+                                ;; current single-line yy/p behaviour carried to
+                                ;; multi-line buffers.
+                                [(c y) (values ls le)]
+                                ;; dd: the line plus a bounding newline so the
+                                ;; line is removed outright.
+                                [else (cond
+                                        [(< le len) (values ls (+ le 1))]
+                                        [(> ls 0)   (values (- ls 1) le)]
+                                        [else       (values ls le)])])])
+                  (vi-apply-operator! es gb kr start end))))
             #t]
 
            ;; Surround operator: ys (the surround key after y). The change and
@@ -1239,18 +1357,52 @@
                  (resolve-motion evt))
             => (lambda (motion)
                  (let* ([text (gap-buffer->string gb)]
+                        [len (string-length text)]
                         [pos (gap-buffer-cursor-pos gb)]
-                        [cnt (max 1 (vi-state-count *vi*))]
-                        [new-pos (run-motion-n motion text pos cnt)])
+                        [op (vi-state-operator *vi*)]
+                        ;; cw / cW act as ce / cE: with the change operator and
+                        ;; a w/W motion on a non-blank, vim changes to the END
+                        ;; of the current word (not the start of the next), and
+                        ;; so keeps the trailing whitespace. Substitute the e/E
+                        ;; motion and take its inclusive end. dw / yw keep w.
+                        [cw->ce? (and (eq? op 'c) (memv val '(#\w #\W))
+                                      (< pos len)
+                                      (not (char-whitespace? (string-ref text pos))))]
+                        [eff-key (cond [(not cw->ce?) val]
+                                       [(char=? val #\w) #\e]
+                                       [else #\E])]
+                        [eff-motion (cond [(not cw->ce?) motion]
+                                          [(char=? val #\w) motion-e]
+                                          [else motion-E])]
+                        ;; Operator count (stashed on operator entry) multiplies
+                        ;; the motion count: 2d3w = 6. Outside operator context
+                        ;; the stash is 0 -> 1, so a plain motion count is
+                        ;; unchanged.
+                        [cnt (* (max 1 (vi-state-operator-count *vi*))
+                                (max 1 (vi-state-count *vi*)))]
+                        [new-pos (run-motion-n eff-motion text pos cnt)])
                    (cond
-                     [(vi-state-operator *vi*)
+                     [op
                       ;; Apply operator over range
                       (when new-pos
-                        (let ([start (min pos new-pos)]
-                              [end (if (memv val '(#\e #\E #\$ #\%))
-                                       (+ (max pos new-pos) 1)
-                                       (max pos new-pos))])
-                          (vi-apply-operator! es gb kr start end)))]
+                        (let* ([start (min pos new-pos)]
+                               [raw-end (if (memv eff-key '(#\e #\E #\$ #\%))
+                                            (+ (max pos new-pos) 1)
+                                            (max pos new-pos))]
+                               ;; w/W-motion operator clamp: never delete across
+                               ;; the current line's trailing newline. Clamp the
+                               ;; end back to the line end so dw / cw on the last
+                               ;; word of a line stop at end-of-line and leave the
+                               ;; newline (and the next line) intact. Operator
+                               ;; context only -- the plain w/W cursor motion
+                               ;; above is untouched. Indices stay within [0, len].
+                               [end (if (memv val '(#\w #\W))
+                                        (let-values ([(ls le) (current-line-bounds text pos)])
+                                          (min raw-end le))
+                                        raw-end)]
+                               [s (max 0 (min start len))]
+                               [e (max s (min end len))])
+                          (vi-apply-operator! es gb kr s e)))]
                      [(vi-state-vis-mode *vi*)
                       ;; Extend visual selection
                       (when new-pos
@@ -1272,23 +1424,28 @@
             (vi-reset-state!)
             #t]
 
-           ;; G: end of line (in single-line context)
+           ;; G: last line — the first non-blank of the final logical line, via
+           ;; the shared line-bounds helper (not raw buffer length).
            [(and (eq? type 'char) (char=? val #\G) (not (vi-state-operator *vi*)))
-            (let ([len (gap-buffer-length gb)]
-                  [pos (gap-buffer-cursor-pos gb)])
-              (when (< pos len)
-                (gap-buffer-move-cursor! gb (- (max 0 (- len 1)) pos))))
+            (let* ([text (gap-buffer->string gb)]
+                   [len (string-length text)]
+                   [pos (gap-buffer-cursor-pos gb)]
+                   [target (motion-first-non-blank text len)])
+              (gap-buffer-move-cursor! gb (- target pos)))
             (vi-reset-state!)
             #t]
 
-           ;; gg: beginning of buffer
+           ;; gg: first line — the first non-blank of the first logical line, via
+           ;; the shared line-bounds helper (not raw buffer offset 0).
            [(and (eq? type 'char) (char=? val #\g) (not (vi-state-operator *vi*)))
             (let ([next (read-key-event in-port)])
               (when (and (not (eof-object? next))
                          (eq? (key-event-type next) 'char)
                          (char=? (key-event-value next) #\g))
-                (let ([pos (gap-buffer-cursor-pos gb)])
-                  (gap-buffer-move-cursor! gb (- 0 pos)))))
+                (let* ([text (gap-buffer->string gb)]
+                       [pos (gap-buffer-cursor-pos gb)]
+                       [target (motion-first-non-blank text 0)])
+                  (gap-buffer-move-cursor! gb (- target pos)))))
             (vi-reset-state!)
             #t]
 
@@ -1445,10 +1602,22 @@
                    [end (+ (max pos (vi-state-vis-anchor *vi*)) 1)]
                    [text (gap-buffer->string gb)]
                    [len (string-length text)])
-              ;; For line visual, extend to line boundaries
+              ;; For line visual, extend to WHOLE logical lines: from the start
+              ;; of the line holding the lower endpoint to the end of the line
+              ;; holding the upper endpoint, plus a bounding newline (the trailing
+              ;; one, or the preceding one when the final line is selected) so Vd
+              ;; removes the line(s) without leaving a blank line behind. Reuses
+              ;; the shared line-bounds helper so V agrees with dd on the line.
               (let-values ([(s e)
                             (if (eq? (vi-state-vis-mode *vi*) 'line)
-                                (values 0 len)
+                                (let-values ([(lo-start lo-end) (current-line-bounds text start)]
+                                             [(hi-start hi-end)
+                                              (current-line-bounds text
+                                                (max pos (vi-state-vis-anchor *vi*)))])
+                                  (cond
+                                    [(< hi-end len) (values lo-start (+ hi-end 1))]
+                                    [(> lo-start 0) (values (- lo-start 1) hi-end)]
+                                    [else           (values lo-start hi-end)]))
                                 (values start (min end len)))])
                 (vi-state-operator-set! *vi* (case val
                                     [(#\d #\x) 'd] [(#\c #\s) 'c] [(#\y) 'y]))
@@ -1621,6 +1790,12 @@
            ;; here would zero the register before the paste ran, stranding "ap /
            ;; "aP back on the kill-ring instead of the named register.
            [else
+            ;; Surface the pending count to the editor's keymap dispatch BEFORE
+            ;; zeroing the running count: 3x / 5p / 4a fall through here, and
+            ;; editor.ss reads the parked count via vi-take-keymap-count! to
+            ;; repeat the bound command. register-char is still left intact so a
+            ;; keymap paste (cmd-paste-after / -before) reads the pending "reg.
+            (vi-state-keymap-count-set! *vi* (vi-state-count *vi*))
             (vi-state-count-set! *vi* 0)
             (vi-state-operator-set! *vi* #f)
             (vi-state-pending-set! *vi* 'normal)

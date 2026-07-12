@@ -8,6 +8,14 @@
 (setenv "TEST_SHELL_VAR" "test-value")
 (setenv "HOME" "/home/user")
 
+;; Helper: does the datum tree contain the given symbol anywhere?
+(define (tree-contains? tree sym)
+  (cond
+    [(eq? tree sym) #t]
+    [(pair? tree) (or (tree-contains? (car tree) sym)
+                      (tree-contains? (cdr tree) sym))]
+    [else #f]))
+
 (test-begin "Shell Parser")
 
 ;; === Simple commands ===
@@ -140,6 +148,26 @@
 (test-equal "pipe with redirect"
   '(run (pipe (ls) (grep "foo")) (> "out.txt"))
   (parse-shell-command "ls | grep foo > out.txt"))
+
+;; A redirection on a non-final pipeline stage must survive into the pipe as an
+;; (epf CMD REDIR ...) nested process form -- it is not dropped in favour of the
+;; last stage's redirects. Without this, `ls 2>/dev/null | grep foo` would parse
+;; to (run (pipe (ls) (grep "foo"))) and leak stderr.
+(test-equal "fd redirect on non-final pipeline stage is preserved"
+  '(run (pipe (epf (ls) (> 2 "/dev/null")) (grep "foo")))
+  (parse-shell-command "ls 2>/dev/null | grep foo"))
+
+;; The same for a duplication redirect on a non-final stage: `cmd 2>&1 | less`
+;; must keep the (= 2 1) so stderr is merged into the pipe.
+(test-equal "dup redirect on non-final pipeline stage is preserved"
+  '(run (pipe (epf (cmd) (= 2 1)) (less)))
+  (parse-shell-command "cmd 2>&1 | less"))
+
+;; The final stage's redirects still hoist onto the outer run, and an earlier
+;; stage without redirects stays a bare command form.
+(test-equal "mixed: non-final redirect wrapped, final redirect hoisted"
+  '(run (pipe (epf (a) (> 2 "/dev/null")) (b)) (> "out.txt"))
+  (parse-shell-command "a 2>/dev/null | b > out.txt"))
 
 ;; === Program name is a symbol ===
 
@@ -293,5 +321,81 @@
 (test-equal "multiple redirections"
   '(run (sort) (< "input.txt") (> "output.txt"))
   (parse-shell-command "sort < input.txt > output.txt"))
+
+;; === fd-prefixed redirections ===
+
+(test-equal "fd-prefixed output redirect"
+  '(run (ls) (> 2 "/dev/null"))
+  (parse-shell-command "ls 2>/dev/null"))
+
+(test-equal "fd-prefixed append redirect"
+  '(run (foo) (>> 2 "log"))
+  (parse-shell-command "foo 2>>log"))
+
+(test-equal "fd-prefixed output redirect, fd 9"
+  '(run (bar) (> 9 "out"))
+  (parse-shell-command "bar 9>out"))
+
+(test-equal "digit followed by space stays an argument"
+  '(run (echo "2") (> "x"))
+  (parse-shell-command "echo 2 > x"))
+
+(test-error "fd-prefixed redirect without filename is a parse error"
+  (parse-shell-command "ls 2>"))
+
+;; No-regression: bare redirects keep the default fd (1-arg form)
+(test-equal "no-regression: bare output redirect keeps default fd"
+  '(run (ls) (> "out.txt"))
+  (parse-shell-command "ls >out.txt"))
+
+(test-equal "no-regression: input then output redirect keeps default fds"
+  '(run (sort) (< "input.txt") (> "output.txt"))
+  (parse-shell-command "sort < input.txt > output.txt"))
+
+;; === fd duplication ===
+
+(test-equal "stderr follows stdout"
+  '(run (cmd) (= 2 1))
+  (parse-shell-command "cmd 2>&1"))
+
+(test-equal "stdout follows stderr"
+  '(run (cmd) (= 1 2))
+  (parse-shell-command "cmd 1>&2"))
+
+(test-equal "output dup with default fd 1"
+  '(run (cmd) (= 1 2))
+  (parse-shell-command "cmd >&2"))
+
+(test-equal "input dup with default fd 0"
+  '(run (cmd) (= 0 3))
+  (parse-shell-command "cmd <&3"))
+
+(test-assert "dup redirection does not background"
+  (not (tree-contains? (parse-shell-command "ls 2>&1") 'job-bg!)))
+
+(test-error "output dup to a file is a parse error, not backgrounding"
+  (parse-shell-command "ls >&file"))
+
+;; === comments ===
+
+(test-equal "trailing comment stripped"
+  '(run (echo "hello"))
+  (parse-shell-command "echo hello # a comment"))
+
+(test-equal "whole-word comment stripped"
+  '(run (ls))
+  (parse-shell-command "ls #comment"))
+
+(test-equal "hash mid-word stays literal"
+  '(run (echo "a#b"))
+  (parse-shell-command "echo a#b"))
+
+(test-equal "single-quoted hash stays literal"
+  '(run (echo "#notacomment"))
+  (parse-shell-command "echo '#notacomment'"))
+
+(test-equal "double-quoted hash stays literal"
+  '(run (echo "a#b"))
+  (parse-shell-command "echo \"a#b\""))
 
 (test-end)

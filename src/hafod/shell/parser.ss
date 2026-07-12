@@ -5,11 +5,12 @@
 ;;; glob expansion, and brace expansion.
 
 (library (hafod shell parser)
-  (export parse-shell-command)
+  (export parse-shell-command parse-command-words)
 
   (import (except (chezscheme) getenv)
           (only (hafod glob) glob)
-          (only (hafod environment) getenv))
+          (only (hafod environment) getenv)
+          (only (hafod user-group) name->user-info user-info:home-dir))
 
   ;; ======================================================================
   ;; Token types
@@ -21,9 +22,10 @@
   ;;   (or-if . #f)           — ||
   ;;   (semi . #f)            — ;
   ;;   (background . #f)      — &
-  ;;   (redirect-out . #f)    — >
-  ;;   (redirect-append . #f) — >>
-  ;;   (redirect-in . #f)     — <
+  ;;   (redirect-out . fd)    — >    (fd is an integer, or #f for the default)
+  ;;   (redirect-append . fd) — >>   (fd is an integer, or #f for the default)
+  ;;   (redirect-in . fd)     — <    (fd is an integer, or #f for the default)
+  ;;   (redirect-dup . (dst . src)) — N>&M / N<&M / >&M / <&M (fd duplication)
 
   (define (make-token type value) (cons type value))
   (define (token-type tok) (car tok))
@@ -41,6 +43,20 @@
 
   (define (glob-meta? c)
     (or (char=? c #\*) (char=? c #\?) (char=? c #\[)))
+
+  (define (ascii-digit? c)
+    (char<=? #\0 c #\9))
+
+  ;; Read a run of ASCII digits from str starting at pos.
+  ;; Returns (values fd new-pos) where fd is the integer value of the run,
+  ;; or (values #f pos) when there is no digit at pos.
+  (define (read-fd-digits str pos len)
+    (let loop ([j pos] [chars '()])
+      (if (and (< j len) (ascii-digit? (string-ref str j)))
+          (loop (+ j 1) (cons (string-ref str j) chars))
+          (if (null? chars)
+              (values #f pos)
+              (values (string->number (list->string (reverse chars))) j)))))
 
   ;; ======================================================================
   ;; Environment variable expansion
@@ -72,6 +88,40 @@
 
   (define (expand-var name)
     (or (getenv name) ""))
+
+  ;; ======================================================================
+  ;; Tilde expansion
+  ;; ======================================================================
+
+  ;; Characters that may appear in a tilde-prefix login name. The name run
+  ;; ends at the first character outside this set (notably `/`, whitespace,
+  ;; a quote, or a shell operator), so the remainder of the word continues
+  ;; through the main loop unchanged.
+  (define (tilde-name-char? c)
+    (or (char-alphabetic? c)
+        (char-numeric? c)
+        (char=? c #\_)
+        (char=? c #\-)
+        (char=? c #\.)))
+
+  ;; Look up ~name's home directory, leaving the literal ~name unchanged when
+  ;; the user is unknown (name->user-info raises for an absent passwd entry).
+  (define (tilde-user-home name)
+    (guard (e [#t (string-append "~" name)])
+      (user-info:home-dir (name->user-info name))))
+
+  ;; Expand a tilde-prefix beginning just after `~` (at pos). Reads the login
+  ;; name run: an empty run (`~` or `~/...`) yields $HOME (literal `~` when HOME
+  ;; is unset); a non-empty run `~name` yields that user's home directory, or
+  ;; the literal `~name` when the user does not exist. Returns
+  ;; (values expansion new-pos); the expansion is appended verbatim (not globbed).
+  (define (expand-tilde str pos len)
+    (let loop ([j pos] [chars '()])
+      (if (and (< j len) (tilde-name-char? (string-ref str j)))
+          (loop (+ j 1) (cons (string-ref str j) chars))
+          (if (null? chars)
+              (values (or (getenv "HOME") "~") j)
+              (values (tilde-user-home (list->string (reverse chars))) j)))))
 
   ;; ======================================================================
   ;; Brace expansion
@@ -214,6 +264,24 @@
       (define (add-string! s)
         (string-for-each (lambda (c) (add-char! c)) s))
 
+      ;; If the pending word is a bare run of ASCII digits contributed only by
+      ;; literal characters (no quote or variable), consume it as an explicit
+      ;; redirection fd and return that integer, clearing the pending word
+      ;; without emitting it as an argument. Otherwise return #f and leave the
+      ;; pending word untouched (flush-word! then emits it normally). A digit
+      ;; run separated from the operator by whitespace is already flushed to a
+      ;; word token, so it stays an ordinary argument.
+      (define (take-fd-prefix!)
+        (if (and (pair? word-chars)
+                 (not word-started?)
+                 (for-all ascii-digit? word-chars))
+            (let ([fd (string->number (list->string (reverse word-chars)))])
+              (set! word-chars '())
+              (set! has-glob? #f)
+              (set! has-brace? #f)
+              fd)
+            #f))
+
       ;; Main loop
       (let loop ([i 0])
         (if (>= i len)
@@ -255,22 +323,51 @@
                  (set! tokens (cons (make-token 'semi #f) tokens))
                  (loop (+ i 1))]
 
-                ;; Redirect: > or >>
+                ;; Redirect: >, >>, or fd-duplication >&M
                 [(char=? c #\>)
-                 (flush-word!)
-                 (if (and (< (+ i 1) len) (char=? (string-ref str (+ i 1)) #\>))
-                     (begin
-                       (set! tokens (cons (make-token 'redirect-append #f) tokens))
-                       (loop (+ i 2)))
-                     (begin
-                       (set! tokens (cons (make-token 'redirect-out #f) tokens))
-                       (loop (+ i 1))))]
+                 (let ([fd (take-fd-prefix!)])
+                   (flush-word!)
+                   (cond
+                     ;; >> append (note: >>& is not a duplication form)
+                     [(and (< (+ i 1) len) (char=? (string-ref str (+ i 1)) #\>))
+                      (set! tokens (cons (make-token 'redirect-append fd) tokens))
+                      (loop (+ i 2))]
+                     ;; >&M duplication: the destination fd defaults to 1
+                     [(and (< (+ i 1) len) (char=? (string-ref str (+ i 1)) #\&))
+                      (let-values ([(src next-i) (read-fd-digits str (+ i 2) len)])
+                        (if src
+                            (begin
+                              (set! tokens (cons (make-token 'redirect-dup
+                                                             (cons (or fd 1) src))
+                                                 tokens))
+                              (loop next-i))
+                            (error 'parse-shell-command
+                                   "redirect '>&' requires a target file descriptor")))]
+                     ;; Plain > output
+                     [else
+                      (set! tokens (cons (make-token 'redirect-out fd) tokens))
+                      (loop (+ i 1))]))]
 
-                ;; Redirect: <
+                ;; Redirect: < or fd-duplication <&M
                 [(char=? c #\<)
-                 (flush-word!)
-                 (set! tokens (cons (make-token 'redirect-in #f) tokens))
-                 (loop (+ i 1))]
+                 (let ([fd (take-fd-prefix!)])
+                   (flush-word!)
+                   (cond
+                     ;; <&M duplication: the destination fd defaults to 0
+                     [(and (< (+ i 1) len) (char=? (string-ref str (+ i 1)) #\&))
+                      (let-values ([(src next-i) (read-fd-digits str (+ i 2) len)])
+                        (if src
+                            (begin
+                              (set! tokens (cons (make-token 'redirect-dup
+                                                             (cons (or fd 0) src))
+                                                 tokens))
+                              (loop next-i))
+                            (error 'parse-shell-command
+                                   "redirect '<&' requires a source file descriptor")))]
+                     ;; Plain < input
+                     [else
+                      (set! tokens (cons (make-token 'redirect-in fd) tokens))
+                      (loop (+ i 1))]))]
 
                 ;; Backslash escape
                 [(char=? c #\\)
@@ -351,6 +448,37 @@
                  (add-char! c)
                  (loop (+ i 1))]
 
+                ;; Tilde expansion. `~` is special only at the very start of a
+                ;; word, or immediately after an unquoted `=` in an assignment
+                ;; word (so `export X=~/y` expands); a leading quote or `$`
+                ;; expansion sets word-started?, so those cases fall through to
+                ;; the literal branch. A mid-word `~` and a quoted `~` (the
+                ;; quote loops add chars directly and never reach here) stay
+                ;; literal. The expansion is appended via add-string! so it is
+                ;; not re-globbed.
+                [(char=? c #\~)
+                 (if (and (not word-started?)
+                          (or (null? word-chars)
+                              (char=? (car word-chars) #\=)))
+                     (let-values ([(expansion next-i)
+                                   (expand-tilde str (+ i 1) len)])
+                       (set! word-started? #t)
+                       (add-string! expansion)
+                       (loop next-i))
+                     (begin
+                       (add-char! c)
+                       (loop (+ i 1))))]
+
+                ;; Unquoted # at a word boundary starts an end-of-line comment.
+                ;; A pending word (mid-word #, e.g. a#b) falls through to the
+                ;; normal-character branch and stays literal; a quoted # never
+                ;; reaches here (the quote loops add it directly).
+                [(and (char=? c #\#)
+                      (null? word-chars)
+                      (not word-started?))
+                 (flush-word!)
+                 (reverse tokens)]
+
                 ;; Normal character (including } which is harmless without matching {)
                 [else
                  (add-char! c)
@@ -373,7 +501,8 @@
 
   ;; Check if a token is a redirection type.
   (define (redirect-token? tok)
-    (memq (token-type tok) '(redirect-out redirect-append redirect-in)))
+    (memq (token-type tok)
+          '(redirect-out redirect-append redirect-in redirect-dup)))
 
   ;; Map redirect token type to EPF symbol.
   (define (redirect-sym type)
@@ -396,12 +525,23 @@
                                     (map token-value (cdr words))))]
                 [redir-forms (reverse redirects)])
            (cons cmd-form redir-forms))]
+        [(eq? (token-type (car rest)) 'redirect-dup)
+         ;; fd duplication: (= dst src). Consumes no following word.
+         (let* ([dup (token-value (car rest))]
+                [redir-form (list '= (car dup) (cdr dup))])
+           (loop (cdr rest) cmd-words (cons redir-form redirects)))]
         [(redirect-token? (car rest))
-         ;; Next token must be a word (the filename)
+         ;; File redirect: the next token must be a word (the filename).
+         ;; With an explicit fd, emit the 2-arg EPF form (sym fd fname);
+         ;; otherwise the 1-arg form (sym fname) that keeps the default fd.
          (if (and (pair? (cdr rest))
                   (eq? (token-type (cadr rest)) 'word))
-             (let ([redir-form (list (redirect-sym (token-type (car rest)))
-                                     (token-value (cadr rest)))])
+             (let* ([fd (token-value (car rest))]
+                    [sym (redirect-sym (token-type (car rest)))]
+                    [fname (token-value (cadr rest))]
+                    [redir-form (if fd
+                                    (list sym fd fname)
+                                    (list sym fname))])
                (loop (cddr rest) cmd-words (cons redir-form redirects)))
              (error 'parse-shell-command
                     "redirect without filename"))]
@@ -424,11 +564,28 @@
                       [cmd (car stage)]
                       [redirects (cdr stage)])
                  (cons 'run (cons cmd redirects)))]
-              ;; Pipeline
+              ;; Pipeline: preserve every stage's redirections, not just the
+              ;; last. A non-final stage carrying redirects becomes an
+              ;; (epf CMD REDIR ...) nested process form so its redirections
+              ;; survive into the pipe (e.g. `ls 2>/dev/null | grep foo` keeps
+              ;; the `(> 2 "/dev/null")` on the first stage, and `cmd 2>&1 | less`
+              ;; keeps the `(= 2 1)`). The final stage's redirections are hoisted
+              ;; onto the outer run, exactly as before.
               [else
-               (let* ([last-stage (list-ref parsed (- (length parsed) 1))]
-                      [last-redirects (cdr last-stage)]
-                      [pipe-forms (map car parsed)]
+               (let* ([last-redirects (cdr (list-ref parsed (- (length parsed) 1)))]
+                      [pipe-forms
+                       (let stage-forms ([stages parsed])
+                         (if (null? (cdr stages))
+                             ;; Final stage: command only; redirs hoisted onto run.
+                             (list (car (car stages)))
+                             ;; Earlier stage: wrap in (epf cmd redir ...) when it
+                             ;; carries redirections, otherwise the bare command.
+                             (let ([cmd (car (car stages))]
+                                   [redirs (cdr (car stages))])
+                               (cons (if (pair? redirs)
+                                         (cons 'epf (cons cmd redirs))
+                                         cmd)
+                                     (stage-forms (cdr stages))))))]
                       [pipe-form (cons 'pipe pipe-forms)])
                  (cons 'run (cons pipe-form last-redirects)))])))))
 
@@ -494,9 +651,19 @@
                           [(pipe) " | "]
                           [(and-if) " && "]
                           [(or-if) " || "]
-                          [(redirect-out) " > "]
-                          [(redirect-append) " >> "]
-                          [(redirect-in) " < "]
+                          [(redirect-out)
+                           (let ([fd (token-value tok)])
+                             (if fd (string-append " " (number->string fd) "> ") " > "))]
+                          [(redirect-append)
+                           (let ([fd (token-value tok)])
+                             (if fd (string-append " " (number->string fd) ">> ") " >> "))]
+                          [(redirect-in)
+                           (let ([fd (token-value tok)])
+                             (if fd (string-append " " (number->string fd) "< ") " < "))]
+                          [(redirect-dup)
+                           (let ([dup (token-value tok)])
+                             (string-append " " (number->string (car dup)) ">&"
+                                            (number->string (cdr dup)) " "))]
                           [(semi) "; "]
                           [(background) " &"]
                           [else ""])
@@ -535,5 +702,18 @@
       (if (null? tokens)
           '(run)  ; empty command
           (build-form tokens))))
+
+  ;; Tokenise an input line and return just the expanded WORD strings, in
+  ;; order, discarding operator and redirect tokens. This is the shared word
+  ;; splitter the shell builtins consume, so a builtin's arguments undergo the
+  ;; same $/~/quote/escape/glob/brace expansion as an external command's, and
+  ;; leading whitespace is skipped (the tokeniser flushes an empty leading word).
+  (define (parse-command-words str)
+    (let loop ([rest (tokenise str)] [acc '()])
+      (cond
+        [(null? rest) (reverse acc)]
+        [(eq? (token-type (car rest)) 'word)
+         (loop (cdr rest) (cons (token-value (car rest)) acc))]
+        [else (loop (cdr rest) acc)])))
 
 ) ; end library

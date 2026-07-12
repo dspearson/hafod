@@ -199,21 +199,30 @@
       ;; Zero out buffer
       (do ([i 0 (+ i 1)]) ((= i SIZEOF-GLOB-T))
         (foreign-set! 'unsigned-8 buf i 0))
-      (let ([rc (c-glob pattern 0 0 buf)])
-        (if (zero? rc)
-            (let* ([pathc (foreign-ref 'uptr buf GLOB-GL-PATHC)]
-                   [pathv (foreign-ref 'uptr buf GLOB-GL-PATHV)]
-                   [results (let loop ([i 0] [acc '()])
-                              (if (= i pathc) (reverse acc)
-                                  (let ([ptr (foreign-ref 'uptr pathv (* i (foreign-sizeof 'void*)))])
-                                    (loop (+ i 1) (cons (ptr->string ptr) acc)))))])
-              (c-globfree buf)
-              (foreign-free buf)
-              results)
-            (begin
-              (c-globfree buf)
-              (foreign-free buf)
-              '())))))
+      ;; The glob call and the pathv decode run inside a dynamic-wind whose
+      ;; after-thunk does BOTH c-globfree (releases the glob_t's own pathv /
+      ;; string allocations) AND foreign-free (releases our glob_t buffer), in
+      ;; that order. A glob_t needs the globfree unwind -- foreign-free alone
+      ;; would leak glob's internal allocations -- so this is not a with-foreign-
+      ;; buffer site. The unwind runs on every exit, including a ptr->string
+      ;; raise mid-walk. Behaviour is preserved: the matched path list on a zero
+      ;; rc, '() on a non-zero rc (globfree on a zeroed/handled glob_t is safe,
+      ;; exactly as the two former branches both did).
+      (dynamic-wind
+        (lambda () #f)
+        (lambda ()
+          (let ([rc (c-glob pattern 0 0 buf)])
+            (if (zero? rc)
+                (let ([pathc (foreign-ref 'uptr buf GLOB-GL-PATHC)]
+                      [pathv (foreign-ref 'uptr buf GLOB-GL-PATHV)])
+                  (let loop ([i 0] [acc '()])
+                    (if (= i pathc) (reverse acc)
+                        (let ([ptr (foreign-ref 'uptr pathv (* i (foreign-sizeof 'void*)))])
+                          (loop (+ i 1) (cons (ptr->string ptr) acc))))))
+                '())))
+        (lambda ()
+          (c-globfree buf)
+          (foreign-free buf)))))
 
   ;; ======================================================================
   ;; mkfifo, fsync, sync

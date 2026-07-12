@@ -92,4 +92,61 @@
 (test-assert "rebuild-path-cache! populates cache"
   (> (hashtable-size (path-cache)) 0))
 
+;; === command-not-found gate ===
+
+;; A bound Scheme identifier (procedure or variable) must never trigger a
+;; command-not-found suggestion -- car/list are legal Scheme, not a typo.
+(test-equal "suppress car (bound procedure)"
+  #t (command-not-found-suppress? "car"))
+
+(test-equal "suppress list (bound procedure)"
+  #t (command-not-found-suppress? "list"))
+
+(test-equal "suppress define (keyword)"
+  #t (command-not-found-suppress? "define"))
+
+(test-equal "suppress 42 (numeric literal)"
+  #t (command-not-found-suppress? "42"))
+
+(test-equal "suppress a string literal"
+  #t (command-not-found-suppress? "\"s\""))
+
+(test-equal "suppress the empty token"
+  #t (command-not-found-suppress? ""))
+
+;; A user-defined variable is bound in the interaction environment the REPL
+;; evaluates in, so it is suppressed too.
+(eval '(define zzboundvar 1) (interaction-environment))
+(test-equal "suppress a user-defined variable"
+  #t (command-not-found-suppress? "zzboundvar"))
+
+;; A genuinely-unknown alphabetic token is still eligible for a suggestion.
+(test-equal "do not suppress an unknown token"
+  #f (command-not-found-suppress? "zzznotacommandxx"))
+
+;; Suggestions are a capped list drawn from the PATH key-list.
+(test-assert "suggestions for ls is a list"
+  (list? (command-not-found-suggestions "ls")))
+
+(test-assert "suggestions are capped at three"
+  (<= (length (command-not-found-suggestions "ls")) 3))
+
+;; === path-cache-keys cache ===
+
+(test-assert "path-cache-keys returns a list"
+  (list? (path-cache-keys)))
+
+(test-assert "path-cache-keys length matches the cache size"
+  (= (length (path-cache-keys)) (hashtable-size (path-cache))))
+
+;; Memoised between rebuilds: two consecutive calls return the same object.
+(test-assert "path-cache-keys is memoised between rebuilds"
+  (eq? (path-cache-keys) (path-cache-keys)))
+
+;; rebuild-path-cache! drops the memoised key-list, so the next call is fresh.
+(test-assert "rebuild-path-cache! invalidates the key-list"
+  (let ([a (path-cache-keys)])
+    (rebuild-path-cache!)
+    (not (eq? a (path-cache-keys)))))
+
 (test-end)

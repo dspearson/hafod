@@ -53,7 +53,7 @@ mtime() {
     fi
 }
 
-# Build with the flake-pinned Chez (10.3.0) so the working tree matches this
+# Build with the flake-pinned Chez so the working tree matches this
 # toolchain before the gate inspects it; a different Chez is not what we test.
 build() {
     nix develop -c make compile </dev/null

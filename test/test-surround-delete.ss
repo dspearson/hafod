@@ -7,8 +7,8 @@
 ;;; ds( on ( x ) gives x while ds) on ( x ) preserves the spaces to give " x "),
 ;;; that detection is lexer- and type-aware (the innermost pair of the requested
 ;;; type, the nearest () skipping an inner [], and a ) inside a string never the
-;;; closer), that the ' and ` families resolve only with the cursor on the
-;;; opening quote (a cursor inside is a documented no-op here), and that a
+;;; closer), that the ' and ` families resolve from the opening quote and from
+;;; inside the quotes (in step with the double-quote family), and that a
 ;;; missing pair, a lone quote, or a non-delimiter char is a safe no-op that
 ;;; raises nothing. Everything is driven through vi-process-key with bounded
 ;;; string ports, so the suite needs no terminal and can never block.
@@ -136,16 +136,15 @@
 (test-equal "ds) on (a \"b)c\" d) ignores the paren inside the string"
   "a \"b)c\" d" (ds! "(a \"b)c\" d)" 1 ")"))
 
-;; --- Quote families: the cursor-on-the-opening-quote limitation (both ways) --
+;; --- Quote families: resolved from the opening quote AND from inside ---------
 
-;; With the cursor ON the opening quote, the same-char scan resolves the pair.
+;; With the cursor ON the opening quote, the enclosing pair resolves.
 (test-equal "ds' removes the quotes from 'x' with the cursor on the open quote"
   "x" (ds! "'x'" 0 "'"))
-;; With the cursor INSIDE the quotes, text-obj-around-pair yields (#f #f): the
-;; documented no-op for the ' and ` families, whose backward same-char scan is
-;; deliberately left unchanged here.
-(test-equal "ds' is a no-op with the cursor inside the quotes"
-  "'x'" (ds! "'x'" 1 "'"))
+;; And with the cursor INSIDE the quotes: the ' and ` families now resolve the
+;; enclosing pair from any inside position, in step with the double-quote family.
+(test-equal "ds' removes the quotes from 'x' with the cursor inside"
+  "x" (ds! "'x'" 1 "'"))
 
 ;; --- Safe no-ops: buffer unchanged, no exception raised ---------------------
 

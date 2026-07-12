@@ -8,9 +8,14 @@
   (export run-finder fuzzy-select
           ;; Exposed for the PTY-free renderer tests (white-box): construct a
           ;; state, render to a string port, and drive the plain fallback.
-          render-finder! make-finder-state run-finder/plain)
+          render-finder! make-finder-state run-finder/plain
+          ;; Further white-box hooks for the incremental-narrowing and O(1)
+          ;; display-lookup equivalence tests: drive one keystroke, read the
+          ;; filtered vector back, and resolve a candidate's display string.
+          query-insert! finder-state-filtered display-version)
   (import (chezscheme)
           (only (hafod fuzzy) filter-search-pattern/positions)
+          (only (hafod srfi-13) string-prefix?)
           (only (hafod editor input-decode)
                 read-key-event key-event? key-event-type key-event-value key-event-mods
                 char-display-width string-display-width
@@ -23,6 +28,7 @@
                 fg-colour fg-colour-l
                 ident-colour-from-hash ident-hash)
           (only (hafod interactive) query-terminal-size)
+          (only (hafod tty) refresh-terminal-size-cache! cached-terminal-size)
           (only (hafod posix) SIGWINCH)
           (only (hafod signal) with-signal-handler)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
@@ -82,7 +88,30 @@
       display-items            ;; vector of flattened display strings
       colorize?                ;; #f or procedure: (string -> boolean) — true means syntax-colour
       show-numbers?            ;; boolean: show 1-based index numbers beside candidates
-      colour?))                ;; boolean: colour-ok? of the output — gates every SGR/palette byte
+      colour?                  ;; boolean: colour-ok? of the output — gates every SGR/palette byte
+      disp-map                 ;; eq-hashtable item->display-string (computed, not passed)
+      idx-map)                 ;; eq-hashtable item->original 0-based index (computed, not passed)
+    ;; The two trailing fields are computed once from items/display-items, so the
+    ;; public constructor keeps exactly its 14 positional arguments (white-box
+    ;; callers and test/test-finder.ss construct with those). disp-map backs the
+    ;; O(1) display-version lookup; idx-map restores narrowing survivors to
+    ;; original-corpus order so a narrowed re-score stays byte-identical to a full
+    ;; one (fuzzy's stable score-tiebreak leaves ties in input order).
+    (protocol
+      (lambda (new)
+        (lambda (items filtered query cursor selected scroll-offset rows cols
+                 total-count prompt display-items colorize? show-numbers? colour?)
+          (let ([dmap (make-eq-hashtable)]
+                [imap (make-eq-hashtable)]
+                [n (vector-length items)])
+            (let lp ([i 0])
+              (when (fx< i n)
+                (hashtable-set! dmap (vector-ref items i) (vector-ref display-items i))
+                (hashtable-set! imap (vector-ref items i) i)
+                (lp (fx1+ i))))
+            (new items filtered query cursor selected scroll-offset rows cols
+                 total-count prompt display-items colorize? show-numbers? colour?
+                 dmap imap))))))
 
   ;; ======================================================================
   ;; Multiline flattening
@@ -119,15 +148,18 @@
           (lp (fx1+ i))))
       disp))
 
+  ;; Sentinel distinct from every stored display string, so an absent candidate
+  ;; is told apart from a present one in a single hashtable probe.
+  (define %display-absent (list 'absent))
+
+  ;; Resolve a candidate's flattened display string in O(1) via the precomputed
+  ;; disp-map (item->display-string), falling back to flatten-for-display for a
+  ;; candidate not drawn from the original corpus.
   (define (display-version state candidate)
-    (let ([disp (finder-state-display-items state)]
-          [items (finder-state-items state)]
-          [len (vector-length (finder-state-items state))])
-      (let lp ([i 0])
-        (cond
-          [(fx>= i len) (flatten-for-display candidate)]
-          [(eq? candidate (vector-ref items i)) (vector-ref disp i)]
-          [else (lp (fx1+ i))]))))
+    (let ([disp (hashtable-ref (finder-state-disp-map state) candidate %display-absent)])
+      (if (eq? disp %display-absent)
+          (flatten-for-display candidate)
+          disp)))
 
   ;; ======================================================================
   ;; Alternate screen buffer
@@ -477,7 +509,7 @@
                                  (substring q c (string-length q)))])
       (finder-state-query-set! state new-q)
       (finder-state-cursor-set! state (fx1+ c))
-      (refilter! state)))
+      (refilter! state q)))
 
   (define (query-delete-back! state)
     (let* ([q (finder-state-query state)]
@@ -487,7 +519,7 @@
                                     (substring q c (string-length q)))])
           (finder-state-query-set! state new-q)
           (finder-state-cursor-set! state (fx1- c))
-          (refilter! state)))))
+          (refilter! state q)))))
 
   (define (query-delete-forward! state)
     (let* ([q (finder-state-query state)]
@@ -497,14 +529,14 @@
         (let ([new-q (string-append (substring q 0 c)
                                     (substring q (fx1+ c) len))])
           (finder-state-query-set! state new-q)
-          (refilter! state)))))
+          (refilter! state q)))))
 
   (define (query-clear! state)
     (let ([q (finder-state-query state)])
       (unless (string=? q "")
         (finder-state-query-set! state "")
         (finder-state-cursor-set! state 0)
-        (refilter! state))))
+        (refilter! state q))))
 
   (define (query-delete-word-back! state)
     (let* ([q (finder-state-query state)]
@@ -522,16 +554,55 @@
                                       (substring q c (string-length q)))])
             (finder-state-query-set! state new-q)
             (finder-state-cursor-set! state i)
-            (refilter! state))))))
+            (refilter! state q))))))
 
   ;; ======================================================================
   ;; Re-filtering
   ;; ======================================================================
 
-  (define (refilter! state)
+  ;; True iff string s contains character ch.
+  (define (string-contains-char? s ch)
+    (let ([n (string-length s)])
+      (let lp ([i 0])
+        (cond
+          [(fx>= i n) #f]
+          [(char=? (string-ref s i) ch) #t]
+          [else (lp (fx1+ i))]))))
+
+  ;; May the new query re-score only the OLD query's survivors rather than the
+  ;; whole corpus?  Only when it strictly extends the old query at the end AND
+  ;; introduces no operator that can make the match set non-monotonic:
+  ;;   |  OR — a later alternative can match strings the old query rejected;
+  ;;   !  negation — flips which strings qualify;
+  ;;   $  suffix anchor — a trailing $ makes the token a suffix match, so typing
+  ;;      past it (foo$ -> foo$x) reverts to a fuzzy token that can re-admit
+  ;;      strings the suffix excluded.
+  ;; A deletion or a mid-string insert fails string-prefix? and also falls back.
+  ;; This is a conservative over-approximation: a literal |/!/$ merely forces a
+  ;; full re-score, never a wrong result.
+  (define (can-narrow? old new)
+    (and (fx> (string-length new) (string-length old))
+         (string-prefix? old new)
+         (not (string-contains-char? new #\|))
+         (not (string-contains-char? new #\!))
+         (not (string-contains-char? new #\$))))
+
+  ;; Re-score the candidates for the current query.  When can-narrow? holds we
+  ;; feed only the previous survivors — but RESTORED TO ORIGINAL-CORPUS ORDER via
+  ;; idx-map, because fuzzy's score-tiebreak leaves equal-score/equal-length ties
+  ;; in input order and list-sort is stable; feeding the old-sorted order would
+  ;; reorder ties versus a full re-score.  Otherwise we re-score the whole corpus.
+  ;; Callers pass their pre-mutation query as old-query.
+  (define (refilter! state old-query)
     (let* ([q (finder-state-query state)]
-           [items (finder-state-items state)]
-           [candidates (vector->list items)]
+           [candidates
+            (if (can-narrow? old-query q)
+                (let ([imap (finder-state-idx-map state)])
+                  (list-sort
+                    (lambda (a b)
+                      (fx< (hashtable-ref imap a 0) (hashtable-ref imap b 0)))
+                    (map car (vector->list (finder-state-filtered state)))))
+                (vector->list (finder-state-items state)))]
            [results (filter-search-pattern/positions q candidates)]
            [new-filtered (list->vector results)])
       (finder-state-filtered-set! state new-filtered)
@@ -605,7 +676,15 @@
   (define (finder-loop state resize-flag)
     (when (flag-ref resize-flag)
       (flag-clear! resize-flag)
-      (let-values ([(new-rows new-cols) (query-terminal-size)])
+      ;; Refresh the leaf width cache on the same resize event, mirroring the
+      ;; REPL's SIGWINCH handler.  The finder installs its OWN SIGWINCH handler
+      ;; for the duration of the TUI, displacing the REPL handler that is
+      ;; otherwise the sole refresher of this cache; without this the editor
+      ;; that resumes after the finder would read a pre-resize width.  Source
+      ;; the finder-state rows/cols from the just-refreshed cache so the two
+      ;; never diverge (one live query, not two).
+      (refresh-terminal-size-cache!)
+      (let-values ([(new-rows new-cols) (cached-terminal-size)])
         (finder-state-rows-set! state new-rows)
         (finder-state-cols-set! state new-cols)
         (adjust-scroll! state)))
@@ -755,6 +834,11 @@
        (run-finder* items prompt colorize? mode-map show-numbers?)]))
 
   (define (run-finder* items prompt colorize? mode-map show-numbers?)
+    ;; Seed the leaf terminal-size cache at entry so the finder's first size
+    ;; query and any immediate cache read start from the true width rather than
+    ;; the stale 24x80 default.  The matching re-seed after finder-loop returns
+    ;; (below) is what restores the width the editor resumes at.
+    (refresh-terminal-size-cache!)
     ;; Gate the full-screen TUI on the ANSI-capability of the OUTPUT target,
     ;; using the explicit fd 1: the shared console port aliases to fd 2, so
     ;; gating on the port object would inspect the wrong stream and could leak
@@ -790,14 +874,22 @@
             ;; installs it for the duration of the TUI and restores whatever
             ;; SIGWINCH disposition was live beforehand (the REPL's resize
             ;; handler) on exit, rather than clobbering it with a no-op.
-            (with-signal-handler SIGWINCH
-              (lambda (sig) (flag-set! resize-flag))
-              (lambda ()
-                (with-raw-mode 0
-                  (lambda ()
-                    (with-alternate-screen
-                      (lambda ()
-                        (finder-loop state resize-flag)))))))))))
+            (let ([result
+                   (with-signal-handler SIGWINCH
+                     (lambda (sig) (flag-set! resize-flag))
+                     (lambda ()
+                       (with-raw-mode 0
+                         (lambda ()
+                           (with-alternate-screen
+                             (lambda ()
+                               (finder-loop state resize-flag)))))))])
+              ;; Re-seed the leaf width cache once the finder has torn down (raw
+              ;; mode, alternate screen and the finder's own SIGWINCH handler
+              ;; all restored).  Belt-and-braces alongside the in-loop refresh:
+              ;; it guarantees the editor that resumes reads the true width even
+              ;; when a resize arrived while the finder's handler was installed.
+              (refresh-terminal-size-cache!)
+              result)))))
 
   (define fuzzy-select
     (case-lambda

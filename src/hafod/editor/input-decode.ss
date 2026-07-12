@@ -187,9 +187,24 @@
         [else
          (make-key-event 'char ch 0)])))
 
-  ;; Ensure locale is set for wcwidth to handle CJK correctly
+  ;; Process-wide locale policy -- this is hafod's single setlocale site.
+  ;;
+  ;; First adopt the environment's locale so wcwidth and multibyte input decoding
+  ;; are UTF-8 aware (that is what LC_CTYPE governs, and the original reason for
+  ;; this call). Then pin the collation category to the byte-ordered "C" locale.
+  ;; libc's regexec resolves a bracket range such as [\x01-\x7f] through
+  ;; LC_COLLATE: under a UTF-8 collation the endpoints straddle where letters
+  ;; sort, so it becomes a collation range that can exclude plain ASCII letters
+  ;; -- which is why `(rx ascii)` failed to match "a" through the merged binary in
+  ;; a UTF-8 locale (LC_CTYPE stays UTF-8, only the collation is neutralised).
+  ;; hafod's regex character ranges are meant to compare by byte/codepoint value
+  ;; regardless of the user's collation, so we force LC_COLLATE to "C" here.
+  ;; This touches only hafod's own libc collation -- no environment variable
+  ;; changes, so child processes are unaffected -- and hafod never sorts through
+  ;; the C library's collation (strcoll), so C collation has no other effect.
   (define c-setlocale (foreign-procedure "setlocale" (int string) string))
   (define locale-initialized (c-setlocale PLAT-LC-ALL ""))
+  (define collate-initialised (c-setlocale PLAT-LC-COLLATE "C"))
 
   ;; wcwidth FFI for display width calculation
   (define c-wcwidth (foreign-procedure "wcwidth" (int) int))

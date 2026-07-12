@@ -2,9 +2,39 @@
 ;;; Tests proc records, process table, wait, wait-any, reap-zombies.
 
 (library-directories '(("src" . "src") ("." . ".")))
-(import (test runner) (hafod procobj) (hafod posix) (hafod compat) (chezscheme))
+(import (test runner) (hafod procobj) (hafod posix) (hafod compat)
+        (hafod signal) (chezscheme))
 
 (test-begin "Process Objects")
+
+;; -----------------------------------------------------------------------------
+;; Signal-interruption harness
+;;
+;; A blocking wait can be interrupted by a caught signal; we deliver one with a
+;; one-shot alarm(2) and bound the whole case with a watchdog so a regression
+;; fails deterministically instead of hanging the suite.
+;; -----------------------------------------------------------------------------
+
+;; libc is already linked into the Chez executable; #f resolves "alarm" from it.
+(load-shared-object #f)
+(define c-alarm (foreign-procedure "alarm" (unsigned-int) unsigned-int))
+
+;; Fork a sibling that SIGKILLs this process after SECONDS, run THUNK, then
+;; cancel the sibling on the happy path and return the thunk's value.
+;;
+;; victim is captured in an OUTER let, fully bound before the inner (posix-fork):
+;; Chez evaluates let inits right-to-left, so a single flat let would run the fork
+;; before (posix-getpid) and the watchdog child would capture its own pid and
+;; SIGKILL itself, never the test process. The nested lets fix the order.
+(define (with-watchdog seconds thunk)
+  (let ([victim (posix-getpid)])
+    (let ([wpid (posix-fork)])
+      (if (zero? wpid)
+          (begin (posix-sleep seconds) (posix-kill victim SIGKILL) (posix-_exit 0))
+          (let ([result (thunk)])
+            (posix-kill wpid SIGKILL)
+            (posix-waitpid wpid 0)
+            result)))))
 
 ;; =============================================================================
 ;; Proc record basics
@@ -185,5 +215,27 @@
         ;; Parent: wait for child
         (receive (wpid status) (posix-waitpid child-pid 0)
           (= 0 (status:exit-val status))))))
+
+;; =============================================================================
+;; Signal interrupting a blocking wait
+;; =============================================================================
+
+;; A child lives ~3s then exits 42. The parent installs a caught SIGALRM
+;; handler, arms a one-shot alarm(1), then blocks in wait. The alarm fires
+;; mid-wait: an unhardened posix-call surfaces the interruption as
+;; &posix-error (errno EINTR) and this case fails; a syscall path that retries
+;; the interrupted wait returns the child's real exit status (42). wait itself
+;; reaps the child, so no follow-up waitpid is needed.
+(test-assert "a caught signal interrupting a blocking wait retries and returns the real exit status"
+  (with-watchdog 10
+    (lambda ()
+      (let ([child (posix-fork)])
+        (if (zero? child)
+            (begin (posix-sleep 3) (posix-_exit 42))
+            (begin
+              (set-signal-handler! SIGALRM (lambda (s) (void)))
+              (c-alarm 1)
+              (let ([st (wait (new-child-proc child))])
+                (= 42 (status:exit-val st)))))))))
 
 (test-end)

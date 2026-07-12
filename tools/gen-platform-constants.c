@@ -143,6 +143,9 @@ int main(void) {
     printf("    PLAT-SIGPROF PLAT-SIGWINCH PLAT-SIGIO PLAT-SIGSYS\n");
     printf("    PLAT-SIGPWR PLAT-SIGINFO\n");
 
+    /* errno constants */
+    printf("    PLAT-EINTR\n");
+
     /* TTY flag values */
     printf("    PLAT-IGNBRK PLAT-BRKINT PLAT-IGNPAR PLAT-PARMRK\n");
     printf("    PLAT-INPCK PLAT-ISTRIP PLAT-INLCR PLAT-IGNCR PLAT-ICRNL\n");
@@ -186,10 +189,10 @@ int main(void) {
 
     /* Regex flags */
     printf("    PLAT-REG-EXTENDED PLAT-REG-ICASE PLAT-REG-NOSUB PLAT-REG-NEWLINE\n");
-    printf("    PLAT-REG-NOTBOL PLAT-REG-NOTEOL PLAT-REG-NOMATCH\n");
+    printf("    PLAT-REG-NOTBOL PLAT-REG-NOTEOL PLAT-REG-NOMATCH PLAT-REG-STARTEND\n");
 
     /* Locale */
-    printf("    PLAT-LC-ALL\n");
+    printf("    PLAT-LC-ALL PLAT-LC-COLLATE\n");
 
     printf("  )\n");
     printf("  (import (chezscheme))\n\n");
@@ -356,6 +359,13 @@ int main(void) {
     printf("\n");
 
     /* ============================================================ */
+    /* EINTR is a small positive signed int, universal on Linux/macOS/BSD --
+       no #ifdef needed. It rides the signed EMIT_S path like a signal number. */
+    printf("  ;; errno constants\n");
+    EMIT_S("PLAT-EINTR", EINTR);
+    printf("\n");
+
+    /* ============================================================ */
     printf("  ;; TTY input flags\n");
     EMIT_U("PLAT-IGNBRK", IGNBRK);
     EMIT_U("PLAT-BRKINT", BRKINT);
@@ -484,9 +494,11 @@ int main(void) {
     EMIT_U("PLAT-REG-NOTBOL", REG_NOTBOL);
     EMIT_U("PLAT-REG-NOTEOL", REG_NOTEOL);
     EMIT_U("PLAT-REG-NOMATCH", REG_NOMATCH);
+    EMIT_U("PLAT-REG-STARTEND", REG_STARTEND);
 
     printf("  ;; Locale\n");
     EMIT_S("PLAT-LC-ALL", LC_ALL);
+    EMIT_S("PLAT-LC-COLLATE", LC_COLLATE);
     printf("\n");
 
     printf("\n) ; end library\n");

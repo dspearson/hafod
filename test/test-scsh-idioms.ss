@@ -180,7 +180,7 @@
 
 ;; begin with env access
 (test-assert "begin: env access"
-  (let ((result (run/string (begin (display (get-environment-variable "HOME"))))))
+  (let ((result (run/string (begin (display (getenv "HOME"))))))
     (and (string? result) (> (string-length result) 0))))
 
 ;; begin computing and printing result

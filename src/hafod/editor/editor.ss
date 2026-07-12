@@ -91,16 +91,17 @@
   ;; Terminal size query
   ;; ======================================================================
 
-  ;; Query the terminal column count, falling back to 80 off a terminal.
-  ;; Delegates to the shared tty helper.
+  ;; Query the terminal column count, falling back to 80 off a terminal.  Reads
+  ;; the SIGWINCH-refreshed cache in the shared tty leaf, so a per-render call
+  ;; costs an O(1) cell read rather than a live TIOCGWINSZ ioctl every frame.
   (define (editor-query-terminal-cols)
-    (let-values ([(rows cols) (terminal-size)]) cols))
+    (let-values ([(rows cols) (cached-terminal-size)]) cols))
 
   ;; Query the terminal row count, falling back to 24 off a terminal.  Reads the
-  ;; same (values rows cols) as editor-query-terminal-cols but keeps the rows it
-  ;; discards -- the drop-up decision needs the terminal height.
+  ;; same cached (values rows cols) as editor-query-terminal-cols but keeps the
+  ;; rows it discards -- the drop-up decision needs the terminal height.
   (define (editor-query-terminal-rows)
-    (let-values ([(rows cols) (terminal-size)]) rows))
+    (let-values ([(rows cols) (cached-terminal-size)]) rows))
 
   ;; ======================================================================
   ;; Raw mode
@@ -866,13 +867,12 @@
                   (set! history-prefix (substring text 0 pos))
                   (set! history-prefix #f)))
             (if history-prefix
-                (let* ([entries (history-entries editor-history)]
-                       [cur (history-cursor editor-history)]
-                       [start (if (= cur -1) (- (vector-length entries) 1) (- cur 1))]
+                (let* ([cur (history-cursor editor-history)]
+                       [start (if (= cur -1) (- (history-count editor-history) 1) (- cur 1))]
                        [idx (history-prefix-search-backward editor-history history-prefix start)])
                   (when idx
                     (history-cursor-set! editor-history idx)
-                    (gap-buffer-set-from-string! gb (vector-ref entries idx))))
+                    (gap-buffer-set-from-string! gb (history-ref editor-history idx))))
                 (let ([entry (history-prev editor-history)])
                   (when entry
                     (gap-buffer-set-from-string! gb entry))))))))
@@ -892,17 +892,16 @@
           (cmd-move-down es)
           ;; On last line: history navigation
           (if (and history-prefix (not (= cur -1)))
-              (let* ([entries (history-entries editor-history)]
-                     [len (vector-length entries)])
+              (let ([len (history-count editor-history)])
                 (let loop ([i (+ cur 1)])
                   (cond
                     [(>= i len)
                      (history-cursor-set! editor-history -1)
                      (set! history-prefix #f)
                      (gap-buffer-set-from-string! gb (history-saved-input editor-history))]
-                    [(string-prefix? history-prefix (vector-ref entries i))
+                    [(string-prefix? history-prefix (history-ref editor-history i))
                      (history-cursor-set! editor-history i)
-                     (gap-buffer-set-from-string! gb (vector-ref entries i))]
+                     (gap-buffer-set-from-string! gb (history-ref editor-history i))]
                     [else (loop (+ i 1))])))
               (let ([entry (history-next editor-history)])
                 (when entry
@@ -1824,11 +1823,13 @@
     (if (or (= (string-length before) 0)
             (not (only-closing-delimiters? after)))
         ""
-        (let* ([entries (history-entries history)]
-               [n (vector-length entries)]
+        ;; This runs from update-suggestion! on every render, so it reads the
+        ;; history through the O(1) count/ref accessors -- never the right-sized
+        ;; history-entries view, which would copy the whole store per keystroke.
+        (let* ([n (history-count history)]
                [idx (history-prefix-search-backward history before (- n 1))])
           (if idx
-              (let ([entry (vector-ref entries idx)])
+              (let ([entry (history-ref history idx)])
                 (substring entry (string-length before) (string-length entry)))
               ""))))
 
@@ -1836,7 +1837,8 @@
   ;; before-cursor string), ignoring paredit's auto-inserted trailing closers, and
   ;; show when the cursor is at the end of the typed region.  Delegates to the pure
   ;; history-ghost-suffix seam.
-  ;; Note: editor-history is referenced via closure; must be defined before first call.
+  ;; Note: editor-history reads through ensure-editor-history!, so the first
+  ;; render's ghost lookup is what opens the history database in interactive use.
   (define (update-suggestion! gb)
     (set! suggestion-text
       (history-ghost-suffix (gap-buffer-before-string gb)
@@ -2207,7 +2209,25 @@
 
   ;; Module-level kill ring instance.
   (define editor-kill-ring (make-kill-ring))
-  (define editor-history (open-history))
+
+  ;; The command history handle is opened lazily on first interactive use.
+  ;; This library is instantiated for EVERY invocation -- including a non-
+  ;; interactive `-c`/`-s` that just evaluates an expression -- so opening the
+  ;; history database at instantiation would dlopen libsqlite3 at startup for
+  ;; a run that never reads history.  Instead %editor-history is a memo cell,
+  ;; ensure-editor-history! opens the database once and caches it, and the
+  ;; identifier macro `editor-history` routes every read below through that
+  ;; accessor.  The handle therefore materialises on the first interactive
+  ;; touch -- the first render's ghost lookup, an Up/Down press, or a submit --
+  ;; and is reused thereafter; a non-interactive boot never opens it.
+  (define %editor-history #f)
+  (define (ensure-editor-history!)
+    (or %editor-history
+        (let ([h (open-history)])
+          (set! %editor-history h)
+          h)))
+  (define-syntax editor-history
+    (identifier-syntax (ensure-editor-history!)))
 
   ;; Return the history entries vector (for history expansion in interactive.ss).
   (define (editor-history-entries)
@@ -2889,9 +2909,18 @@
   (define (dot-dispatch-event! es gb in out evt)
     (if (eq? (editor-state-mode es) 'normal)
         (unless (vi-process-key es evt in out gb editor-kill-ring)
-          (let ([binding (keymap-lookup editor-normal-keymap evt)])
+          ;; A count typed before this keymap-dispatched command (3x, 5p, 4a)
+          ;; was surfaced by vi-process-key; read it and repeat the bound
+          ;; command that many times (default 1), stopping early on done. Keeps
+          ;; this dispatch path consistent with the main loop's.
+          (let ([binding (keymap-lookup editor-normal-keymap evt)]
+                [reps (vi-take-keymap-count!)])
             (cond
-              [(procedure? binding) (binding es)]
+              [(procedure? binding)
+               (let rep ([i 0])
+                 (when (and (< i reps) (not (editor-state-done? es)))
+                   (binding es)
+                   (rep (+ i 1))))]
               [(keymap? binding)
                (let ([next-evt (read-key-event in)])
                  (unless (eof-object? next-evt)
@@ -3090,6 +3119,10 @@
          ;; Set initial cursor shape + colour (bar/blue for insert mode)
          (set-cursor-bar out-port)
          (flush-output-port out-port)
+         ;; Seed the terminal-size cache once for this prompt, so the first
+         ;; render below -- and every keystroke render after it -- reads the
+         ;; true width from the cache instead of a live ioctl per render.
+         (refresh-terminal-size-cache!)
          ;; Render initial edit line (last line of prompt + empty buffer)
          (let ([initial-lines (render-line out-port prompt gb 0 (editor-query-terminal-cols))])
          ;; Command loop — prev-lines tracks screen lines for correct cursor-up
@@ -3163,11 +3196,21 @@
                          (if (editor-state-done? es)
                              (finish! (editor-state-result es))
                              (loop (render-with-menu out-port prompt gb prev-lines es)))
-                         ;; Fall through to keymap
-                         (let ([binding (keymap-lookup km evt)])
+                         ;; Fall through to keymap. A numeric count typed before
+                         ;; a keymap-dispatched command (3x, 5p, 4a) was surfaced
+                         ;; by vi-process-key; in normal mode read it and repeat
+                         ;; the bound command that many times (default 1). Taken
+                         ;; only in normal mode, so insert-mode typing is
+                         ;; unaffected; the loop also stops early if a command
+                         ;; signals done.
+                         (let ([binding (keymap-lookup km evt)]
+                               [reps (if (eq? mode 'normal) (vi-take-keymap-count!) 1)])
                            (cond
                              [(procedure? binding)
-                              (binding es)
+                              (let rep ([i 0])
+                                (when (and (< i reps) (not (editor-state-done? es)))
+                                  (binding es)
+                                  (rep (+ i 1))))
                               (if (editor-state-done? es)
                                   (finish! (editor-state-result es))
                                   (loop (render-with-menu out-port prompt gb prev-lines es)))]

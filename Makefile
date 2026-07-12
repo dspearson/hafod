@@ -40,7 +40,7 @@ TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
 # Platform detection
 UNAME_S := $(shell uname -s)
 
-.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-version-guard test-load test-ffi-no-helper test-hafod-so-fresh test-install-launch test-platform-abi test-hang-timeout print-test-timeout verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability print-native-libs version-source chez-version-source $(TEST_TARGETS)
+.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-re-binary test-version-guard test-load test-ffi-no-helper test-hafod-so-fresh test-install-launch test-platform-abi test-hang-timeout print-test-timeout verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability print-native-libs version-source chez-version-source $(TEST_TARGETS)
 
 all: native
 
@@ -78,7 +78,7 @@ TIMEOUT_PREFIX =
 # enumerated rather than matched with test-%, because the standalone .sh proofs
 # (test-ffi-no-helper, test-hafod-so-fresh, test-install-launch, test-platform-abi,
 # test-hang-timeout) do not use the wrapper and must not trigger this warning.
-ifneq ($(filter test $(TEST_TARGETS) test-launcher test-version-guard test-load verify-umbrella,$(MAKECMDGOALS)),)
+ifneq ($(filter test $(TEST_TARGETS) test-launcher test-re-binary test-version-guard test-load verify-umbrella,$(MAKECMDGOALS)),)
 $(warning No 'timeout' or 'gtimeout' found; test suites run WITHOUT a kill-timeout.)
 endif
 else
@@ -196,16 +196,19 @@ compile-libs: $(PLATFORM_STAMP) version-source chez-version-source
 	$(SCHEME) $(LIBDIRS) --compile-imported-libraries --script compile-all.ss
 
 # The launcher (bin/hafod.so) is a real file target so it is never stale: it
-# rebuilds whenever a library source (hand-maintained or generated) or
-# bin/hafod.sps changes, and is a no-op otherwise. GENERATED_SRC lists the
-# generated sources by literal name -- they are absent from the parse-time
-# HAFOD_SRC wildcard on a clean tree, so without naming them a version/Chez bump
-# that rewrites only a generated source would leave the launcher carrying a
-# stale inlined version. The library build is an ORDER-ONLY prerequisite
-# (| compile-libs): it guarantees the library .so/.wpo exist first without
-# forcing a launcher rebuild on every make (a normal prerequisite on a phony
-# target would, because a phony is always considered newer).
-bin/hafod.so: $(HAFOD_SRC) $(GENERATED_SRC) bin/hafod.sps | compile-libs
+# rebuilds whenever a library source (hand-maintained or generated),
+# bin/hafod.sps, or the tools/compile-launcher.ss recipe changes, and is a no-op
+# otherwise. GENERATED_SRC lists the generated sources by literal name -- they
+# are absent from the parse-time HAFOD_SRC wildcard on a clean tree, so without
+# naming them a version/Chez bump that rewrites only a generated source would
+# leave the launcher carrying a stale inlined version. tools/compile-launcher.ss
+# is listed too so a change to the whole-program merge recipe itself forces the
+# image to be rebuilt (editing the recipe alone otherwise leaves a stale .so).
+# The library build is an ORDER-ONLY prerequisite (| compile-libs): it
+# guarantees the library .so/.wpo exist first without forcing a launcher rebuild
+# on every make (a normal prerequisite on a phony target would, because a phony
+# is always considered newer).
+bin/hafod.so: $(HAFOD_SRC) $(GENERATED_SRC) bin/hafod.sps tools/compile-launcher.ss | compile-libs
 	$(SCHEME) $(LIBDIRS) --script tools/compile-launcher.ss
 
 # Plain `make compile` now also keeps the launcher fresh: its work is entirely
@@ -304,6 +307,15 @@ $(TEST_TARGETS): test-%: compile
 test-launcher: compile-wpo
 	@$(TIMEOUT_PREFIX) sh test/test-launcher.sh </dev/null || { $(HANG_CHECK); }
 
+# Merged-binary regex smoke test: the regex --script suite runs in the default
+# "C" collation and so cannot catch a fault that appears only once the shipped
+# launcher adopts the user's UTF-8 locale. This drives the real bin/hafod
+# (--program path) and asserts the character-range results a UTF-8 collation must
+# not change. Depends on compile-wpo (like test-launcher) because it needs the
+# built bin/hafod.so behind the wrapper, not just the src/*.so fasls.
+test-re-binary: compile-wpo
+	@$(TIMEOUT_PREFIX) sh test/test-re-binary.sh </dev/null || { $(HANG_CHECK); }
+
 # Startup version guard: a Chez mismatch (or a compiler-less interpreter on the
 # source path) must yield a friendly remediation and a non-zero exit, not a raw
 # fasl-object crash or a silent exit 0. Depends on compile-wpo so the happy-path
@@ -391,7 +403,7 @@ verify-umbrella: compile
 	@$(TIMEOUT_PREFIX) $(SCHEME) $(LIBDIRS) --script tools/verify-umbrella.ss </dev/null \
 	  || { $(HANG_CHECK); }
 
-test: compile $(TEST_TARGETS) test-launcher test-version-guard test-load verify-umbrella
+test: compile $(TEST_TARGETS) test-launcher test-re-binary test-version-guard test-load verify-umbrella
 	@printf 'test platform: '; uname -srm
 
 clean:

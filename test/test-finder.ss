@@ -205,4 +205,81 @@
       (lambda () #t))
     (eq? (current-signal-handler SIGWINCH) sentinel)))
 
+;; ======================================================================
+;; Incremental narrowing == full re-score (order-sensitive, engineered tie)
+;; ======================================================================
+
+;; Build a finder-state at the empty query, mirroring run-finder*'s init:
+;; filtered = every item paired with empty positions; display = item (these
+;; single-line items flatten to themselves). make-finder-state stays a 14-arg
+;; positional call.
+(define (make-narrow-state items-vec)
+  (make-finder-state
+    items-vec
+    (list->vector (map (lambda (s) (cons s '())) (vector->list items-vec)))
+    "" 0 0 0                        ; query cursor selected scroll-offset
+    24 80                           ; rows cols
+    (vector-length items-vec) "> "  ; total-count prompt
+    items-vec                       ; display-items
+    #f #f #f))                      ; colorize? show-numbers? colour?
+
+;; Type each character through the real query-insert! entry point, so refilter!
+;; runs with the true pre-mutation query and takes the narrowing path.
+(define (type-query! state s)
+  (let ([n (string-length s)])
+    (let lp ([i 0])
+      (if (< i n)
+          (begin
+            (query-insert! state (string-ref s i))
+            (lp (+ i 1)))
+          state))))
+
+;; Engineered corpus: under "ab", "x.ab" and "a-ab" share the SAME fuzzy score
+;; AND the same length (a pure input-order tie), but under the prefix "a" the
+;; finder sorts "a-ab" ahead of "x.ab". Corpus order is "x.ab" before "a-ab".
+;; A narrowing that re-scored the old-SORTED survivors would feed "a-ab" first
+;; and swap the tie; restoring survivors to original-corpus order keeps the
+;; filtered vector byte-identical (candidates + positions + ORDER) to a full
+;; re-score. ("zzab" matches with a distinct lower score; "qqqq" never matches.)
+(define narrow-items (vector "x.ab" "a-ab" "zzab" "qqqq"))
+
+(test-equal "incremental narrowing == full re-score (candidates + positions + order)"
+  (list->vector (filter-search-pattern/positions "ab" (vector->list narrow-items)))
+  (let ([state (make-narrow-state narrow-items)])
+    (type-query! state "ab")
+    (finder-state-filtered state)))
+
+;; A trailing $ turns the last token into a suffix match, so extending the query
+;; across it (ab$ -> ab$x) is NOT monotonic: "ab$xy" matches the fuzzy "ab$x"
+;; but not the suffix "ab". Narrowing must fall back to a full re-score here
+;; rather than silently drop the match.
+(define dollar-items (vector "zzab" "ab$xy" "qqqq"))
+
+(test-equal "extending the query across a suffix $ falls back to full (no dropped match)"
+  (list->vector (filter-search-pattern/positions "ab$x" (vector->list dollar-items)))
+  (let ([state (make-narrow-state dollar-items)])
+    (type-query! state "ab$x")
+    (finder-state-filtered state)))
+
+;; ======================================================================
+;; display-version: O(1) map lookup with a flatten fallback
+;; ======================================================================
+
+;; A known item resolves to its PRECOMPUTED display string (proving the map is
+;; consulted rather than flatten-for-display recomputed); an absent candidate
+;; falls back to flatten-for-display. The item objects are shared with the items
+;; vector so the eq?-keyed lookup hits.
+(let* ([plain "plain"]
+       [multi "multi"]
+       [state (make-finder-state
+                (vector plain multi)
+                (vector (cons plain '()))
+                "" 0 0 0 24 80 2 "> "
+                (vector "PLAIN-DISP" "MULTI-DISP")   ; display-items != items
+                #f #f #f)])
+  (test-equal "display-version resolves a known item to its precomputed display string"
+    "MULTI-DISP" (display-version state multi))
+  (test-equal "display-version falls back to flatten-for-display for an unknown item"
+    "absent" (display-version state "absent")))
+
 (test-end)

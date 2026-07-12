@@ -138,18 +138,24 @@
     (guard (e [#t '()])
       (let* ([dir (if (string=? path "") "." path)]
              [dirp (posix-opendir dir)])
-        (let loop ([acc '()])
-          (let ([name (posix-readdir dirp)])
-            (if name
-                (loop (if (or (string=? name ".") (string=? name ".."))
-                          acc
-                          (cons name acc)))
-                (begin
-                  (posix-closedir dirp)
-                  (if dotfiles?
-                      acc
-                      (filter (lambda (f) (not (char=? (string-ref f 0) #\.)))
-                              acc)))))))))
+        ;; The readdir loop runs inside a dynamic-wind (INSIDE the guard) whose
+        ;; after-thunk closes the DIR*, so a mid-loop posix-readdir raise closes
+        ;; the stream THEN unwinds to the guard, which still yields '(). The
+        ;; error-swallow semantics are preserved; only the leak is closed.
+        (dynamic-wind
+          (lambda () #f)
+          (lambda ()
+            (let loop ([acc '()])
+              (let ([name (posix-readdir dirp)])
+                (if name
+                    (loop (if (or (string=? name ".") (string=? name ".."))
+                              acc
+                              (cons name acc)))
+                    (if dotfiles?
+                        acc
+                        (filter (lambda (f) (not (char=? (string-ref f 0) #\.)))
+                                acc))))))
+          (lambda () (posix-closedir dirp))))))
 
   ;; Check if path is a directory (silently returns #f on error).
   (define (maybe-isdir? path)

@@ -21,8 +21,7 @@
         (test vterm)
         (only (hafod editor render)
               render-line render-line/suggestion
-              ansi-display-width cursor-visual-row count-visual-lines)
-        (only (hafod editor input-decode) string-display-width)
+              ansi-display-width cursor-visual-row+col count-visual-lines)
         (hafod editor gap-buffer)
         (chezscheme))
 
@@ -39,30 +38,17 @@
     (gap-buffer-set-from-string! gb text)
     gb))
 
-;; The substring of s after its final newline (the whole string when s carries no
-;; newline).  This is render.ss's width-after-last-newline input: the display
-;; width of THIS span, not the raw buffer offset, sets the cursor's 0-based
-;; column.
-(define (last-line s)
-  (let ([len (string-length s)])
-    (let loop ([i (- len 1)])
-      (cond
-        [(< i 0) s]
-        [(char=? (string-ref s i) #\newline) (substring s (+ i 1) len)]
-        [else (loop (- i 1))]))))
-
 ;; The (row, 0-based col) the renderer's own geometry oracle predicts for a
-;; cursor at the end of `before` under this prompt and terminal width.  row is
-;; cursor-visual-row; col0 is the prompt width on row 0 (else 0) plus the display
-;; width of the text after the last newline.  render.ss computes the 1-based
-;; cursor-col as (+ (if (= row 0) prompt-width 0) (width-after-last-newline before) 1);
-;; the 0-based grid column the harness reads drops that trailing +1.
+;; cursor at the end of `before` under this prompt and terminal width.  Both come
+;; from the SAME wrap-aware walk the renderer uses (cursor-visual-row+col): the
+;; visual row, and the 0-based column WITHIN the final visual row -- which on a
+;; line that wraps beyond the terminal width is the wrapped column, not the
+;; wrap-blind width since the last newline.  render.ss emits the 1-based
+;; cursor-col as that column + 1; the 0-based grid column the harness reads back
+;; drops the +1, so the oracle column is the walk's col directly.
 (define (expected-cursor prompt before term-cols)
-  (let* ([pw (ansi-display-width prompt)]
-         [row (cursor-visual-row pw before term-cols)]
-         [col0 (+ (if (= row 0) pw 0)
-                  (string-display-width (last-line before)))])
-    (values row col0)))
+  (let ([rc (cursor-visual-row+col (ansi-display-width prompt) before term-cols)])
+    (values (car rc) (cdr rc))))
 
 ;; Drive render-line for `before` under `prompt`/`cols` into a fresh screen.
 (define (screen-of prompt before cols)
@@ -118,6 +104,27 @@
     ;; not a vacuous "row 0 equals row 0".
     (test-assert "wrapped: the cursor is below the first row (a wrap happened)"
       (> (vterm-cursor-row scr) 0))))
+
+;; (c2) Wrapped-column regression: a line that overruns a narrow terminal must
+;; leave the cursor at the WRAPPED column -- its position within the final
+;; wrapped row -- not at the wrap-blind width-since-the-newline that overshoots
+;; the terminal's right edge.  Thirty glyphs after a two-column prompt at width
+;; 20 wrap once, so the cursor rests twelve columns into the second row, well
+;; inside the terminal.  The concrete 12 (not the pre-fix overrun of 32) gives the
+;; assertion teeth: it fails on a renderer that emits the absolute column.
+(let* ([prompt "> "] [before (make-string 30 #\a)] [cols 20]
+       [scr (screen-of prompt before cols)])
+  (let-values ([(er ec) (expected-cursor prompt before cols)])
+    (test-equal "wrapped column: cursor row agrees with the geometry oracle"
+      er (vterm-cursor-row scr))
+    (test-equal "wrapped column: cursor col agrees with the geometry oracle"
+      ec (vterm-cursor-col scr)))
+  (test-equal "wrapped column: the cursor rests at the wrapped column (12), not the overrun"
+    12 (vterm-cursor-col scr))
+  (test-assert "wrapped column: the wrapped cursor stays within the terminal width"
+    (<= (vterm-cursor-col scr) cols))
+  (test-assert "wrapped column: the cursor descended below the first row (a wrap happened)"
+    (> (vterm-cursor-row scr) 0)))
 
 ;; (d) Ghost suggestion: render-line/suggestion draws a multi-line ghost past the
 ;; cursor, then climbs back over its rows.  The cursor must land on the USER's

@@ -36,15 +36,16 @@
           (only (hafod procobj) background-job-count)
           (only (hafod editor editor) read-expression with-raw-mode
                 editor-history-entries editor-history-set-last-mode!)
-          (only (hafod tty) tty? terminal-size reassert-cooked-tty! install-terminal-guard!)
+          (only (hafod tty) tty? terminal-size refresh-terminal-size-cache!
+                reassert-cooked-tty! install-terminal-guard!)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod editor render) tokenize display-colourised)
-          (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache)
+          (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache
+                command-not-found-suppress? command-not-found-suggestions)
           (only (hafod shell parser) parse-shell-command)
           (only (hafod shell builtins) run-builtin! builtin-names dir-stack)
           (only (hafod shell jobs) install-job-signals! update-jobs! drain-notifications!)
-          (only (hafod shell history-expand) history-expand)
-          (only (hafod fuzzy) fuzzy-filter))
+          (only (hafod shell history-expand) history-expand))
 
   ;; === Hook parameters ===
 
@@ -380,18 +381,15 @@
                 (substring str i j)]
                [else (collect (+ j 1))]))]))))
 
-  ;; Check if a command exists in PATH cache; if not, suggest similar names.
-  ;; Shows up to 3 fuzzy-matched suggestions from the PATH cache.
+  ;; Report a genuinely-unknown command, with up to three fuzzy suggestions.
+  ;; The classifier owns the decision: a bound/legal Scheme identifier (car,
+  ;; list, a user define), a keyword, a literal, or a known command is
+  ;; suppressed, and the suggestion list is computed lazily and already capped,
+  ;; so no full-PATH scan runs on a suppressed line.
   (define (command-not-found-check line)
-    (let* ([cmd (first-token line)]
-           [ht (path-cache)]
-           [keys (vector->list (hashtable-keys ht))])
-      (when (and (> (string-length cmd) 0)
-                 (not (hashtable-ref ht cmd #f)))
-        (let* ([suggestions (let ([filtered (fuzzy-filter cmd keys)])
-                             (if (> (length filtered) 3)
-                                 (list (car filtered) (cadr filtered) (caddr filtered))
-                                 filtered))]
+    (let ([cmd (first-token line)])
+      (unless (command-not-found-suppress? cmd)
+        (let* ([suggestions (command-not-found-suggestions cmd)]
                ;; Grey the diagnostic only when stderr is a live terminal; the
                ;; message text always survives to a piped or captured stream.
                [colour? (colour-ok? (console-error-port))])
@@ -443,6 +441,10 @@
         (lambda ()
           ;; Initialize terminal width
           (terminal-width (query-terminal-width))
+          ;; Seed the leaf terminal-size cache once at entry, so the editor's
+          ;; first render reads the true width from the cache rather than the
+          ;; stale 24x80 default.
+          (refresh-terminal-size-cache!)
 
           ;; Initialize PATH cache for shell-mode classification
           (rebuild-path-cache!)
@@ -462,7 +464,11 @@
           ;; of clobbering it.
           (set-signal-handler! SIGWINCH
             (lambda (sig)
-              (terminal-width (query-terminal-width))))
+              (terminal-width (query-terminal-width))
+              ;; Refresh the leaf width cache on the same resize event, so the
+              ;; editor's per-render column/row reads track the new size
+              ;; without paying a live ioctl on every render.
+              (refresh-terminal-size-cache!)))
 
           ;; Main REPL loop with call/cc restart pattern
           ;; Determine at startup whether stdin is a terminal (editor vs bare read).

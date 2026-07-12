@@ -114,6 +114,41 @@ assert_exit "-c with no expression exits 1" 1 "$HAFOD" -c
 # -c with -e should fail
 assert_exit "-c with -e is rejected" 1 "$HAFOD" -e main -c '(display 1)'
 
+# -c evaluates every form in the string, not only the first datum
+out=$("$HAFOD" -c '(display 1)(display 2)(display 3)' 2>&1)
+assert_eq "-c evaluates every form" "123" "$out"
+
+# A later (exit N) form is reached, so the process status derives from it
+assert_exit "-c reaches an (exit N) in a later form" 5 "$HAFOD" -c '(display 1)(display 2)(exit 5)'
+
+# The | pipe combinator is accepted exactly as in -s scripts.  run/string
+# captures the pipeline output to a string, so display prints it to stdout.
+out=$("$HAFOD" -c '(display (run/string (| (echo hi) (cat))))' 2>&1)
+assert_eq "-c accepts the | pipe combinator" "hi" "$out"
+
+# The |+ combinator (with an explicit stdout->stdin connection spec) too
+out=$("$HAFOD" -c '(display (run/string (|+ ((1 0)) (echo hi) (cat))))' 2>&1)
+assert_eq "-c accepts the |+ pipe combinator" "hi" "$out"
+
+# A malformed string is read in full before any form runs, so nothing is
+# evaluated.  Discard stderr and guard the non-zero exit so set -e cannot abort.
+out=$("$HAFOD" -c '(display 1) (((' 2>/dev/null || true)
+assert_eq "-c does not evaluate any form when the string fails to parse" "" "$out"
+set +e
+"$HAFOD" -c '(display 1) (((' >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    pass "-c exits non-zero when the string fails to parse"
+else
+    fail "-c exits non-zero when the string fails to parse" "non-zero" "$rc"
+fi
+
+# An empty -c string is a clean no-op
+assert_exit "-c with an empty string is a clean no-op" 0 "$HAFOD" -c ''
+out=$("$HAFOD" -c '' 2>&1)
+assert_eq "-c empty string prints nothing" "" "$out"
+
 # ======================================================================
 section "-s script execution"
 # ======================================================================
@@ -604,6 +639,16 @@ assert_eq "double import is harmless" "double-ok" "$out"
 
 # Nonexistent script
 assert_exit "nonexistent script exits non-zero" 1 "$HAFOD" -s "$TMPDIR/nonexistent.ss"
+
+# A bare (no -s) missing filename gets the same friendly message as -s.  Guard
+# the non-zero exit so capturing its output cannot abort the harness under set -e.
+set +e
+out=$("$HAFOD" "$TMPDIR/no-such-script.ss" 2>&1)
+set -e
+assert_contains "bare missing script names the file with a friendly message" "no-such-script.ss: No such file" "$out"
+
+# ... and exits 1, exactly like -s on a missing file
+assert_exit "bare missing script exits 1 like -s" 1 "$HAFOD" "$TMPDIR/no-such-script.ss"
 
 # ======================================================================
 section "REPL auto-import (LNCH-01)"

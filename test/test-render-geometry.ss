@@ -18,7 +18,8 @@
 (import (test runner)
         (test vterm)
         (only (hafod editor render)
-              count-visual-lines cursor-visual-row ansi-display-width
+              count-visual-lines cursor-visual-row cursor-visual-row+col
+              ansi-display-width
               render-line/suggestion)
         (hafod editor gap-buffer)
         (only (hafod environment) setenv)
@@ -88,6 +89,31 @@
   (cursor-visual-row 2 "ab" 80))
 (test-equal "cursor-visual-row: cursor after the newline is row 1" 1
   (cursor-visual-row 2 "ab\ncd" 80))
+
+;; cursor-visual-row+col: one wrap-aware walk yields BOTH the visual row and the
+;; 0-based column WITHIN the final visual row.  On a line that overruns the
+;; terminal width the column is the wrapped position, not the wrap-blind width
+;; since the last newline; the common non-wrapping case is unchanged.
+(test-equal "cursor-visual-row+col: a fitting line is (row 0 . column past the prompt)"
+  '(0 . 5) (cursor-visual-row+col 2 "abc" 80))
+(test-equal "cursor-visual-row+col: a line wider than the terminal reports the wrapped column"
+  '(1 . 12) (cursor-visual-row+col 2 (make-string 30 #\a) 20))
+(test-assert "cursor-visual-row+col: the wrapped column stays within the terminal width"
+  (<= (cdr (cursor-visual-row+col 2 (make-string 30 #\a) 20)) 20))
+;; Edge cases the walk must handle without a second traversal: an unknown width
+;; (term-cols <= 0) falls back to the wrap-blind column, an empty buffer rests at
+;; the prompt, a glyph that exactly fills the final column sits at a pending wrap
+;; (column = width), and the next glyph past the boundary wraps to a new row.
+(test-equal "cursor-visual-row+col: unknown width falls back to the wrap-blind column"
+  '(0 . 5) (cursor-visual-row+col 2 "abc" 0))
+(test-equal "cursor-visual-row+col: unknown width past a newline drops the prompt"
+  '(1 . 2) (cursor-visual-row+col 2 "ab\ncd" 0))
+(test-equal "cursor-visual-row+col: an empty buffer rests at the prompt column"
+  '(0 . 2) (cursor-visual-row+col 2 "" 20))
+(test-equal "cursor-visual-row+col: a glyph filling the last column is a pending wrap"
+  '(0 . 5) (cursor-visual-row+col 0 "abcde" 5))
+(test-equal "cursor-visual-row+col: one glyph past the boundary wraps to the next row"
+  '(1 . 1) (cursor-visual-row+col 0 "abcdef" 5))
 
 ;; The KEY ghost arithmetic: measuring the buffer alone vs. the buffer with the
 ;; suggestion appended.  Worked case P=2, T="abc" (cursor at end), S="X\nY\nZ",
