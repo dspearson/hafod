@@ -27,7 +27,6 @@
                 string-colour comment-colour number-colour boolean-colour
                 fg-colour fg-colour-l
                 ident-colour-from-hash ident-hash)
-          (only (hafod interactive) query-terminal-size)
           (only (hafod tty) refresh-terminal-size-cache! cached-terminal-size)
           (only (hafod posix) SIGWINCH)
           (only (hafod signal) with-signal-handler)
@@ -85,18 +84,19 @@
       (mutable cols)           ;; integer: terminal columns
       total-count              ;; integer: length of original items
       prompt                   ;; string: prompt text (e.g. "> ")
-      display-items            ;; vector of flattened display strings
       colorize?                ;; #f or procedure: (string -> boolean) — true means syntax-colour
       show-numbers?            ;; boolean: show 1-based index numbers beside candidates
       colour?                  ;; boolean: colour-ok? of the output — gates every SGR/palette byte
       disp-map                 ;; eq-hashtable item->display-string (computed, not passed)
       idx-map)                 ;; eq-hashtable item->original 0-based index (computed, not passed)
-    ;; The two trailing fields are computed once from items/display-items, so the
-    ;; public constructor keeps exactly its 14 positional arguments (white-box
-    ;; callers and test/test-finder.ss construct with those). disp-map backs the
-    ;; O(1) display-version lookup; idx-map restores narrowing survivors to
-    ;; original-corpus order so a narrowed re-score stays byte-identical to a full
-    ;; one (fuzzy's stable score-tiebreak leaves ties in input order).
+    ;; The constructor takes exactly 14 positional arguments and that shape is
+    ;; load-bearing: white-box callers and test/test-finder.ss construct with it.
+    ;; The 11th of them is the vector of flattened display strings, and it is
+    ;; CONSUMED rather than stored -- the two trailing fields are computed from it
+    ;; and from items, and nothing reads the raw vector back afterwards. disp-map
+    ;; backs the O(1) display-version lookup; idx-map restores narrowing survivors
+    ;; to original-corpus order so a narrowed re-score stays byte-identical to a
+    ;; full one (fuzzy's stable score-tiebreak leaves ties in input order).
     (protocol
       (lambda (new)
         (lambda (items filtered query cursor selected scroll-offset rows cols
@@ -110,7 +110,7 @@
                 (hashtable-set! imap (vector-ref items i) i)
                 (lp (fx1+ i))))
             (new items filtered query cursor selected scroll-offset rows cols
-                 total-count prompt display-items colorize? show-numbers? colour?
+                 total-count prompt colorize? show-numbers? colour?
                  dmap imap))))))
 
   ;; ======================================================================
@@ -834,62 +834,74 @@
        (run-finder* items prompt colorize? mode-map show-numbers?)]))
 
   (define (run-finder* items prompt colorize? mode-map show-numbers?)
-    ;; Seed the leaf terminal-size cache at entry so the finder's first size
-    ;; query and any immediate cache read start from the true width rather than
-    ;; the stale 24x80 default.  The matching re-seed after finder-loop returns
-    ;; (below) is what restores the width the editor resumes at.
-    (refresh-terminal-size-cache!)
     ;; Gate the full-screen TUI on the ANSI-capability of the OUTPUT target,
     ;; using the explicit fd 1: the shared console port aliases to fd 2, so
     ;; gating on the port object would inspect the wrong stream and could leak
     ;; escapes into a piped stdout. When the output is not a capable terminal,
     ;; refuse raw-mode + the alternate screen and use a plain, zero-escape
     ;; numbered selection instead.
+    ;;
+    ;; The window-size query sits INSIDE the capable branch, below this gate.
+    ;; The plain branch sizes nothing to the terminal -- it prints a numbered
+    ;; list and reads a line -- so a query taken ahead of the gate is an ioctl a
+    ;; piped run or a CI log pays for and never reads.
     (if (not (ansi-ok? 1))
         (run-finder/plain items prompt (console-input-port) (console-output-port))
-        (let-values ([(rows cols) (query-terminal-size)])
-          (let* ([colour? (colour-ok? 1)]
-                 [item-vec (list->vector items)]
-                 [disp-vec (build-display-items item-vec)]
-                 [init-filtered (list->vector (map (lambda (s) (cons s '())) items))]
-                 [color-fn (cond
-                            ;; Suppress syntax colour when colour output is not
-                            ;; permitted (NO_COLOR on a real TTY) as well as when
-                            ;; the caller did not ask for it.
-                            [(not (and colour? colorize?)) #f]
-                            [mode-map
-                             ;; Use stored mode: syntax-colour only if mode is 'scheme
-                             (lambda (s) (eq? 'scheme (hashtable-ref mode-map s 'scheme)))]
-                            [else
-                             ;; Default: use classifier
-                             (lambda (s) (eq? 'scheme (classify-input s)))])]
-                 [state (make-finder-state item-vec init-filtered
-                                           "" 0 0 0
-                                           rows cols
-                                           (length items) prompt
-                                           disp-vec color-fn (and show-numbers? #t)
-                                           colour?)]
-                 [resize-flag (make-flag)])
-            ;; Scope the resize handler to the finder: with-signal-handler
-            ;; installs it for the duration of the TUI and restores whatever
-            ;; SIGWINCH disposition was live beforehand (the REPL's resize
-            ;; handler) on exit, rather than clobbering it with a no-op.
-            (let ([result
-                   (with-signal-handler SIGWINCH
-                     (lambda (sig) (flag-set! resize-flag))
-                     (lambda ()
-                       (with-raw-mode 0
-                         (lambda ()
-                           (with-alternate-screen
-                             (lambda ()
-                               (finder-loop state resize-flag)))))))])
-              ;; Re-seed the leaf width cache once the finder has torn down (raw
-              ;; mode, alternate screen and the finder's own SIGWINCH handler
-              ;; all restored).  Belt-and-braces alongside the in-loop refresh:
-              ;; it guarantees the editor that resumes reads the true width even
-              ;; when a resize arrived while the finder's handler was installed.
-              (refresh-terminal-size-cache!)
-              result)))))
+        (begin
+          ;; Seed the leaf terminal-size cache at entry, so the reads that follow
+          ;; start from the true width rather than the stale 24x80 default, and
+          ;; take the finder's own rows and cols from THAT SAME answer: one live
+          ;; query, not two.  A second, live query here would ask the kernel again
+          ;; about a window it has just measured -- and the two answers need not
+          ;; agree, because real work separates them (the capability gate above
+          ;; runs an isatty and reads the environment).  A resize landing in that
+          ;; gap would leave the cache holding one size while the finder's state
+          ;; was built from another, and the editor that resumes would inherit the
+          ;; disagreement.  The in-loop resize path sources both the same way.
+          (refresh-terminal-size-cache!)
+          (let-values ([(rows cols) (cached-terminal-size)])
+            (let* ([colour? (colour-ok? 1)]
+                   [item-vec (list->vector items)]
+                   [disp-vec (build-display-items item-vec)]
+                   [init-filtered (list->vector (map (lambda (s) (cons s '())) items))]
+                   [color-fn (cond
+                              ;; Suppress syntax colour when colour output is not
+                              ;; permitted (NO_COLOR on a real TTY) as well as when
+                              ;; the caller did not ask for it.
+                              [(not (and colour? colorize?)) #f]
+                              [mode-map
+                               ;; Use stored mode: syntax-colour only if mode is 'scheme
+                               (lambda (s) (eq? 'scheme (hashtable-ref mode-map s 'scheme)))]
+                              [else
+                               ;; Default: use classifier
+                               (lambda (s) (eq? 'scheme (classify-input s)))])]
+                   [state (make-finder-state item-vec init-filtered
+                                             "" 0 0 0
+                                             rows cols
+                                             (length items) prompt
+                                             disp-vec color-fn (and show-numbers? #t)
+                                             colour?)]
+                   [resize-flag (make-flag)])
+              ;; Scope the resize handler to the finder: with-signal-handler
+              ;; installs it for the duration of the TUI and restores whatever
+              ;; SIGWINCH disposition was live beforehand (the REPL's resize
+              ;; handler) on exit, rather than clobbering it with a no-op.
+              (let ([result
+                     (with-signal-handler SIGWINCH
+                       (lambda (sig) (flag-set! resize-flag))
+                       (lambda ()
+                         (with-raw-mode 0
+                           (lambda ()
+                             (with-alternate-screen
+                               (lambda ()
+                                 (finder-loop state resize-flag)))))))])
+                ;; Re-seed the leaf width cache once the finder has torn down (raw
+                ;; mode, alternate screen and the finder's own SIGWINCH handler
+                ;; all restored).  Belt-and-braces alongside the in-loop refresh:
+                ;; it guarantees the editor that resumes reads the true width even
+                ;; when a resize arrived while the finder's handler was installed.
+                (refresh-terminal-size-cache!)
+                result))))))
 
   (define fuzzy-select
     (case-lambda

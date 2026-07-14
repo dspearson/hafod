@@ -10,25 +10,35 @@
   (import (hafod internal base)
           (hafod compat)
           (for (hafod internal sre-compile) expand)
-          (only (hafod internal re-engine) make-regexp match:substring))
+          (for (only (hafod internal platform-constants)
+                     PLAT-REG-NEWLINE PLAT-REG-ICASE)
+               expand)
+          (only (hafod internal re-engine)
+                make-regexp make-line-aware-regexp match:substring))
 
   ;; ======================================================================
   ;; rx macro
   ;; ======================================================================
-
-  ;; REG_ICASE constant for use in macro expansion (must be available at expand time)
-  (meta define rx-REG_ICASE 2)
 
   (define-syntax rx
     (lambda (stx)
       (syntax-case stx ()
         ((_ sre ...)
          (let* ((datum (syntax->datum #'(sre ...)))
-                (sre-form (if (= (length datum) 1) (car datum) (cons 'seq datum))))
+                (sre-form (if (= (length datum) 1) (car datum) (cons 'seq datum)))
+                ;; Re-derive, at expand time, the datum flags the emitter used:
+                ;; line-awareness gates REG_NEWLINE and routes the pattern through
+                ;; the fail-loud seam; a string anchor beside a line anchor is the
+                ;; mixed case that seam must check.
+                (line-aware? (sre-line-aware? sre-form))
+                (has-string-anchor? (sre-has-string-anchor? sre-form)))
            (let-values (((posix-str nparen fold? smap)
                          (compile-sre sre-form #f)))
              (let ((nsub (count-parens posix-str))
-                   (cf (if fold? rx-REG_ICASE 0))
+                   ;; REG_NEWLINE only for a line-aware pattern, taken from the
+                   ;; platform constant rather than a hardcoded 4; REG_ICASE as before.
+                   (cf (bitwise-ior (if fold? PLAT-REG-ICASE 0)
+                                    (if line-aware? PLAT-REG-NEWLINE 0)))
                    ;; Build submatch map: smap is a list of 1-based POSIX paren indices.
                    ;; If identity (1 2 3 ...), use #f. Otherwise, keep as a list for runtime.
                    (smap-data
@@ -41,13 +51,21 @@
                              (else smap))))))  ; non-identity, keep list
                (with-syntax ((ps (datum->syntax #'_ posix-str))
                              (ns (datum->syntax #'_ nsub))
-                             (cflag (datum->syntax #'_ cf)))
-                 (if smap-data
-                     ;; Non-identity: embed as (list->vector '(1 3 ...))
-                     (with-syntax ((sm-list (datum->syntax #'_ smap-data)))
-                       #'(make-regexp ps cflag ns (list->vector 'sm-list)))
-                     ;; Identity or no submatches: use #f
-                     #'(make-regexp ps cflag ns #f))))))))))
+                             (cflag (datum->syntax #'_ cf))
+                             (sm (if smap-data
+                                     ;; Non-identity: embed as (list->vector '(1 3 ...))
+                                     (with-syntax ((sm-list (datum->syntax #'_ smap-data)))
+                                       #'(list->vector 'sm-list))
+                                     ;; Identity or no submatches: use #f
+                                     #'#f)))
+                 ;; A line-aware pattern routes through make-line-aware-regexp, so a
+                 ;; mixed string+line anchor pattern fails loud where the GNU buffer
+                 ;; anchors are absent; every other pattern keeps the exact
+                 ;; make-regexp expansion as before.
+                 (if line-aware?
+                     (with-syntax ((hsa (datum->syntax #'_ has-string-anchor?)))
+                       #'(make-line-aware-regexp ps cflag ns sm hsa))
+                     #'(make-regexp ps cflag ns sm))))))))))
 
   ;; ======================================================================
   ;; Match macros: let-match, if-match, match-cond

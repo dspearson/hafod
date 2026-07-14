@@ -15,7 +15,8 @@
     posix-access posix-lseek posix-umask)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
-          (only (hafod internal platform-ftypes) stat-t) (hafod internal posix-core))
+          (only (hafod internal platform-ftypes) stat-t) (hafod internal posix-core)
+          (hafod internal platform))
 
   ;; ======================================================================
   ;; Stat -- struct stat handling
@@ -38,10 +39,15 @@
         [(= fmt S_IFLNK)  'symlink]
         [else 'unknown])))
 
-  ;; Internal FFI
-  (define c-stat (foreign-procedure "stat" (string void*) int))
-  (define c-lstat (foreign-procedure "lstat" (string void*) int))
-  (define c-fstat (foreign-procedure "fstat" (int void*) int))
+  ;; Internal FFI. The libc symbol names are resolved once in the platform hub
+  ;; (stat-symbol-name / lstat-symbol-name / fstat-symbol-name): on 64-bit Intel
+  ;; macOS they are the "…$INODE64" 64-bit-inode variants, so the function Chez
+  ;; resolves matches the 64-bit-inode stat-t layout the reader expects; every
+  ;; other target keeps the bare name, byte-identical to today. Binds a resolved
+  ;; name exactly as errno.ss binds errno-accessor-name.
+  (define c-stat (foreign-procedure stat-symbol-name (string void*) int))
+  (define c-lstat (foreign-procedure lstat-symbol-name (string void*) int))
+  (define c-fstat (foreign-procedure fstat-symbol-name (int void*) int))
 
   ;; Extract stat-info from a filled stat block. p is an ftype pointer over the
   ;; buffer the stat/lstat/fstat syscall wrote; every field is read through the

@@ -9,6 +9,7 @@
           render-line/suggestion
           render-line/selection
           only-closing-delimiters?
+          ghost-visible-suffix
           display-with-highlights
           display-with-selection
           ;; Reusable terminal-overlay helpers (editor + tests)
@@ -183,12 +184,18 @@
 
   ;; djb2 string hash, kept positive via bitmask
   (define (ident-hash s)
-    (let ([len (string-length s)])
-      (let loop ([i 0] [h 5381])
-        (if (>= i len) h
-            (loop (+ i 1)
-                  (bitwise-and (+ (* h 33) (char->integer (string-ref s i)))
-                               #xFFFFFFFF))))))
+    (ident-hash-range s 0 (string-length s)))
+
+  ;; The same djb2 hash over the half-open range [start,end) of s, without
+  ;; allocating the substring.  The colourised display hashes an identifier's
+  ;; WHOLE span this way even when it draws only a clipped part of it, so an atom
+  ;; that straddles a draw window's edge keeps ONE hue across both halves.
+  (define (ident-hash-range s start end)
+    (let loop ([i start] [h 5381])
+      (if (>= i end) h
+          (loop (+ i 1)
+                (bitwise-and (+ (* h 33) (char->integer (string-ref s i)))
+                             #xFFFFFFFF)))))
 
   ;; Heuristic: does this atom span look like a number?
   (define (number-atom? text start end)
@@ -318,71 +325,98 @@
   ;; display-colourised takes an optional trailing colour? (default #t).  When
   ;; colour? is #f every coloured branch falls through to its plain arm, so the
   ;; output carries zero escape bytes; the four-argument callers keep the prior
-  ;; behaviour unchanged.
+  ;; behaviour unchanged.  Both arities are the whole-text window of the core
+  ;; below, so their bytes are exactly what they always were.
   (define display-colourised
     (case-lambda
       [(port text tokens cursor-pos)
        (display-colourised port text tokens cursor-pos #t)]
       [(port text tokens cursor-pos colour?)
-       (let-values ([(open-idx close-idx) (find-enclosing-parens text cursor-pos)])
-         (for-each
-           (lambda (tok)
-             (let* ([type (car tok)]
-                    [start (cadr tok)]
-                    [end (caddr tok)]
-                    [depth (cadddr tok)]
-                    [span (substring text start end)])
-               (case type
-                 [(paren)
-                  (if (and colour? (rainbow-parens?))
-                      (let ([col (vector-ref paren-colours
-                                   (modulo depth num-paren-colours))]
-                            [bold? (or (eqv? start open-idx)
-                                       (eqv? start close-idx))])
-                        (when bold? (display "\x1b;[1m" port))
-                        (fg-colour-l port col)
-                        (display span port)
-                        (display "\x1b;[0m" port))
-                      (let ([bold? (and colour?
-                                        (or (eqv? start open-idx)
-                                            (eqv? start close-idx)))])
-                        (when bold? (display "\x1b;[1m" port))
-                        (display span port)
-                        (when bold? (display "\x1b;[22m" port))))]
-                 [(atom)
-                  (if (and colour? (rainbow-identifiers?) (> depth 0))
-                      (let ([col (ident-colour-from-hash (ident-hash span))])
-                        (fg-colour-l port col)
-                        (display span port)
-                        (display "\x1b;[39m" port))
-                      (display span port))]
-                 [(number)
-                  (if (and colour? (syntax-highlight?))
-                      (begin (fg-colour-l port number-colour)
-                             (display span port)
-                             (display "\x1b;[39m" port))
-                      (display span port))]
-                 [(boolean)
-                  (if (and colour? (syntax-highlight?))
-                      (begin (fg-colour-l port boolean-colour)
-                             (display span port)
-                             (display "\x1b;[39m" port))
-                      (display span port))]
-                 [(string)
-                  (if (and colour? (syntax-highlight?))
-                      (begin (fg-colour-l port string-colour)
-                             (display span port)
-                             (display "\x1b;[39m" port))
-                      (display span port))]
-                 [(comment)
-                  (if (and colour? (syntax-highlight?))
-                      (begin (fg-colour-l port comment-colour)
-                             (display span port)
-                             (display "\x1b;[39m" port))
-                      (display span port))]
-                 [else
-                  (display span port)])))
-           tokens))]))
+       (display-colourised/window port text tokens cursor-pos colour?
+                                  0 (string-length text))]))
+
+  ;; display-colourised/window: colourise only the half-open window [lo,hi) of
+  ;; text.  A caller can then draw the buffer in two halves and slip something
+  ;; between them -- which is exactly what the ghost renderer does, splitting at
+  ;; the cursor so the suggestion is drawn INSIDE paredit's auto-inserted closers
+  ;; rather than after them.
+  ;;
+  ;; Every colour decision is still made from the WHOLE text and the token's
+  ;; ORIGINAL start: the enclosing-paren bold indices, the rainbow depth, the
+  ;; identifier hue (hashed over the token's whole span, not the clipped one) and
+  ;; every syntax hue.  A windowed half therefore colours each character exactly
+  ;; as the single full-width pass does; only the SPAN emitted is narrowed.  That
+  ;; is why the window CLIPS an already-lexed token rather than re-tokenising the
+  ;; fragment: a fragment would be lexed out of context -- its paren depth would
+  ;; restart at zero, a string opened in the other half would be lost -- and a
+  ;; token really can straddle the split, since } is not a token delimiter and so
+  ;; an atom can span the cursor while the text after it is still all closers.
+  ;;
+  ;; With lo = 0 and hi = (string-length text) no token is skipped and no span is
+  ;; clipped, so the full-width call emits byte-for-byte what it always emitted.
+  (define (display-colourised/window port text tokens cursor-pos colour? lo hi)
+    (let-values ([(open-idx close-idx) (find-enclosing-parens text cursor-pos)])
+      (for-each
+        (lambda (tok)
+          (let* ([type (car tok)]
+                 [start (cadr tok)]
+                 [end (caddr tok)]
+                 [depth (cadddr tok)])
+            ;; A token lying wholly outside the window contributes nothing to it.
+            (unless (or (<= end lo) (>= start hi))
+              (let ([span (substring text (max start lo) (min end hi))])
+                (case type
+                  [(paren)
+                   (if (and colour? (rainbow-parens?))
+                       (let ([col (vector-ref paren-colours
+                                    (modulo depth num-paren-colours))]
+                             [bold? (or (eqv? start open-idx)
+                                        (eqv? start close-idx))])
+                         (when bold? (display "\x1b;[1m" port))
+                         (fg-colour-l port col)
+                         (display span port)
+                         (display "\x1b;[0m" port))
+                       (let ([bold? (and colour?
+                                         (or (eqv? start open-idx)
+                                             (eqv? start close-idx)))])
+                         (when bold? (display "\x1b;[1m" port))
+                         (display span port)
+                         (when bold? (display "\x1b;[22m" port))))]
+                  [(atom)
+                   (if (and colour? (rainbow-identifiers?) (> depth 0))
+                       (let ([col (ident-colour-from-hash
+                                    (ident-hash-range text start end))])
+                         (fg-colour-l port col)
+                         (display span port)
+                         (display "\x1b;[39m" port))
+                       (display span port))]
+                  [(number)
+                   (if (and colour? (syntax-highlight?))
+                       (begin (fg-colour-l port number-colour)
+                              (display span port)
+                              (display "\x1b;[39m" port))
+                       (display span port))]
+                  [(boolean)
+                   (if (and colour? (syntax-highlight?))
+                       (begin (fg-colour-l port boolean-colour)
+                              (display span port)
+                              (display "\x1b;[39m" port))
+                       (display span port))]
+                  [(string)
+                   (if (and colour? (syntax-highlight?))
+                       (begin (fg-colour-l port string-colour)
+                              (display span port)
+                              (display "\x1b;[39m" port))
+                       (display span port))]
+                  [(comment)
+                   (if (and colour? (syntax-highlight?))
+                       (begin (fg-colour-l port comment-colour)
+                              (display span port)
+                              (display "\x1b;[39m" port))
+                       (display span port))]
+                  [else
+                   (display span port)])))))
+        tokens)))
 
   ;; ======================================================================
   ;; render-line
@@ -539,43 +573,112 @@
           [(memv (string-ref str i) '(#\) #\] #\} #\")) (loop (+ i 1))]
           [else #f]))))
 
-  ;; render-line/suggestion: like render-line but appends dim ghost text after the
-  ;; cursor when the cursor sits at the end of the typed region (real end-of-buffer
-  ;; or just before paredit's auto-inserted trailing closers).
+  ;; The length of the longest common suffix of two strings (0 when they share
+  ;; no trailing character).  Walks both backwards from their ends while the
+  ;; characters agree, so it is bounded by the shorter string.
+  (define (common-suffix-length a b)
+    (let ([la (string-length a)]
+          [lb (string-length b)])
+      (let loop ([i (- la 1)] [j (- lb 1)] [n 0])
+        (if (and (>= i 0) (>= j 0)
+                 (char=? (string-ref a i) (string-ref b j)))
+            (loop (- i 1) (- j 1) (+ n 1))
+            n))))
+
+  ;; ghost-visible-suffix: the part of a ghost suggestion that is actually DRAWN,
+  ;; given the after-cursor text it will be drawn in front of.  The ghost is
+  ;; displayed at the cursor -- inside paredit's auto-inserted closers, not past
+  ;; them -- so any trailing run it shares with that after-cursor text is already
+  ;; on the screen as real buffer characters and must be elided, or the line shows
+  ;; those characters twice.
+  ;;
+  ;;   suggestion "+ 1 2)" + after ")"   ->  "+ 1 2"   the common case: the buffer's
+  ;;                                                   own closer is not redrawn
+  ;;   suggestion ")"      + after ")"   ->  ""        nothing left to draw
+  ;;   suggestion "-world" + after ""    ->  "-world"  end-of-buffer: drawn whole
+  ;;
+  ;; Only the run the two GENUINELY share is elided.  For "lambda (x) x) 1)" in
+  ;; front of "))" the tails "1)" and "))" differ, so exactly one closer is shared
+  ;; and the ghost keeps the other -- an extra closer on screen, which is ACCEPTED:
+  ;; it is the honest continuation of the matched history entry, and eliding
+  ;; further would mean guessing which of the buffer's closers the ghost's own
+  ;; closers correspond to.  Accepting the ghost is unaffected either way: that
+  ;; path lays down the whole suggestion over the closers (cmd-accept-suggestion),
+  ;; never the visible part.
+  (define (ghost-visible-suffix suggestion after)
+    (let ([n (common-suffix-length suggestion after)])
+      (substring suggestion 0 (- (string-length suggestion) n))))
+
+  ;; render-line/suggestion: like render-line, but draws the dim ghost AT THE
+  ;; CURSOR.  The line is laid down in three pieces -- the buffer before the
+  ;; cursor, then the ghost, then the buffer after it -- rather than as the whole
+  ;; buffer followed by the ghost.  That layout is what lets a suggestion expand
+  ;; INSIDE the parens the user already has: with paredit on, typing "(" leaves
+  ;; the buffer "()" with the cursor between them, so a ghost drawn past the whole
+  ;; buffer lands OUTSIDE the closer ("> ()+ 1 2)") instead of within it
+  ;; ("> (+ 1 2)").
+  ;;
+  ;; The ghost shows only when the cursor sits at the end of the TYPED region --
+  ;; the real end-of-buffer (after = "") or just before paredit's auto-inserted
+  ;; trailing closers (after is all closers/quotes) -- and only the part of it that
+  ;; is not already on the screen is drawn: ghost-visible-suffix elides the
+  ;; trailing run the suggestion shares with the after-cursor text, so the closer
+  ;; the buffer is already showing is not drawn a second time ("> (+ 1 2))").  A
+  ;; ghost that elides away to nothing draws nothing.
+  ;;
+  ;; The buffer past the cursor goes through the SAME colouriser as the buffer
+  ;; before it, so those closers keep their own paren colour and are never mistaken
+  ;; for ghost text.  When the after-cursor text is empty that second piece emits
+  ;; nothing and the ghost lands exactly where it always did, so the end-of-buffer
+  ;; frame is byte-identical to the one this renderer drew before.
   (define render-line/suggestion
     (case-lambda
       [(port prompt gb prev-lines suggestion)
        (render-line/suggestion port prompt gb prev-lines suggestion 0)]
       [(port prompt gb prev-lines suggestion term-cols)
        (let* ([geom (render-prologue port prompt gb term-cols)]
+              [before (render-geom-before geom)]
               [after (render-geom-after geom)]
               [text (render-geom-text geom)]
+              ;; cursor-pos IS the split index into text: it is the length of
+              ;; before, so the two draw windows are [0,cursor-pos) and
+              ;; [cursor-pos,len).
               [cursor-pos (render-geom-cursor-pos geom)]
+              [text-len (string-length text)]
               [prompt-width (render-geom-prompt-width geom)]
               [total-lines (render-geom-total-lines geom)]
               [cursor-row (render-geom-cursor-row geom)]
               [cursor-col (render-geom-cursor-col geom)]
               [colour? (render-geom-colour? geom)]
               [ansi? (render-geom-ansi? geom)]
-              ;; Is the dim ghost actually drawn?  Only when colour is live and
-              ;; the cursor sits at the end of the typed region -- either the real
-              ;; end-of-buffer (after = "") or just before paredit's auto-inserted
-              ;; trailing closers (after is all closers/quotes).  This mirrors the
-              ;; draw gate below, so the row count and the draw stay in lock-step.
+              ;; The part of the suggestion actually drawn: the whole of it at
+              ;; end-of-buffer, less whatever trailing closers the buffer is
+              ;; already showing past the cursor.
+              [ghost-visible (ghost-visible-suffix suggestion after)]
+              ;; Is a ghost actually drawn?  Only when colour is live, the cursor
+              ;; sits at the end of the typed region, and something survives the
+              ;; elision.  This mirrors the draw gate below, so the row count and
+              ;; the draw stay in lock-step.
               [ghost-shown? (and colour?
                                  (only-closing-delimiters? after)
-                                 (> (string-length suggestion) 0))]
-              ;; Total screen rows drawn.  When the ghost shows, its own wrapped
-              ;; and newlined rows count too, so measure buffer + suggestion
-              ;; through the SAME wrap-aware helper the edit line uses; otherwise
-              ;; the buffer-only count stands.  Counting the ghost's own rows is
-              ;; what keeps the cursor on the user's typing row rather than
-              ;; stranding it on the suggestion's bottom row.
+                                 (> (string-length ghost-visible) 0))]
+              ;; Total screen rows drawn.  Measured over the text that is really
+              ;; drawn -- before ++ ghost ++ after -- through the SAME wrap-aware
+              ;; helper the edit line uses, so the ghost's own wrapped and newlined
+              ;; rows are counted and the climb-back below lands the cursor on the
+              ;; user's typing row rather than stranding it on the ghost's bottom
+              ;; row.  Counting the suggestion WHOLE (rather than its visible part)
+              ;; would over-count the moment an elision happened.
               [drawn-lines (if ghost-shown?
-                               (count-visual-lines prompt-width
-                                                   (string-append text suggestion)
-                                                   term-cols)
-                               total-lines)])
+                               (count-visual-lines
+                                 prompt-width
+                                 (string-append before ghost-visible after)
+                                 term-cols)
+                               total-lines)]
+              ;; Tokenise the buffer ONCE; both windows read the same token list,
+              ;; so each is coloured in the context of the whole line.
+              [scheme? (eq? (classify-input text) 'scheme)]
+              [tokens (if scheme? (tokenize text) '())])
          (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
            (display prev-lines port)
@@ -583,19 +686,26 @@
          (when ansi?
            (display "\r\x1b;[J" port))
          (display prompt port)
-         (if (eq? (classify-input text) 'scheme)
-             (let ([tokens (tokenize text)])
-               (display-colourised port text tokens cursor-pos colour?))
-             (display text port))
-         ;; Draw the dim grey ghost past the cursor when it applies.  Gated
-         ;; exactly as drawn-lines above (ghost-shown?), so a plain sink still
-         ;; emits zero escapes and no ghost.
+         ;; The buffer up to the cursor.
+         (if scheme?
+             (display-colourised/window port text tokens cursor-pos colour?
+                                        0 cursor-pos)
+             (display (substring text 0 cursor-pos) port))
+         ;; The dim grey ghost, AT the cursor.  Gated exactly as drawn-lines above
+         ;; (ghost-shown?), so a plain sink still emits zero escapes and no ghost.
          (when ghost-shown?
            (display "\x1b;[38;5;240m" port)  ; dim grey
-           (display suggestion port)
+           (display ghost-visible port)
            (display "\x1b;[39m" port))
+         ;; The rest of the buffer -- paredit's auto-inserted closers -- in its own
+         ;; colour, never in the ghost's grey.  Empty at end-of-buffer.
+         (if scheme?
+             (display-colourised/window port text tokens cursor-pos colour?
+                                        cursor-pos text-len)
+             (display (substring text cursor-pos text-len) port))
          ;; Position cursor: climb back over every drawn row (the ghost's rows
-         ;; included) to the user's logical typing row, then to the column.
+         ;; included) to the user's logical typing row, then to the column.  Both
+         ;; are measured from `before` alone, which is still drawn first.
          (when ansi?
            (let ([lines-after-cursor (- drawn-lines cursor-row)])
              (when (> lines-after-cursor 0)

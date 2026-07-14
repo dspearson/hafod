@@ -20,13 +20,20 @@
     compiled-regexp-type-posix-string
     count-posix-parens
     regexp-match-type-string regexp-match-type-submatches
-    build-match-vector)
+    build-match-vector
+    ;; Line-aware compilation seam (shared with re-macros; NOT re-exported by
+    ;; the facade, so the umbrella surface does not grow). The probe is exported
+    ;; alongside the pure predicate so a caller -- in practice the anchor test
+    ;; suites -- can ask what THIS libc can express, rather than guessing from
+    ;; the platform name.
+    line-aware-anchors-ok? gnu-buffer-anchors-available? make-line-aware-regexp)
   (import (hafod internal base)
           (hafod posix)
           (hafod compat)
           (rename (only (hafod internal re-records) regexp?)
                   (regexp? re-adt?))
-          (only (hafod internal re-posixstr) regexp->posix-string))
+          (only (hafod internal re-posixstr)
+                regexp->posix-string re-line-aware? re-has-string-anchor?))
 
   ;; ======================================================================
   ;; Compiled regex record
@@ -68,6 +75,51 @@
               (crx (make-compiled-regexp-type posix-str cflags rt nsub smap)))
          (regex-guardian crx)
          crx))))
+
+  ;; ======================================================================
+  ;; Line-aware compilation: REG_NEWLINE + the fail-loud capability seam
+  ;; ======================================================================
+  ;; bol/eol match at LINE boundaries only when the compiled regex carries
+  ;; REG_NEWLINE, which the ADT/rx compilers request via a line-aware signal.
+  ;; Keeping bos/eos STRING-anchored under REG_NEWLINE needs glibc's GNU buffer
+  ;; anchors, which do not exist on a BSD/musl libc. A pattern that mixes bos/eos
+  ;; with bol/eol therefore cannot be expressed correctly everywhere, so it must
+  ;; FAIL LOUD where those anchors are absent rather than silently match a
+  ;; literal backtick/apostrophe.
+
+  ;; Memoised probe: does the running libc treat the buffer-start anchor as an
+  ;; anchor? Compile it and match against "x": a GNU libc reads it as a
+  ;; zero-width buffer-start anchor (a match), while a BSD/musl libc reads it as
+  ;; a literal backtick, absent from "x" (no match). The libc cannot change
+  ;; within a process, so the answer is cached after the first call. Any
+  ;; regcomp/regexec failure is treated as "unavailable". Single-threaded, so a
+  ;; plain variable needs no lock (mirrors the *regexp-cache* idiom above).
+  (define *gnu-buffer-anchors* 'unprobed)
+  (define (gnu-buffer-anchors-available?)
+    (when (eq? *gnu-buffer-anchors* 'unprobed)
+      (set! *gnu-buffer-anchors*
+        (guard (exn [#t #f])
+          (let ((rt (posix-regcomp (string #\\ #\`) REG_EXTENDED)))
+            (let ((m (posix-regexec rt "x" 1 0)))
+              (posix-regfree rt)
+              (and m #t))))))
+    *gnu-buffer-anchors*)
+
+  ;; Pure capability predicate (the testable seam). A line-aware pattern is
+  ;; expressible iff it uses no string anchor, or the libc has the GNU buffer
+  ;; anchors. A pattern that is not line-aware is always fine.
+  (define (line-aware-anchors-ok? line-aware? has-string-anchor? gnu-available?)
+    (or (not line-aware?) (not has-string-anchor?) gnu-available?))
+
+  ;; Build a line-aware compiled regex (REG_NEWLINE folded into cflags), failing
+  ;; loud when a mixed string+line anchor pattern needs GNU buffer anchors the
+  ;; running libc lacks.
+  (define (make-line-aware-regexp posix-str cflags nsub smap has-string-anchor?)
+    (unless (line-aware-anchors-ok? #t has-string-anchor?
+                                    (gnu-buffer-anchors-available?))
+      (error 'make-line-aware-regexp
+             "line-anchored pattern also uses bos/eos, which needs GNU buffer anchors this libc lacks"))
+    (make-regexp posix-str cflags nsub smap))
 
   ;; ======================================================================
   ;; Bounded compiled-regexp cache (guardian-safe)
@@ -220,11 +272,20 @@
 
   ;; Bridge: compile an RE ADT value to a compiled-regexp.
   (define (re-adt->compiled-regexp re)
-    (let-values (((posix-str level pcount smap) (regexp->posix-string re)))
-      (if (not posix-str)
-          (error 're-adt->compiled-regexp "RE can never match" re)
-          (make-regexp posix-str 0 pcount
-                       (if (= 0 (vector-length smap)) #f smap)))))
+    (let ((line-aware? (re-line-aware? re))
+          (has-anchor? (re-has-string-anchor? re)))
+      (let-values (((posix-str level pcount smap) (regexp->posix-string re)))
+        (if (not posix-str)
+            (error 're-adt->compiled-regexp "RE can never match" re)
+            (let ((smap (if (= 0 (vector-length smap)) #f smap)))
+              (if line-aware?
+                  ;; Line-aware: set REG_NEWLINE and route the mixed string+line
+                  ;; anchor case through the fail-loud seam.
+                  (make-line-aware-regexp posix-str REG_NEWLINE pcount smap
+                                          has-anchor?)
+                  ;; Not line-aware: byte-identical to the historic path
+                  ;; (cflags 0, no REG_NEWLINE).
+                  (make-regexp posix-str 0 pcount smap)))))))
 
   ;; Coerce any regex representation to compiled-regexp-type.
   (define (coerce-regexp re)

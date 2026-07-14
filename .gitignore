@@ -15,6 +15,8 @@ bin/hafod-standalone
 # Standalone build intermediates
 tools/*.boot
 tools/*_data.c
+tools/*.so
+tools/*.wpo
 lib/
 
 # Generated binaries/libraries
@@ -48,3 +50,6 @@ result
 # Editor
 *~
 \#*\#
+
+# Generated coverage report
+coverage/

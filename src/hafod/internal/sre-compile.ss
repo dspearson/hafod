@@ -3,7 +3,7 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal sre-compile)
-  (export compile-sre count-parens)
+  (export compile-sre count-parens sre-line-aware? sre-has-string-anchor?)
   (import (chezscheme))
 
   ;; POSIX ERE special characters that need backslash-escaping in literals.
@@ -227,6 +227,66 @@
                     (+ nparen 1)))))
 
   ;; ======================================================================
+  ;; Line-awareness datum pre-pass
+  ;; ======================================================================
+  ;; A pattern is "line-aware" only when its SRE datum carries a bol/eol SYMBOL
+  ;; node.  That single trigger switches on the line-aware emission below and,
+  ;; in the rx macro, REG_NEWLINE; so every anchor-free pattern and every
+  ;; bos/eos-only pattern is emitted byte-for-byte as before.  Only the bare
+  ;; symbols count -- a string literal such as "bol" is opaque.
+
+  ;; True iff the SRE datum contains the symbol bol or eol anywhere.
+  (define (sre-line-aware? sre)
+    (cond
+      ((symbol? sre) (or (eq? sre 'bol) (eq? sre 'eol)))
+      ((pair? sre) (or (sre-line-aware? (car sre))
+                       (sre-line-aware? (cdr sre))))
+      (else #f)))
+
+  ;; True iff the SRE datum contains the symbol bos or eos anywhere.  A mixed
+  ;; bos/eos + bol/eol pattern needs glibc's GNU buffer anchors, which the rx
+  ;; macro routes through the fail-loud seam.
+  (define (sre-has-string-anchor? sre)
+    (cond
+      ((symbol? sre) (or (eq? sre 'bos) (eq? sre 'eos)))
+      ((pair? sre) (or (sre-has-string-anchor? (car sre))
+                       (sre-has-string-anchor? (cdr sre))))
+      (else #f)))
+
+  ;; True iff STR contains a literal newline (0x0A) character.
+  (define (string-has-newline? str)
+    (let loop ((i 0))
+      (and (< i (string-length str))
+           (or (char=? (string-ref str i) #\newline)
+               (loop (+ i 1))))))
+
+  ;; True iff a single char-set FORM (as it appears inside a (~ ...) complement)
+  ;; denotes a set that already contains newline.  A negated class built from
+  ;; such a set already excludes newline, so REG_NEWLINE leaves it alone and no
+  ;; |<newline> restoration is wanted.  Named classes are judged by whether the
+  ;; class's set includes 0x0A (space and cntrl do, and ascii = [\x01-\x7f] spans
+  ;; it; alpha/digit/blank/graph/print do not); string forms are scanned for a
+  ;; literal newline.
+  (define (cset-form-has-newline? form)
+    (cond
+      ((string? form) (string-has-newline? form))
+      ((symbol? form)
+       (and (memq form '(any space white whitespace cntrl control ascii)) #t))
+      ((and (pair? form) (string? (car form)))
+       (let loop ((fs form))
+         (and (pair? fs)
+              (or (and (string? (car fs)) (string-has-newline? (car fs)))
+                  (loop (cdr fs))))))
+      (else #f)))
+
+  ;; True iff the excluded set of a (~ form ...) already contains newline.
+  (define (cset-forms-have-newline? forms)
+    (let loop ((fs forms))
+      (and (pair? fs)
+           (or (cset-form-has-newline? (car fs))
+               (loop (cdr fs))))))
+
+  ;; ======================================================================
   ;; compile-sre : SRE datum x fold? -> (values posix-string nparen fold? submatch-map)
   ;;
   ;; base  = number of POSIX parens already emitted before this expression
@@ -237,14 +297,15 @@
   ;; ======================================================================
 
   (define (compile-sre sre fold?)
-    (let-values (((s np f smap) (compile-sre/base sre fold? 0)))
-      (values s np f smap)))
+    (let ((line-aware? (sre-line-aware? sre)))
+      (let-values (((s np f smap) (compile-sre/base sre fold? 0 line-aware?)))
+        (values s np f smap))))
 
   ;; Compile repetition body and append quantifier
-  (define (compile-repetition/base body quantifier fold? base)
+  (define (compile-repetition/base body quantifier fold? base line-aware?)
     (let-values (((s p f smap) (compile-sre/base
                                  (if (= (length body) 1) (car body) (cons 'seq body))
-                                 fold? base)))
+                                 fold? base line-aware?)))
       (let-values (((s2 p2) (ensure-piece s p)))
         ;; If ensure-piece added a grouping paren, adjust base offsets of all smap entries
         ;; The grouping paren is at position (base + 1), shifting all inner parens by 1
@@ -259,7 +320,7 @@
   ;; base = how many ( have been emitted in the whole pattern before this subexpression
   ;; Returns (values posix-string nparen fold? submatch-map)
   ;; where submatch-map is a list of 1-based POSIX paren indices for user submatches
-  (define (compile-sre/base sre fold? base)
+  (define (compile-sre/base sre fold? base line-aware?)
     (cond
       ;; String literal
       ((string? sre)
@@ -270,10 +331,17 @@
       ;; Symbol (named classes and anchors)
       ((symbol? sre)
        (case sre
-         ((any) (values "." 0 fold? '()))
+         ;; In a line-aware pattern, bare ^/$ become LINE anchors under
+         ;; REG_NEWLINE, so bos/eos instead emit glibc's GNU buffer anchors
+         ;; \` (buffer start) and \' (buffer end) to stay STRING-anchored; any
+         ;; keeps matching newline via the bare alternation ".|<newline>" (a real
+         ;; 0x0A byte, wrapped and renumbered by the existing piece machinery).
+         ;; bol/eol stay ^/$ (line anchors), nonl stays newline-excluding, and a
+         ;; NON-line-aware pattern emits every token byte-for-byte as before.
+         ((any) (values (if line-aware? (string #\. #\| #\newline) ".") 0 fold? '()))
          ((nonl) (values "[^\n]" 0 fold? '()))
-         ((bos) (values "^" 0 fold? '()))
-         ((eos) (values "$" 0 fold? '()))
+         ((bos) (values (if line-aware? (string #\\ #\`) "^") 0 fold? '()))
+         ((eos) (values (if line-aware? (string #\\ #\') "$") 0 fold? '()))
          ((bol) (values "^" 0 fold? '()))
          ((eol) (values "$" 0 fold? '()))
          (else
@@ -301,7 +369,7 @@
                     (let loop ((forms rest) (acc "") (np 0) (smap '()))
                       (if (null? forms)
                           (values acc np fold? (reverse smap))
-                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np))))
+                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
                             (let-values (((s2 p2) (ensure-piece-for-seq s p)))
                               ;; If ensure-piece-for-seq added a grouping paren,
                               ;; adjust inner submatch indices
@@ -319,7 +387,7 @@
                     (let loop ((forms rest) (acc '()) (np 0) (first? #t) (smap '()))
                       (if (null? forms)
                           (values (apply string-append (reverse acc)) np fold? (reverse smap))
-                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np))))
+                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
                             (loop (cdr forms)
                                   (if first?
                                       (cons s acc)
@@ -329,9 +397,9 @@
                                   (append (reverse inner-smap) smap)))))))
 
                ;; Repetition: (* re ...)
-               ((*) (compile-repetition/base rest "*" fold? base))
-               ((+) (compile-repetition/base rest "+" fold? base))
-               ((?) (compile-repetition/base rest "?" fold? base))
+               ((*) (compile-repetition/base rest "*" fold? base line-aware?))
+               ((+) (compile-repetition/base rest "+" fold? base line-aware?))
+               ((?) (compile-repetition/base rest "?" fold? base line-aware?))
 
                ;; Bounded repetition: (** m n re ...)
                ((**)
@@ -340,7 +408,7 @@
                       (body (cddr rest)))
                   (let-values (((s p f smap) (compile-sre/base
                                                (if (= (length body) 1) (car body) (cons 'seq body))
-                                               fold? base)))
+                                               fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
                         (values (string-append s2 "{" (number->string m) "," (number->string n) "}")
@@ -352,7 +420,7 @@
                       (body (cdr rest)))
                   (let-values (((s p f smap) (compile-sre/base
                                                (if (= (length body) 1) (car body) (cons 'seq body))
-                                               fold? base)))
+                                               fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
                         (values (string-append s2 "{" (number->string n) "}")
@@ -364,7 +432,7 @@
                       (body (cdr rest)))
                   (let-values (((s p f smap) (compile-sre/base
                                                (if (= (length body) 1) (car body) (cons 'seq body))
-                                               fold? base)))
+                                               fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
                         (values (string-append s2 "{" (number->string n) ",}")
@@ -376,7 +444,7 @@
                 (let ((this-paren-idx (+ base 1)))
                   (let-values (((s p f inner-smap) (compile-sre/base
                                                      (if (= (length rest) 1) (car rest) (cons 'seq rest))
-                                                     fold? (+ base 1))))
+                                                     fold? (+ base 1) line-aware?)))
                     ;; The inner submatches are already correct (they were compiled with base+1).
                     ;; Our user submatch is at this-paren-idx, followed by any inner user submatches.
                     (values (string-append "(" s ")")
@@ -386,31 +454,40 @@
                ;; Dead submatch (ignore pre/post counts)
                ((dsm)
                 (let ((body (cddr rest)))
-                  (compile-sre/base (if (= (length body) 1) (car body) (cons 'seq body)) fold? base)))
+                  (compile-sre/base (if (= (length body) 1) (car body) (cons 'seq body)) fold? base line-aware?)))
 
                ;; Case folding
                ((w/nocase)
                 (let-values (((s p f smap) (compile-sre/base
                                              (if (= (length rest) 1) (car rest) (cons 'seq rest))
-                                             #t base)))
+                                             #t base line-aware?)))
                   (values s p #t smap)))
 
                ((w/case)
                 (let-values (((s p f smap) (compile-sre/base
                                              (if (= (length rest) 1) (car rest) (cons 'seq rest))
-                                             #f base)))
+                                             #f base line-aware?)))
                   (values s p #f smap)))
 
                ((uncase)
                 (let-values (((s p f smap) (compile-sre/base
                                              (if (= (length rest) 1) (car rest) (cons 'seq rest))
-                                             #t base)))
+                                             #t base line-aware?)))
                   (values s p #t smap)))
 
                ;; Complement: (~ cset ...)
                ((~)
                 (let ((inner (compile-char-set-union rest)))
-                  (values (string-append "[^" inner "]") 0 fold? '())))
+                  ;; A negated class [^...] stops matching newline under
+                  ;; REG_NEWLINE.  In a line-aware pattern, when the excluded set
+                  ;; is meant to match newline (it does not already contain one),
+                  ;; re-add it with a bare alternation so the class keeps spanning
+                  ;; it; the piece machinery groups and renumbers.  Otherwise the
+                  ;; historic [^...] is emitted unchanged.
+                  (if (and line-aware? (not (cset-forms-have-newline? rest)))
+                      (values (string-append "[^" inner "]" "|" (string #\newline))
+                              0 fold? '())
+                      (values (string-append "[^" inner "]") 0 fold? '()))))
 
                ;; Intersection: (& cset ...)
                ((&)

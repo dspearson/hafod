@@ -33,14 +33,30 @@ CHEZ_LIBDIR ?= $(shell d=$$(perl -MCwd=realpath -e 'print realpath(shift)' $$(wh
 	  echo "$$d/../lib/csv$$v/$$m"; \
 	fi)
 
-# Auto-discover Scheme test files
-TEST_SCRIPTS := $(wildcard test/test-*.ss)
-TEST_TARGETS := $(patsubst test/test-%.ss,test-%,$(TEST_SCRIPTS))
+# Auto-discover the Scheme test suites: ONE glob over every .ss under test/,
+# with the harness libraries removed by literal name.
+#
+# Deliberately not a second glob sitting alongside a narrower one. Two parallel
+# discovery paths can disagree about what "the tests" are, and a suite matching
+# neither is simply never run -- silently, and for as long as nobody thinks to
+# count. An exclusion list you can read cannot drop a suite behind your back;
+# a pattern that has to be guessed at can, and did.
+#
+# The exclusion list must stay exhaustive, because the failure mode here is
+# quiet rather than loud. Chez does NOT choke on a (library ...) form handed to
+# --script: it defines the library and exits 0, having printed nothing. So a
+# harness file that escapes this list is not a build error -- it joins the run
+# as a suite that asserts nothing and always passes. check-test-wiring enforces
+# the split in both directions: every .ss under test/ is either wired in or
+# named here, and no wired file is a library.
+TEST_HARNESS := test/runner.ss test/vterm.ss test/poll.ss
+TEST_SCRIPTS := $(filter-out $(TEST_HARNESS),$(wildcard test/*.ss))
+TEST_TARGETS := $(patsubst test/%.ss,%,$(TEST_SCRIPTS))
 
 # Platform detection
 UNAME_S := $(shell uname -s)
 
-.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-re-binary test-version-guard test-load test-ffi-no-helper test-hafod-so-fresh test-install-launch test-platform-abi test-hang-timeout print-test-timeout verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability print-native-libs version-source chez-version-source $(TEST_TARGETS)
+.PHONY: all compile compile-libs compile-wpo native standalone test clean install uninstall test-launcher test-re-binary test-history-eof test-version-guard test-load test-ffi-no-helper test-hafod-so-fresh test-install-launch test-standalone-selfcontained test-platform-abi test-hang-timeout print-test-timeout print-test-targets print-test-harness print-installed-launcher verify-umbrella platform-constants check-platform check-c-probe test-c-probe check-portability test-check-portability check-resource-guards test-check-resource-guards check-test-wiring test-check-test-wiring print-native-libs version-source chez-version-source $(TEST_TARGETS)
 
 all: native
 
@@ -78,7 +94,7 @@ TIMEOUT_PREFIX =
 # enumerated rather than matched with test-%, because the standalone .sh proofs
 # (test-ffi-no-helper, test-hafod-so-fresh, test-install-launch, test-platform-abi,
 # test-hang-timeout) do not use the wrapper and must not trigger this warning.
-ifneq ($(filter test $(TEST_TARGETS) test-launcher test-re-binary test-version-guard test-load verify-umbrella,$(MAKECMDGOALS)),)
+ifneq ($(filter test $(TEST_TARGETS) test-launcher test-re-binary test-history-eof test-version-guard test-load verify-umbrella,$(MAKECMDGOALS)),)
 $(warning No 'timeout' or 'gtimeout' found; test suites run WITHOUT a kill-timeout.)
 endif
 else
@@ -147,6 +163,35 @@ check-c-probe: tools/probe-platform-constants.c
 # variadic shim. Read-only; no compile. Fails naming the offender.
 check-portability:
 	sh tools/check-portability.sh
+
+# Structural resource-lifetime audit: no bare foreign-memory release inside a
+# re-raising guard handler in internal/posix-*.ss -- the shape that frees a block
+# inline and then raises into an enclosing handler that frees it again. Read-only;
+# no compile. Fails naming the offender. A dynamic-wind after-thunk free and a
+# latched (release!) in a handler are the safe shapes and are not flagged.
+check-resource-guards:
+	sh tools/check-resource-guards.sh
+
+# Structural audit of the test-suite wiring, enforcing the split the TEST_HARNESS
+# comment above describes. Read-only; no compile. Fails naming the offender.
+#
+# What it prevents, all of it silent until now: a suite that matches neither list
+# and so is simply never run; a library wired in as a suite, which Chez defines
+# and exits 0 on, having printed nothing -- a phantom pass, not an error; a
+# failing suite quieted by parking its name in the exclusion list; the two front
+# ends drifting apart on which suites are "the tests"; and a suite whose basename
+# collides with a build target, which make shadows with that target's own recipe
+# -- running it in the suite's place and exiting 0.
+#
+# The two lists are handed to the script through the environment rather than
+# looked up by it, so the audit runs no BUILD sub-make: no recipe executes, no
+# recursion, no jobserver contention. It does read make's rule database with a
+# `make -n` dry run (which executes nothing) to learn the build's own target
+# names. That is what keeps this gate safe inside the `test:` aggregate, where
+# the standalone .sh proofs -- which run make to build things -- are not.
+check-test-wiring:
+	@SCHEME='$(SCHEME)' WIRING_TARGETS='$(TEST_TARGETS)' WIRING_HARNESS='$(TEST_HARNESS)' \
+	  sh tools/check-test-wiring.sh
 
 # Regenerate the version library from git tags (source of truth), falling back
 # to the VERSION file. Runs every build; gen-version.sh only rewrites the file
@@ -284,7 +329,12 @@ native: compile-wpo
 standalone: compile-wpo
 	$(SCHEME) $(LIBDIRS) --script tools/build-standalone.ss
 
-# Static pattern rule: test-X runs test/test-X.ss for all discovered test files.
+# Static pattern rule: target X runs test/X.ss for every discovered suite, so a
+# target is simply its file's base name -- test-awk runs test/test-awk.ss,
+# scsh-tty runs test/scsh-tty.ss. The stem is a bare %, matching the whole
+# target name rather than stripping a fixed prefix from it; that is what lets
+# one rule serve both naming conventions without a second rule to drift against.
+#
 # We use a static pattern rule (not an implicit pattern rule) because GNU Make
 # skips implicit rule search for targets declared .PHONY. Static pattern rules
 # are explicit rules and work correctly with .PHONY.
@@ -293,8 +343,14 @@ standalone: compile-wpo
 # interactive-repl picks the line editor vs. bare read via (tty? 0), so
 # test-interactive would otherwise hang waiting for keystrokes when `make test`
 # inherits a real terminal (e.g. in an interactive shell). Matches `just test`.
-$(TEST_TARGETS): test-%: compile
-	@$(TIMEOUT_PREFIX) $(SCHEME) $(TESTDIRS) --script test/test-$*.ss </dev/null \
+#
+# SCHEME is exported into the suite's environment, exactly as test-load already
+# does, so a suite that spawns a child interpreter spawns the one this build
+# selected rather than whichever `scheme` happens to come first on PATH. Under a
+# `make test SCHEME=/elsewhere/scheme` run those are different interpreters, and
+# the child would fail on a fasl version mismatch.
+$(TEST_TARGETS): %: compile
+	@SCHEME='$(SCHEME)' $(TIMEOUT_PREFIX) $(SCHEME) $(TESTDIRS) --script test/$*.ss </dev/null \
 	  || { $(HANG_CHECK); }
 
 # Special case: test-launcher uses bash, not Scheme.
@@ -315,6 +371,18 @@ test-launcher: compile-wpo
 # built bin/hafod.so behind the wrapper, not just the src/*.so fasls.
 test-re-binary: compile-wpo
 	@$(TIMEOUT_PREFIX) sh test/test-re-binary.sh </dev/null || { $(HANG_CHECK); }
+
+# The history database must be closed when the input ends -- the ordinary way out
+# of a shell.  The in-process suites can only run the exit hooks by hand, which
+# assumes the very thing that was false: that the way hafod really leaves reaches
+# them.  So this drives the real bin/hafod with its input on a pipe (a pipe at EOF
+# is the eof a terminal gives on Ctrl-D, no terminal needed, so it runs on every
+# CI leg) and asserts on what is left on disk afterwards -- a stranded -wal / -shm
+# beside the database is a connection that was never closed. Depends on compile-wpo
+# (like test-launcher) because it needs the built bin/hafod.so behind the wrapper,
+# not just the src/*.so fasls.
+test-history-eof: compile-wpo
+	@$(TIMEOUT_PREFIX) sh test/test-history-eof.sh </dev/null || { $(HANG_CHECK); }
 
 # Startup version guard: a Chez mismatch (or a compiler-less interpreter on the
 # source path) must yield a friendly remediation and a non-zero exit, not a raw
@@ -364,6 +432,19 @@ test-hafod-so-fresh:
 test-install-launch: compile-wpo
 	sh test/test-install-launch.sh </dev/null
 
+# Standalone proof that bin/hafod-standalone really is ONE image: run it from an
+# EMPTY directory -- no src/, nothing on disk to load -- and every entry point
+# (-c, -s, -e, -l, the piped REPL) must still work, every library source in the
+# tree must be present in its heap (the SRFIs included), and it must open no
+# library file at all. Its libraries come from the embedded boot image rather
+# than from disk, and nothing else in the tree says so; from a normal working
+# directory the claim is untestable, because a real src/ sits under the binary's
+# feet and would answer any import it got wrong. Builds the 7 MB binary, so --
+# like test-ffi-no-helper, test-hafod-so-fresh and test-install-launch -- it is
+# deliberately NOT part of the `test:` aggregate.
+test-standalone-selfcontained: standalone
+	sh test/test-standalone-selfcontained.sh </dev/null
+
 # Standalone proof of the platform fingerprint, the cross-build refusal, and the
 # check-platform drift gate. The drift case runs `make` internally and mutates
 # the tracked platform-constants.ss (restoring it, mtime preserved, on an exit
@@ -383,7 +464,28 @@ test-c-probe:
 # Standalone proof that the structural portability audit has teeth. Shells the
 # audit against a private fixture tree, so it is kept out of the test: aggregate.
 test-check-portability:
-	sh test/test-check-portability.sh </dev/null
+	sh test/test-check-portability.sh
+
+# Standalone proof that the resource-guard audit both bites and does not false-
+# positive: it passes on the tracked tree, rejects (and names) a bare foreign-
+# memory free in a re-raising guard handler, and accepts the safe shapes (a
+# dynamic-wind after-thunk free, a latched handler release, an allow-marked free).
+# Shells the audit against a private fixture tree, so -- like test-check-portability
+# -- it is kept out of the test: aggregate. The audit ITSELF is in that aggregate,
+# which is the point; this proves its teeth on every CI run via its own step.
+test-check-resource-guards:
+	sh test/test-check-resource-guards.sh </dev/null
+
+# Standalone proof that the test-wiring audit has teeth: it passes on the tracked
+# tree and fails -- naming the offender -- on an unwired suite, a suite silenced
+# by exclusion, a library wired in as a phantom pass, and a justfile that globs a
+# second suite set of its own. A structural gate nobody has ever seen fail is
+# indistinguishable from a comment, so every direction is driven against a broken
+# fixture. Shells the audit against a private fixture tree (and, for the clean
+# case, runs make), so -- like the sibling standalone proofs -- it is deliberately
+# NOT part of the test: aggregate. The audit ITSELF is, which is the point.
+test-check-test-wiring:
+	sh test/test-check-test-wiring.sh </dev/null
 
 # Standalone proof of the per-suite kill-timeout: a wedged suite is killed and
 # reported as a HANG, a fast FAIL or PASS exit passes through unchanged, and a
@@ -398,12 +500,30 @@ test-hang-timeout:
 print-test-timeout:
 	@echo $(TEST_TIMEOUT)
 
+# Echo the authoritative suite list, and the harness libraries held out of it,
+# so both are readable without parsing this Makefile. `just test` iterates the
+# first of these instead of globbing on its own, and the wiring gate checks both
+# against the tree -- so neither re-derives the discovery rule above, and the two
+# front ends cannot drift on WHICH suites constitute the tests. (The dependency
+# runs the other way for the timeout: the justfile owns that value and this
+# Makefile parses it out, so each fact has exactly one home.)
+print-test-targets:
+	@echo $(TEST_TARGETS)
+
+print-test-harness:
+	@echo $(TEST_HARNESS)
+
 # Umbrella verification: confirm all 791+ symbols are accessible via (import (hafod))
 verify-umbrella: compile
 	@$(TIMEOUT_PREFIX) $(SCHEME) $(LIBDIRS) --script tools/verify-umbrella.ss </dev/null \
 	  || { $(HANG_CHECK); }
 
-test: compile $(TEST_TARGETS) test-launcher test-re-binary test-version-guard test-load verify-umbrella
+# check-test-wiring comes first, ahead of even the compile: it is a read-only
+# grep over the tree that answers in well under a second, and what it proves is
+# that this line runs the tests it claims to. A wiring break should surface then,
+# not after a compile and several minutes of suites -- least of all as a green
+# run that quietly executed one suite fewer than it did last week.
+test: check-test-wiring check-resource-guards compile $(TEST_TARGETS) test-launcher test-re-binary test-history-eof test-version-guard test-load verify-umbrella
 	@printf 'test platform: '; uname -srm
 
 clean:
@@ -414,6 +534,7 @@ clean:
 	rm -f tools/petite-vfasl.boot tools/hafod-vfasl.boot
 	rm -f tools/boot_data.c tools/hafod_boot_data.c tools/prog_data.c
 	rm -f tools/hafod-lib-merged.wpo
+	rm -f tools/hafod-program.so tools/hafod-program.wpo
 	rm -rf lib/
 	rm -f bin/hafod.so bin/hafod.wpo bin/hafod-native bin/hafod-standalone
 	rm -f tools/gen-platform-constants
@@ -422,6 +543,23 @@ clean:
 	rm -f $(VERSION_SS)
 	rm -f $(CHEZVERSION_SS)
 	rm -f doc/hafod.1
+
+# Which launcher `install` places at $(BINDIR)/hafod. A C binary is preferred when
+# one has been built -- it starts without a shell fork and without the second Chez
+# startup the wrapper's version guard costs -- and the bin/hafod shell wrapper is
+# the fallback. $(wildcard) expands when the recipe runs, and nothing among
+# install's prerequisites builds a binary, so what it reports is what install acts
+# on.
+#
+# One source of truth, deliberately: the recipe below selects from this variable
+# and print-installed-launcher echoes it, so a test can ASK which launcher an
+# install would land rather than re-deriving the preference order. Two copies of
+# that rule would drift, and a test asserting against the launcher it merely
+# assumed was installed is worse than no test at all -- it is a green one.
+INSTALLED_LAUNCHER = $(firstword $(wildcard bin/hafod-native) $(wildcard bin/hafod-standalone) bin/hafod)
+
+print-installed-launcher:
+	@echo $(INSTALLED_LAUNCHER)
 
 install: doc/hafod.1
 	install -d $(DESTDIR)$(BINDIR)
@@ -469,17 +607,17 @@ install: doc/hafod.1
 	rm -f $(DESTDIR)$(LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/scheme.boot
 	install -m 644 $(CHEZ_LIBDIR)/petite.boot $(DESTDIR)$(LIBDIR)/petite.boot
 	install -m 644 $(CHEZ_LIBDIR)/scheme.boot $(DESTDIR)$(LIBDIR)/scheme.boot
-	@if [ -f bin/hafod-native ]; then \
-		install -m 755 bin/hafod-native $(DESTDIR)$(BINDIR)/hafod; \
-	elif [ -f bin/hafod-standalone ]; then \
-		install -m 755 bin/hafod-standalone $(DESTDIR)$(BINDIR)/hafod; \
-	else \
+	@l='$(INSTALLED_LAUNCHER)'; \
+	if [ "$$l" = bin/hafod ]; then \
 		sed -e 's|HAFOD_ROOT="$$(cd "$$BINDIR/.." \&\& pwd)"|HAFOD_ROOT="$(LIBDIR)"|' \
 		    -e 's|"$$BINDIR/hafod.so"|"$(LIBDIR)/hafod.so"|' \
 		    -e 's|"$$BINDIR/hafod.sps"|"$(LIBDIR)/hafod.sps"|' \
 			bin/hafod > $(DESTDIR)$(BINDIR)/hafod; \
 		chmod +x $(DESTDIR)$(BINDIR)/hafod; \
-	fi
+	else \
+		install -m 755 "$$l" $(DESTDIR)$(BINDIR)/hafod; \
+	fi; \
+	echo "install: launcher: $$l"
 	install -d $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 644 doc/hafod.1 $(DESTDIR)$(PREFIX)/share/man/man1/hafod.1
 	@if command -v scsh >/dev/null 2>&1; then \

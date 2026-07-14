@@ -1,10 +1,13 @@
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (test poll)
         (hafod fuzzy)
         (hafod interactive)
         (hafod finder)
         (only (hafod signal) set-signal-handler! current-signal-handler with-signal-handler)
-        (only (hafod posix) SIGWINCH))
+        (only (hafod posix) SIGWINCH posix-kill posix-getpid)
+        (only (hafod terminal-caps) assume-terminal-caps)
+        (only (hafod tty) tty?))
 
 (test-begin "finder")
 
@@ -204,6 +207,106 @@
     (with-signal-handler SIGWINCH other
       (lambda () #t))
     (eq? (current-signal-handler SIGWINCH) sentinel)))
+
+;; ======================================================================
+;; The finder hands the SIGWINCH disposition back when it leaves
+;; ======================================================================
+
+;; The case above tests the MECHANISM: it calls with-signal-handler directly and
+;; never goes near the finder.  Break the finder's unwind and it stays green -- it
+;; is green because it never exercises its subject.  The two cases below drive
+;; run-finder itself.
+;;
+;; The finder installs its own SIGWINCH handler for the extent of its full-screen
+;; TUI, displacing the REPL's resize handler, and has to put the REPL's back when it
+;; leaves.  An unwind that instead clobbers SIGWINCH with a no-op leaves the REPL
+;; deaf to every later resize for the rest of the session: silent, and permanent.
+;;
+;; Three things make this an actual test of that, and a reader who deletes any of
+;; them makes it vacuous again:
+;;
+;;   * It goes through run-finder rather than through with-signal-handler.
+;;
+;;   * It forces the capability verdict ON.  run-finder branches on (ansi-ok? 1), and
+;;     the PLAIN branch it otherwise takes installs no handler at all -- a restore
+;;     assertion over a swap that never happened passes for nothing.
+;;     assume-terminal-caps 'on bypasses the live fd/tty/TERM probe and steers into
+;;     the full-screen branch without needing a pty.
+;;
+;;   * The proof is a DELIVERED SIGNAL, never a registry read.  current-signal-handler
+;;     reads our own disposition table, and a no-op unwind installs and restores
+;;     through the Chez primitive, which never writes that table.  A registry read
+;;     would therefore still report the sentinel and stay GREEN on a tree that has the
+;;     bug.  Only delivering a real SIGWINCH and watching the prior handler RUN tells
+;;     the two trees apart -- what matters is which handler is INSTALLED, not which one
+;;     was recorded.
+;;
+;; The suite's stdin is /dev/null, so (with-raw-mode 0) inside the finder's resize
+;; scope raises on tcgetattr.  That raise is BOTH the exceptional unwind the restore
+;; contract has to survive AND the proof the scope was entered: with-signal-handler
+;; installs the handler before it runs the raising thunk, so a raise from inside that
+;; thunk means the swap had already happened.
+;;
+;; Neither case may drive the finder against a live terminal -- it would enter raw mode
+;; and block on a keystroke -- so both refuse loudly when fd 0 is a tty.
+
+;; A delivered signal's handler runs at the next safe point, not at the instruction
+;; after the kill, so wait for it on the WALL CLOCK rather than spinning a fixed
+;; number of attempts (a spin bounds the tries, not the time they are given).
+(define (winch-handler-ran? fired?)
+  (poll-until 5000
+              (lambda () (sleep (make-time 'time-duration 10000000 0)))
+              fired?))
+
+(test-assert "the finder restores the SIGWINCH handler that was live before it ran"
+  (and
+    ;; Refuse loudly rather than enter raw mode on somebody's terminal.
+    (not (tty? 0))
+    (let ([fired #f]
+          [entered-resize-scope #f])
+      (let ([sentinel (lambda (sig) (set! fired #t))])
+        ;; Install through the registry, so the sentinel is BOTH live in the kernel
+        ;; and recorded: this is the disposition the finder has to hand back.
+        (set-signal-handler! SIGWINCH sentinel)
+        (guard (e [#t (set! entered-resize-scope #t)])  ; the tcgetattr raise
+          (parameterize ([console-input-port (open-input-string "")]
+                         [console-output-port (open-output-string)]
+                         [assume-terminal-caps 'on])
+            (run-finder '("alpha" "beta") "> ")))
+        ;; The finder has unwound.  Now ask the kernel, not the registry: deliver a
+        ;; real resize and see whose handler runs.
+        (set! fired #f)
+        (posix-kill (posix-getpid) SIGWINCH)
+        (winch-handler-ran? (lambda () fired))
+        (and entered-resize-scope  ; control: the scope really was entered
+             fired                 ; THE PROOF: the prior handler is installed again
+             ;; Secondary and deliberately NOT load-bearing: this also holds on a tree
+             ;; that has the bug, because the no-op unwind never writes this table.
+             (eq? (current-signal-handler SIGWINCH) sentinel))))))
+
+;; The control for the case above.  Move ONE variable -- the capability verdict -- and
+;; the branch moves with it: forced OFF, the same call takes the PLAIN branch, which
+;; installs no signal handler, enters no raw mode and emits no escapes.  It reads the
+;; empty console input port, hits EOF, returns #f, and does NOT raise.  That is what
+;; proves the raise above belongs to the full-screen branch, and that the forced
+;; verdict is what steers into it.
+;;
+;; The verdict is PINNED here rather than left to the ambient fd 1.  make redirects the
+;; suite's stdin but not its stdout, so a developer running this suite from a terminal
+;; has a CAPABLE fd 1: an unforced call would take the full-screen branch and raise,
+;; and the control would fail for no reason but how it was invoked.  Pinning it makes
+;; this an A/B on the verdict instead of a hostage to the invocation.
+(test-assert "with the capability verdict off the finder takes its plain branch"
+  (and
+    (not (tty? 0))
+    (let ([raised #f]
+          [result 'unset])
+      (guard (e [#t (set! raised #t)])
+        (parameterize ([console-input-port (open-input-string "")]
+                       [console-output-port (open-output-string)]
+                       [assume-terminal-caps 'off])
+          (set! result (run-finder '("alpha" "beta") "> "))))
+      (and (not raised) (eq? result #f)))))
 
 ;; ======================================================================
 ;; Incremental narrowing == full re-score (order-sensitive, engineered tie)

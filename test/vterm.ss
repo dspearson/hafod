@@ -4,10 +4,18 @@
 ;;; test can read back the text, the cursor row/column, and the colour/attribute
 ;;; at any (row, column) without a real terminal.
 ;;;
-;;; This library is deliberately NOT named test-*.ss: the Makefile globs
-;;; test/test-*.ss and runs each as a script, which would choke on a library
-;;; form.  It is a source-only library (like test/runner.ss) that resolves under
-;;; the test runner's --libdirs .:src.
+;;; This library is deliberately NOT named test-*.ss.  The Makefile globs
+;;; test/*.ss and runs as a script every file it is not told is a harness file,
+;;; and Chez, handed a library form via --script, does not baulk at it: it simply
+;;; defines the library and exits 0, printing nothing.  So a harness library that
+;;; escaped the Makefile's TEST_HARNESS list would not fail loudly -- it would
+;;; join the run as a phantom suite, silently passing without ever asserting
+;;; anything, which is a good deal worse than an error.  The split is therefore
+;;; enforced in both directions: make check-test-wiring holds every test/*.ss to
+;;; being either a wired suite or a declared harness file, so no library can
+;;; drift into the suite list, and no failing suite can be quietened by parking
+;;; it in the exclusion list.  It is a source-only library (like test/runner.ss)
+;;; that resolves under the suites' --libdirs .:src.
 ;;;
 ;;; Correctness is defined as AGREEMENT with (hafod editor render): the glyph
 ;;; advance reuses char-display-width (the renderer's wcwidth width oracle) and

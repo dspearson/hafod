@@ -13,7 +13,12 @@
     posix-fnmatch FNM_PERIOD FNM_PATHNAME FNM_NOESCAPE
     posix-glob-fast
     posix-mkfifo posix-fsync posix-sync
-    posix-uname)
+    posix-uname
+    ;; Settable fault/observer hooks for the resource-lifetime proof -- read
+    ;; live by the wrappers below, default inert, and deliberately NOT named in
+    ;; the (hafod posix) facade nor the (hafod) umbrella (leaf-only test seams).
+    readdir-fault-after
+    glob-fault glob-release)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
           (hafod internal platform-constants) (hafod internal posix-core)
@@ -25,7 +30,11 @@
   ;; ======================================================================
 
   (define c-opendir (foreign-procedure "opendir" (string) void*))
-  (define c-readdir (foreign-procedure "readdir" (void*) void*))
+  ;; readdir returns a struct dirent read through dirent-t; on 64-bit Intel macOS
+  ;; readdir-symbol-name (resolved in the platform hub) is the "readdir$INODE64"
+  ;; variant, so the returned entry matches the 64-bit-inode dirent-t layout.
+  ;; opendir and closedir carry no dirent, so they keep the bare symbol.
+  (define c-readdir (foreign-procedure readdir-symbol-name (void*) void*))
   (define c-closedir (foreign-procedure "closedir" (void*) int))
 
   ;; opendir: open a directory stream. Returns a DIR* pointer.
@@ -36,8 +45,24 @@
           (raise-posix-error 'opendir err)))
       dirp))
 
+  ;; A settable readdir fault hook for the resource-lifetime proof. When
+  ;; readdir-fault-after holds an integer N, the (N+1)th posix-readdir call
+  ;; raises, so a directory scan fails mid-loop with its DIR* still open and the
+  ;; consumer's dynamic-wind after-thunk (closedir) genuinely runs on the
+  ;; unwind. The default #f leaves the read path below byte-identical. The
+  ;; internal counter resets when it fires, so a repeated drive faults at the
+  ;; same point on every scan.
+  (define readdir-fault-after (make-parameter #f))
+  (define readdir-fault-count 0)
+
   ;; readdir: read next directory entry. Returns name as string, or #f at end.
   (define (posix-readdir dirp)
+    (let ([fault-n (readdir-fault-after)])
+      (when (integer? fault-n)
+        (set! readdir-fault-count (+ readdir-fault-count 1))
+        (when (> readdir-fault-count fault-n)
+          (set! readdir-fault-count 0)
+          (error 'posix-readdir "forced readdir fault for the resource-lifetime proof"))))
     ;; Reset errno to distinguish end-of-dir (NULL + errno=0) from error
     (foreign-set! 'int (__errno_location) 0 0)
     (let ([ent (c-readdir dirp)])
@@ -190,6 +215,18 @@
   (define c-glob (foreign-procedure "glob" (string int void* void*) int))
   (define c-globfree (foreign-procedure "globfree" (void*) void))
 
+  ;; Settable fault/observer hooks for the glob_t resource-lifetime proof.
+  ;; glob-fault, when it holds a thunk, forces a post-acquire raise inside
+  ;; posix-glob-fast's middle thunk so the dynamic-wind after-thunk runs on the
+  ;; unwind. glob-release is the SOLE free path the after-thunk routes through;
+  ;; its default runs the exact current release -- c-globfree then foreign-free
+  ;; of the glob_t buffer -- so a test may count the free by wrapping the
+  ;; default (the fd canary is blind to this heap free, so the routed observer
+  ;; is the only proof that goes RED when the after-thunk is deleted). Both
+  ;; default inert / behaviour-identical.
+  (define glob-fault (make-parameter #f))
+  (define glob-release (make-parameter (lambda (b) (c-globfree b) (foreign-free b))))
+
   ;; glob_t — struct size and offsets from platform-constants
 
   ;; posix-glob-fast: call C glob(3) directly.
@@ -200,18 +237,25 @@
       (do ([i 0 (+ i 1)]) ((= i SIZEOF-GLOB-T))
         (foreign-set! 'unsigned-8 buf i 0))
       ;; The glob call and the pathv decode run inside a dynamic-wind whose
-      ;; after-thunk does BOTH c-globfree (releases the glob_t's own pathv /
-      ;; string allocations) AND foreign-free (releases our glob_t buffer), in
-      ;; that order. A glob_t needs the globfree unwind -- foreign-free alone
-      ;; would leak glob's internal allocations -- so this is not a with-foreign-
-      ;; buffer site. The unwind runs on every exit, including a ptr->string
-      ;; raise mid-walk. Behaviour is preserved: the matched path list on a zero
-      ;; rc, '() on a non-zero rc (globfree on a zeroed/handled glob_t is safe,
-      ;; exactly as the two former branches both did).
+      ;; after-thunk releases the glob_t through the glob-release seam, whose
+      ;; default does BOTH c-globfree (releases the glob_t's own pathv / string
+      ;; allocations) AND foreign-free (releases our glob_t buffer), in that
+      ;; order. A glob_t needs the globfree unwind -- foreign-free alone would
+      ;; leak glob's internal allocations -- so this is not a with-foreign-buffer
+      ;; site. The seam is the SOLE free path (no bare free beside it), so a test
+      ;; wrapping the default can count it: 1 means freed once, 0 means leaked.
+      ;; The unwind runs on every exit, including a ptr->string raise mid-walk or
+      ;; a forced glob-fault raise. Behaviour is preserved: the matched path list
+      ;; on a zero rc, '() on a non-zero rc (globfree on a zeroed/handled glob_t
+      ;; is safe, exactly as the two former branches both did).
       (dynamic-wind
         (lambda () #f)
         (lambda ()
           (let ([rc (c-glob pattern 0 0 buf)])
+            ;; Resource-lifetime proof hook: a forced post-acquire raise here
+            ;; drives the after-thunk's routed release on the unwind. Inert (#f)
+            ;; by default.
+            (let ([f (glob-fault)]) (when f (f)))
             (if (zero? rc)
                 (let ([pathc (foreign-ref 'uptr buf GLOB-GL-PATHC)]
                       [pathv (foreign-ref 'uptr buf GLOB-GL-PATHV)])
@@ -221,8 +265,7 @@
                           (loop (+ i 1) (cons (ptr->string ptr) acc))))))
                 '())))
         (lambda ()
-          (c-globfree buf)
-          (foreign-free buf)))))
+          ((glob-release) buf)))))
 
   ;; ======================================================================
   ;; mkfifo, fsync, sync

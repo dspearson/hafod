@@ -517,6 +517,53 @@
     [(string=? when-str "never")  (colour-override 'never)]
     [else                         (colour-override #f)]))   ; "auto"
 
+;; Leave a run that has done its work the way an explicit (exit) leaves it.
+;;
+;; Every terminator below RETURNS when its work is done.  interactive-repl returns
+;; at EOF -- Ctrl-D at the prompt, or a redirected stdin reaching its end -- and
+;; that return is the ordinary way out of a shell; a script returns once its last
+;; form is evaluated; a -c expression returns once it is evaluated.  Left to itself
+;; each of those returns lands back in parse-and-execute, returns from there, and
+;; falls off the end of this program: a path that runs neither the exit hooks nor
+;; Chez's exit-handler.
+;;
+;; So every hook the run registered would simply not run.  add-exit-hook! is public
+;; API, which makes those a user's hooks as much as hafod's own -- the one their
+;; script registered to close a database, drop a lock file or post a report on the
+;; way out, and which hafod then quietly never called.  hafod's history is the case
+;; that showed it up: the hook it registers when it opens is the close of the SQLite
+;; connection, so the database was released when a run typed (exit), and abandoned
+;; when a user pressed Ctrl-D or a script reached its end -- leaving the write-ahead
+;; log and its shared-memory file stranded beside it, uncheckpointed, holding what
+;; had just been written.
+;;
+;; So exit explicitly: hafod's exit (not Chez's -- (hafod) shadows it) runs the exit
+;; hooks, flushes the ports and _exits, which is exactly the route an explicit
+;; (exit) already took.  The status is 0, the status each of these paths exited with
+;; when it fell off the end, so nothing observable changes but the hooks running.
+;;
+;; It cannot run them twice.  An explicit (exit N) -- typed at the REPL, written in
+;; a script, written in a -c expression -- runs the hooks and _exits from there: the
+;; process is gone, this is never reached, and the status stays that (exit N)'s
+;; rather than becoming this one's.  Returning is the only other way control leaves
+;; a terminator.  Composing Chez's exit-handler instead would not do: it does not
+;; fire on the fall-off-the-end path either, and composed as well as this it would
+;; run every hook a second time.
+;;
+;; A raise is not a return, so an uncaught error still unwinds past this to the
+;; top-level guard and Chez's default handler, exiting with the status and the
+;; diagnostic it always did.
+;;
+;; interactive-repl and load-script-file are themselves left returning normally,
+;; which is what a caller embedding either in a program needs them to do; the
+;; launcher owns when the PROCESS ends, and this is the launcher.
+(define (exit-normally)
+  (exit 0))
+
+(define (repl-and-exit)
+  (interactive-repl)
+  (exit-normally))
+
 (define (parse-and-execute raw-args)
   (let ([args (meta-arg-process-arglist raw-args)])
     (let loop ([args args]
@@ -532,7 +579,7 @@
             (ensure-hafod-interaction-environment!)
             (unless no-config?
               (load-config-file (hafod-init-file)))
-            (interactive-repl))
+            (repl-and-exit))
 
           (let ([arg (car args)]
                 [rest (cdr args)])
@@ -577,7 +624,10 @@
                  (load-script-file script)
                  (when entry
                    (let ([proc (eval entry (interaction-environment))])
-                     (proc script-args))))]
+                     (proc script-args)))
+                 ;; The script has run: leave through the exit hooks rather than off
+                 ;; the end of the program.  See exit-normally.
+                 (exit-normally))]
 
               ;; -c EXPR -- expression mode (terminating)
               [(string=? arg "-c")
@@ -590,7 +640,10 @@
                (set-command-line! (cons "hafod" (cdr rest)))
                (load-preload-files preloads)
                (ensure-hafod-interaction-environment!)
-               (eval-source-string (car rest))]
+               (eval-source-string (car rest))
+               ;; The expression has been evaluated: leave through the exit hooks
+               ;; rather than off the end of the program.  See exit-normally.
+               (exit-normally)]
 
               ;; -- explicit REPL (terminating)
               [(string=? arg "--")
@@ -599,7 +652,7 @@
                (ensure-hafod-interaction-environment!)
                (unless no-config?
                  (load-config-file (hafod-init-file)))
-               (interactive-repl)]
+               (repl-and-exit)]
 
               ;; --help
               [(string=? arg "--help")
@@ -668,7 +721,11 @@
                    (when effective-entry
                      (let ([proc (eval effective-entry
                                       (interaction-environment))])
-                       (proc rest)))))]))))))
+                       (proc rest))))
+                 ;; A shebang boots through here, so this is the branch most scripts
+                 ;; a user writes actually take -- and it fell off the same end as -s.
+                 ;; See exit-normally.
+                 (exit-normally))]))))))
 
 ;; ======================================================================
 ;; Main

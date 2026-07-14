@@ -103,6 +103,45 @@ assert_search "caret-dash char-set matches a dash"     "#t" '(regexp-search? (rx
 assert_search "empty-alternation star matches empty"   "#t" '(regexp-search? (rx (* (or))) "")'
 
 # ======================================================================
+section "line anchors match at an interior boundary (through the merged binary)"
+# ======================================================================
+
+# bol/eol are LINE anchors: over a subject with an embedded newline they must
+# match at the interior line boundary, not only at the string ends. A -c string
+# passes backslash-n through the shell and hafod's reader turns it into a real
+# newline, so the subject is genuinely multi-line. Read through the shipped
+# launcher this catches a compiler that degrades bol/eol to the string anchors
+# bos/eos: that degradation prints #f, since "abc\ndef" neither starts nor ends
+# with "def". This is the anchor defect seen through the shipped path -- #f today,
+# #t once bol/eol are line-aware -- across the same three locales the ascii guard
+# uses.
+assert_search "bol matches an interior line boundary under the inherited locale" \
+    "#t" '(regexp-search? (rx (: bol "def")) "abc\ndef")'
+if [ -n "$utf8_locale" ]; then
+    assert_search "bol matches an interior line boundary under $utf8_locale collation" \
+        "#t" '(regexp-search? (rx (: bol "def")) "abc\ndef")' "LC_ALL=$utf8_locale"
+else
+    printf "  SKIP: no reordering UTF-8 collation locale installed for the anchor leg\n"
+fi
+assert_search "bol matches an interior line boundary under LC_ALL=C" \
+    "#t" '(regexp-search? (rx (: bol "def")) "abc\ndef")' "LC_ALL=C"
+
+# A line-aware "any" (".") must keep matching a whole UTF-8 line, so the rewrite
+# that keeps "." matching a newline stays multibyte-correct: a byte-range rewrite
+# of "any" would drop the two-byte "é" under a UTF-8 LC_CTYPE and diverge here,
+# while still passing the "C"-collation in-process suite. This is a differential
+# guard -- #t both before and after the anchor fix -- not a match that flips once
+# bol/eol are line-aware.
+assert_search "line-aware any spans a utf-8 line under the inherited locale" \
+    "#t" '(regexp-search? (rx (: bol (+ any))) "x\ncafé")'
+if [ -n "$utf8_locale" ]; then
+    assert_search "line-aware any spans a utf-8 line under $utf8_locale collation" \
+        "#t" '(regexp-search? (rx (: bol (+ any))) "x\ncafé")' "LC_ALL=$utf8_locale"
+else
+    printf "  SKIP: no reordering UTF-8 collation locale installed for the multibyte anchor leg\n"
+fi
+
+# ======================================================================
 # Summary
 # ======================================================================
 

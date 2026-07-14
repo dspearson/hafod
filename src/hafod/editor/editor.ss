@@ -3040,43 +3040,54 @@
                          (set! history-prefix #f)
                          (dismiss-completion!)
                          (reset-undo-state!)
-                         ;; Clear the ghost suggestion from the screen. The ghost
-                         ;; is only ever shown at end-of-buffer, so the cursor sits
-                         ;; at the user's typing position; clear-to-end-of-screen
-                         ;; wipes every ghost row -- however many the suggestion
-                         ;; wrapped onto -- without touching the echoed input. Emit
-                         ;; no carriage return first: a CR would jump to column 0 of
-                         ;; the typed line and the clear would then erase the input.
-                         (when (> (string-length suggestion-text) 0)
-                           (when (ansi-ok? out-port)
-                             (display "\x1b;[J" out-port))  ; clear to end of screen
-                           (flush-output-port out-port))
-                         (set! suggestion-text "")
-                         ;; Clear a mode-indicator row (or a reverse-video
-                         ;; selection) the selection-aware renderer drew on the
-                         ;; last frame.  The indicator sits on its own row BELOW
-                         ;; the edit line; left in place it collides with the
-                         ;; result printed next (e.g. a submitted (+ 9 5 4) would
-                         ;; print as "18 NORMAL --").  Re-render once with the
-                         ;; indicator and any selection suppressed -- render-line
-                         ;; climbs to the prompt line and clears to end of screen,
-                         ;; wiping the indicator row and any stale row below it,
-                         ;; then redraws the buffer plain and leaves the cursor on
-                         ;; the typing row.  Gated on a live overlay AND a
-                         ;; terminal, so the common no-overlay path is untouched
-                         ;; and a non-tty sink (which drew nothing to clear, and
-                         ;; must not be sent a duplicated buffer) is left alone.
-                         ;; Captured before the mark is cleared below, so an
-                         ;; emacs-region highlight is seen too.
-                         (when (and (ansi-ok? out-port)
-                                    (or (editor-mode-indicator es)
-                                        (editor-selection-range es)))
-                           (let ([term-cols (editor-query-terminal-cols)])
-                             (render-line out-port prompt gb
-                                          (cursor-visual-row (ansi-display-width prompt)
-                                                             (gap-buffer-before-string gb)
-                                                             term-cols)
-                                          term-cols)))
+                         ;; Erase whatever the last frame drew over and around the
+                         ;; line, and echo the committed line whole.
+                         ;;
+                         ;; Three things can be on the screen that the transcript
+                         ;; must not keep: a history ghost, a mode-indicator row,
+                         ;; and a reverse-video selection.  ONE re-render clears
+                         ;; all three: render-line climbs to the prompt row, clears
+                         ;; the whole edit block from there (so every ghost row
+                         ;; goes, however many the suggestion wrapped onto),
+                         ;; redraws the prompt and the full buffer with no ghost,
+                         ;; no indicator and no highlight, then leaves the cursor
+                         ;; on the typing row -- which is exactly what a truthful
+                         ;; echo is.  The indicator has to go because it sits on
+                         ;; its own row BELOW the edit line and would otherwise
+                         ;; collide with the result printed next (a submitted
+                         ;; (+ 9 5 4) printing as "18 NORMAL --").
+                         ;;
+                         ;; The ghost cannot be erased by clearing from the cursor
+                         ;; to the end of the screen, which is what this did
+                         ;; before.  That relied on the ghost only ever showing at
+                         ;; end-of-buffer, and it does not: the ghost shows
+                         ;; whenever the text after the cursor is all closing
+                         ;; delimiters (only-closing-delimiters?), which is
+                         ;; precisely where paredit parks its auto-inserted
+                         ;; closers -- and it is drawn AT the cursor, in front of
+                         ;; them.  A clear from the cursor therefore reached past
+                         ;; the ghost and took those real closers with it: a
+                         ;; submitted (+ 1 2) echoed as "> (+ 1 2", the transcript
+                         ;; disagreeing with what was evaluated.
+                         ;;
+                         ;; Gated on a terminal AND something actually drawn: a
+                         ;; non-tty sink emitted nothing to clear and must not be
+                         ;; sent a duplicated buffer, and a plain line with no
+                         ;; ghost or overlay needs no repaint.  The ghost is read
+                         ;; before it is dropped, and the selection before the mark
+                         ;; is cleared below, so both are still seen here.
+                         (let ([ghost? (> (string-length suggestion-text) 0)])
+                           (set! suggestion-text "")
+                           (when (and (ansi-ok? out-port)
+                                      (or ghost?
+                                          (editor-mode-indicator es)
+                                          (editor-selection-range es)))
+                             (let ([term-cols (editor-query-terminal-cols)])
+                               (render-line out-port prompt gb
+                                            (cursor-visual-row (ansi-display-width prompt)
+                                                               (gap-buffer-before-string gb)
+                                                               term-cols)
+                                            term-cols))))
                          ;; Clear the emacs mark so a region set on this line never
                          ;; bleeds a highlight into the next prompt (vi visual is
                          ;; already cleared by the session reset).  Drop the

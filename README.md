@@ -444,8 +444,8 @@ hafod -s examples/01-system-info.ss
 
 ## Tests
 
-The test suite comprises 75 Scheme test suites (2,500+ assertions) and a
-92-test shell-based launcher test:
+The test suite comprises 122 Scheme test suites (3,800+ assertions) and a
+108-test shell-based launcher test:
 
 ```sh
 make test                       # run all Scheme tests + launcher + umbrella
@@ -456,6 +456,13 @@ make test-re                    # regex tests
 make test-syntax                # process notation tests
 make test-awk                   # AWK macro tests
 ```
+
+The suites are discovered by a glob, so `make test` and `just test` run a
+wiring audit (`tools/check-test-wiring.sh`) before the suites themselves.  It
+fails the run if a test file is neither wired in nor deliberately excluded, and
+if a harness library has leaked into the suite list -- either would otherwise be
+silent, since a suite that is never run reports nothing, and Chez accepts a
+`(library ...)` form handed to `--script` and exits 0 having asserted nothing.
 
 Some suites exercise the interactive editor, PTYs, and signals.  Both `make
 test` and `just test` redirect every suite's stdin from `/dev/null`, so an

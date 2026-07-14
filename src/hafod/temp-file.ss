@@ -4,7 +4,9 @@
 
 (library (hafod temp-file)
   (export create-temp-file temp-file-channel temp-file-iterate
-          *temp-file-template*)
+          *temp-file-template*
+          ;; Settable post-open fault hook + routed read-port close (resource-lifetime proof only)
+          temp-file-post-open-fault temp-read-close)
 
   (import (hafod internal base)
           (hafod posix) (hafod compat) (hafod fd-ports) (hafod environment))
@@ -36,6 +38,19 @@
                (unless (= (posix-errno e) 2) (raise e))])  ; ENOENT=2 -> already gone
       (posix-unlink path)))
 
+  ;; A settable post-open fault hook, read live by temp-file-channel immediately
+  ;; after the read port is opened and before the temp path is unlinked. When it
+  ;; holds a thunk the helper calls it, forcing a raise in that post-open window so
+  ;; the descriptor unwind can be driven without engineering a real unlink failure.
+  ;; The default #f leaves the behaviour byte-for-byte unchanged.
+  (define temp-file-post-open-fault (make-parameter #f))
+
+  ;; A routed read-port close.  temp-file-channel releases its staged read port by
+  ;; calling ((temp-read-close) iport), so the close and any observation of it are
+  ;; the same call and cannot drift apart.  The default IS the real close, so
+  ;; production behaviour is unchanged; overriding it counts the close.
+  (define temp-read-close (make-parameter (lambda (p) (close p))))
+
   ;; temp-file-channel: create a temp file, unlink it, return (values inport outport).
   ;; The file has no name on the filesystem but stays alive via open fds.
   ;; This is used by run/collecting* to buffer multi-fd output without deadlock.
@@ -43,23 +58,29 @@
     (let ([template (string-append (temp-dir) "/hafod-chan-XXXXXX")])
       (receive (path fd) (posix-mkstemp template)
         ;; Stage the cleanup of the window between mkstemp and the successful
-        ;; return.  If any step raises, release the descriptor's current owner
-        ;; -- the raw fd before the port wraps it, otherwise the port (closing
-        ;; the raw fd as well would double-close a port-owned descriptor) -- and
-        ;; unlink the temp path, then re-raise.  The success path is unchanged:
-        ;; the file is unlinked exactly once and (values inport outport) returned.
-        (let ([oport #f])
+        ;; return.  If any step raises, release every descriptor still held -- the
+        ;; read port first (routed through the close seam so the release is
+        ;; observable), then the mkstemp fd's current owner (the raw fd before the
+        ;; port wraps it, otherwise the port; closing the raw fd as well would
+        ;; double-close a port-owned descriptor) -- and unlink the temp path, then
+        ;; re-raise.  The success path is unchanged: the file is unlinked exactly
+        ;; once and (values inport outport) returned.
+        (let ([oport #f] [iport #f])
           (guard (e [#t
+                     (when iport (guard (inner [#t #f]) ((temp-read-close) iport)))
                      (if oport
                          (guard (inner [#t #f]) (close oport))
                          (guard (inner [#t #f]) (posix-close fd)))
                      (unlink-temp-file path)
                      (raise e)])
             (set! oport (fdes->outport fd))
-            (let ([iport (open-file path open/read)])
-              ;; Unlink immediately -- file stays alive via open fds
-              (posix-unlink path)
-              (values iport oport)))))))
+            (set! iport (open-file path open/read))
+            ;; Force a raise in the post-open window on demand; #f by default,
+            ;; so ordinary behaviour is unchanged.
+            (let ([fault (temp-file-post-open-fault)]) (when fault (fault)))
+            ;; Unlink immediately -- file stays alive via open fds
+            (posix-unlink path)
+            (values iport oport))))))
 
   ;; temp-file-iterate: try candidate names until maker succeeds.
   ;; MAKER is called with a filename string and should either return a value

@@ -19,9 +19,19 @@
 ;;; ===== Test 1: tty-info record =====
 ;;; Original scsh test calls (tty-info) with no args on stdout.
 ;;; In hafod, when not on a TTY, we use open-pty to get a real PTY fd.
+;;;
+;;; Query the SLAVE, not the master. The terminal proper -- the line discipline
+;;; that owns the termios state -- is the slave end; the master is just the other
+;;; side of the pair. Linux happens to proxy tcgetattr from the master through to
+;;; the slave's termios, so asking the master works there by accident. BSD does
+;;; not: it only attaches the termios state when the slave is first opened, so
+;;; tcgetattr on a master whose slave was never opened fails with ENOTTY. Opening
+;;; the slave by name and asking IT is both portable and a truer test -- it is the
+;;; real terminal the original scsh test had in hand.
 (test-assert "tty-info-record-test"
   (receive (pty-port tty-name) (open-pty)
-    (let ([ti (tty-info pty-port)])
+    (let* ([tty-in (open-input-file tty-name)]
+           [ti (tty-info tty-in)])
       (let ([result
               (and (bytevector? (tty-info:control-chars ti))
                    (or (integer? (tty-info:input-flags ti))
@@ -40,6 +50,7 @@
                        (not (tty-info:min ti)))
                    (or (integer? (tty-info:time ti))
                        (not (tty-info:time ti))))])
+        (close-input-port tty-in)
         (close pty-port)
         result))))
 
@@ -63,9 +74,11 @@
          (= time-v (tty-info:time ti)))))
 
 ;;; ===== Test 3: copy-tty-info =====
+;;; Query the slave, for the reason given on the tty-info record test above.
 (test-assert "copy-tty-test"
   (receive (pty-port tty-name) (open-pty)
-    (let* ([ti (tty-info pty-port)]
+    (let* ([tty-in (open-input-file tty-name)]
+           [ti (tty-info tty-in)]
            [ti-c (copy-tty-info ti)])
       (let ([result
               (and (tty-info? ti)
@@ -88,6 +101,7 @@
                       (tty-info:min ti-c))
                    (= (tty-info:time ti)
                       (tty-info:time ti-c)))])
+        (close-input-port tty-in)
         (close pty-port)
         result))))
 

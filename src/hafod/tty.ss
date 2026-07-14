@@ -84,6 +84,11 @@
 
     ;; Terminal window size
     terminal-size
+    ;; Settable fault/observer hooks for the winsize resource-lifetime proof,
+    ;; and the routed TIOCGWINSZ call every window-size query goes through --
+    ;; leaf-only exports, deliberately NOT re-exported from the (hafod) umbrella;
+    ;; tests reach them via (only (hafod tty) ...).
+    winsize-fault winsize-release winsize-ioctl
     ;; SIGWINCH-refreshed width cache: one live query on resize/entry, O(1)
     ;; reads on the render hot path.  Leaf-only exports -- deliberately NOT
     ;; re-exported from the (hafod) umbrella; consumers reach them via
@@ -521,32 +526,77 @@
   ;; winsize buffer as a uptr, so it takes the pointer's integer address
   ;; and the compiler emits the correct call frame without a per-platform
   ;; C shim.
+
+  ;; Settable fault/observer hooks for the winsize resource-lifetime proof.
+  ;; winsize-fault, when it holds a thunk, forces a post-acquire raise inside
+  ;; terminal-size's middle thunk so the dynamic-wind after-thunk runs on the
+  ;; unwind. winsize-release is the SOLE free path the after-thunk routes
+  ;; through; its default frees the buffer exactly as before -- foreign-free of
+  ;; the ftype-pointer-address -- so a test may count the free by wrapping the
+  ;; default. winsize is pure foreign memory, invisible to the fd canary, so
+  ;; this routed observer is the only proof that goes RED when the after-thunk
+  ;; is deleted. Both default inert / behaviour-identical.
+  (define winsize-fault (make-parameter #f))
+  (define winsize-release (make-parameter (lambda (addr) (foreign-free addr))))
+
+  ;; The routed TIOCGWINSZ call.  EVERY window-size query this tree issues goes
+  ;; through this one hook, so the kernel queries can be COUNTED -- which is the
+  ;; only way to prove that a resize asks exactly once rather than twice -- and
+  ;; answered deterministically, with no pseudo-terminal anywhere in sight.  Its
+  ;; value is a procedure of (fd p): the descriptor to ask, and the winsize
+  ;; ftype-pointer terminal-size has already allocated.  It returns
+  ;; (values rc rows cols); rows and cols are meaningful only when rc is zero.
+  ;;
+  ;; Returning the two FIELDS rather than a bare return code is deliberate.  It
+  ;; lets a stub be pure Scheme -- (lambda (fd p) (values 0 42 137)) -- with no
+  ;; need to fabricate a winsize buffer, write into it, or import the internal
+  ;; ftype at all; p is simply ignored.  The default IS the call it replaces:
+  ;; the same c-ioctl on the same address and, on a zero return, the same two
+  ;; ftype-ref reads, so the seam is behaviour-identical while nobody has
+  ;; stubbed it.  The seam sits INSIDE terminal-size's dynamic-wind, at the
+  ;; ioctl call: the buffer's owner (winsize-fault, winsize-release) is
+  ;; untouched by it.
+  (define winsize-ioctl
+    (make-parameter
+      (lambda (fd p)
+        (let ([rc (c-ioctl fd TIOCGWINSZ (ftype-pointer-address p))])
+          (if (zero? rc)
+              (values rc
+                      (ftype-ref winsize-t (ws_row) p)
+                      (ftype-ref winsize-t (ws_col) p))
+              (values rc 0 0))))))
+
   (define terminal-size
     (case-lambda
       [() (terminal-size #f)]
       [(fd)
        (let ([p (make-ftype-pointer winsize-t
                                     (foreign-alloc (ftype-sizeof winsize-t)))])
-         ;; The query runs inside a dynamic-wind whose after-thunk foreign-frees
-         ;; the winsize buffer, so it is released on every exit -- the fallback
-         ;; return, a successful return, or an unexpected raise from c-ioctl or
-         ;; ftype-ref -- never only on the two success paths.
+         ;; The query runs inside a dynamic-wind whose after-thunk frees the
+         ;; winsize buffer through the winsize-release seam (default: foreign-free
+         ;; of the address), so it is released on every exit -- the fallback
+         ;; return, a successful return, or an unexpected raise from c-ioctl,
+         ;; ftype-ref or a forced winsize-fault -- never only on the success paths.
          (dynamic-wind
            (lambda () #f)
            (lambda ()
+             ;; Resource-lifetime proof hook: a forced post-acquire raise here
+             ;; (the buffer is already allocated above) drives the after-thunk's
+             ;; routed free on the unwind. Inert (#f) by default.
+             (let ([f (winsize-fault)]) (when f (f)))
              (let try-fd ([fds (if fd (list fd) '(1 0 2))])
                (cond
                  [(null? fds)
                   (values 24 80)]  ;; fallback when nothing is a terminal
                  [else
-                  (let ([rc (c-ioctl (car fds) TIOCGWINSZ (ftype-pointer-address p))])
+                  ;; The one routed query.  A zero return means this fd answered;
+                  ;; anything else means it is not a terminal, so try the next.
+                  (let-values ([(rc rows cols) ((winsize-ioctl) (car fds) p)])
                     (if (zero? rc)
-                        (let ([rows (ftype-ref winsize-t (ws_row) p)]
-                              [cols (ftype-ref winsize-t (ws_col) p)])
-                          (values (if (> rows 0) rows 24)
-                                  (if (> cols 0) cols 80)))
+                        (values (if (> rows 0) rows 24)
+                                (if (> cols 0) cols 80))
                         (try-fd (cdr fds))))])))
-           (lambda () (foreign-free (ftype-pointer-address p)))))]))
+           (lambda () ((winsize-release) (ftype-pointer-address p)))))]))
 
   ;; ======================================================================
   ;; Terminal window size cache
@@ -565,19 +615,31 @@
 
   ;; Perform the ONE live terminal-size query and store its (rows . cols) in the
   ;; cache.  Called on a resize and at editor/finder entry -- never per render.
+  ;; It stores and returns unspecified, and every call site uses it in statement
+  ;; position: a caller that wants the answer it just fetched reads it straight
+  ;; back out of the cache below, rather than taking a second query of its own.
   (define (refresh-terminal-size-cache!)
     (let-values ([(rows cols) (terminal-size)])
       (set-car! %terminal-size-cache rows)
       (set-cdr! %terminal-size-cache cols)))
 
   ;; The O(1) cache read: (values rows cols) with no ioctl.  This is the source
-  ;; the editor's per-render column/row queries draw from.
+  ;; the editor's per-render column/row queries draw from, so it must stay a
+  ;; pure, branch-free cell read -- no freshness check, no seeding, no ioctl on
+  ;; any path through it.  It promises exactly what its name says and no more:
+  ;; the last size STORED, which is the true size only for a caller that knows
+  ;; something has refreshed it.  A caller that cannot know that -- anything
+  ;; outside the REPL, where no resize and no editor entry ever runs -- must not
+  ;; be answered from here; it wants a live terminal-size query.
   (define (cached-terminal-size)
     (values (car %terminal-size-cache) (cdr %terminal-size-cache)))
 
   ;; Deterministic test seam: seed the cache to a known size directly, so a
   ;; PTY-free test can prove a reader consults the cache (a distinct sentinel)
   ;; rather than issuing a live ioctl (which off a non-terminal returns 24x80).
+  ;; It can only ever affect what cached-terminal-size reports, which is the
+  ;; whole of its purpose: no live query is routed through the cache, so a
+  ;; planted size cannot reach a caller that asked the kernel.
   (define (set-terminal-size-cache! rows cols)
     (set-car! %terminal-size-cache rows)
     (set-cdr! %terminal-size-cache cols))

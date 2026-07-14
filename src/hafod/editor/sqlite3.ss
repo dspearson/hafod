@@ -7,7 +7,8 @@
           sqlite3-prepare sqlite3-finalize sqlite3-reset
           sqlite3-bind-text sqlite3-bind-int64
           sqlite3-step sqlite3-column-text sqlite3-column-int64
-          sqlite3-column-count sqlite3-errmsg sqlite3-loaded?
+          sqlite3-column-count sqlite3-errmsg
+          sqlite3-last-insert-rowid sqlite3-loaded?
           SQLITE_OK SQLITE_ROW SQLITE_DONE)
   (import (chezscheme) (hafod internal platform))
 
@@ -39,10 +40,14 @@
                  (try "/usr/lib/libsqlite3.so.0"))])
           #f)))
 
-  ;; Helper: allocate a pointer-sized slot, read/free it.  These use only Chez
-  ;; FFI primitives (no shared object), so they stay at library top level.
+  ;; Helper: allocate a pointer-sized slot, zero/read/free it.  These use only
+  ;; Chez FFI primitives (no shared object), so they stay at library top level.
+  ;; foreign-alloc is malloc: the slot it hands back holds whatever was in that
+  ;; memory before, so a caller that will DEREFERENCE what it finds there zeroes
+  ;; it first -- see sqlite3-open.
   (define ptr-size (foreign-sizeof 'void*))
   (define (alloc-ptr-slot) (foreign-alloc ptr-size))
+  (define (zero-ptr-slot! addr) (foreign-set! 'void* addr 0 0))
   (define (read-ptr-slot addr)
     (foreign-ref 'void* addr 0))
   (define (free-ptr-slot addr) (foreign-free addr))
@@ -64,6 +69,7 @@
   (define c-sqlite3-column-text #f)
   (define c-sqlite3-column-int64 #f)
   (define c-sqlite3-column-count #f)
+  (define c-sqlite3-last-insert-rowid #f)
 
   ;; First-use initialiser.  The flag is set before the load is attempted so a
   ;; missing library is remembered and not re-probed on every wrapper call.  A
@@ -99,7 +105,9 @@
         (set! c-sqlite3-column-int64
           (foreign-procedure "sqlite3_column_int64" (void* int) integer-64))
         (set! c-sqlite3-column-count
-          (foreign-procedure "sqlite3_column_count" (void*) int)))))
+          (foreign-procedure "sqlite3_column_count" (void*) int))
+        (set! c-sqlite3-last-insert-rowid
+          (foreign-procedure "sqlite3_last_insert_rowid" (void*) integer-64)))))
 
   ;; Probe: #t only once a real C entry point has been resolved (i.e. libsqlite3
   ;; was present and loaded).  Reads the cell without triggering a load, so a
@@ -107,14 +115,41 @@
   (define (sqlite3-loaded?) (and c-sqlite3-open #t))
 
   ;; Open a database.  Returns db handle (void* address) or #f on failure.
+  ;;
+  ;; SQLite allocates the connection object whether or not the open succeeds,
+  ;; and the caller owns it either way: the handle written to the out slot is
+  ;; closeable -- and must be closed -- even after a failure.  Reporting #f
+  ;; without closing it strands one connection object per failed open, for as
+  ;; long as the session runs.  So the failure branch closes it; a null slot
+  ;; means the allocation itself failed and there is nothing to close.  The
+  ;; success branch is unchanged: it hands back the live handle and never closes
+  ;; it (c-sqlite3-close is resolved in the same set! block as c-sqlite3-open,
+  ;; so it is bound wherever this branch is reachable).
+  ;;
+  ;; The slot is zeroed before the call, and that is what makes the null guard
+  ;; below mean anything.  foreign-alloc is malloc, so an unzeroed slot holds
+  ;; whatever was last in that memory -- and the failure branch does not merely
+  ;; read the word, it CLOSES it.  That the word is safe to read rests on
+  ;; sqlite3_open always writing *ppDb, which today's libsqlite3 does (it is the
+  ;; first thing openDatabase does), but this wrapper dlopens whichever
+  ;; libsqlite3 the platform supplies, and a build that skipped that write would
+  ;; turn a failed open into sqlite3_close() on a stray pointer.  Zeroing it here
+  ;; costs one store and takes the assumption out: the failure branch can only
+  ;; ever close a handle SQLite actually wrote.
   (define (sqlite3-open path)
     (ensure-sqlite3!)
     (and c-sqlite3-open
          (let ([slot (alloc-ptr-slot)])
+           (zero-ptr-slot! slot)
            (let ([rc (c-sqlite3-open path slot)])
              (let ([db (read-ptr-slot slot)])
                (free-ptr-slot slot)
-               (if (= rc SQLITE_OK) db #f))))))
+               (if (= rc SQLITE_OK)
+                   db
+                   (begin
+                     (unless (eqv? db 0)
+                       (c-sqlite3-close db))
+                     #f)))))))
 
   ;; Close a database handle.
   (define (sqlite3-close db)
@@ -136,6 +171,16 @@
     (if (and db c-sqlite3-errmsg)
         (c-sqlite3-errmsg db)
         "sqlite3 not available"))
+
+  ;; Row id of the most recent successful insert on THIS connection.  Per
+  ;; connection, not per file: a caller reads back the row IT inserted, never
+  ;; one another connection interleaved into the same database.  Falls back to 0
+  ;; when the library is unavailable, like the other numeric accessors.
+  (define (sqlite3-last-insert-rowid db)
+    (ensure-sqlite3!)
+    (if (and db c-sqlite3-last-insert-rowid)
+        (c-sqlite3-last-insert-rowid db)
+        0))
 
   ;; Prepare a statement.  Returns stmt handle (void* address) or #f.
   (define (sqlite3-prepare db sql)

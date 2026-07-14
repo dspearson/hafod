@@ -1,9 +1,17 @@
-;;; test-ghost-accept.ss -- accepting the history ghost through auto-inserted closers
+;;; test-ghost-accept.ss -- accepting the history ghost through auto-inserted
+;;; closers, and echoing the line it was showing over.
 ;;;
 ;;; With paredit on, typing "(" leaves the buffer "()" with the cursor parked
 ;;; before the auto-inserted ")".  When the history ghost is showing, Right / End
 ;;; / Ctrl-Right must ACCEPT it -- landing exactly on the matched history entry --
 ;;; rather than merely stepping past the closer or stacking a doubled ")".
+;;;
+;;; Submitting is the other half of the same story, and the final section proves
+;;; it: a line committed with a ghost up must echo WHOLE.  The ghost is drawn at
+;;; the cursor, so erasing it cannot mean clearing from the cursor to the end of
+;;; the screen -- that takes the buffer's real closers with it, and the transcript
+;;; then disagrees with what was evaluated.  Those cases read the echoed line back
+;;; off a virtual-terminal screen, folded from the editor's own escape stream.
 ;;;
 ;;; PTY-free: we drive read-expression with string ports, exactly as the other
 ;;; editor suites do.  editor-history is the editor's module-level history;
@@ -15,6 +23,7 @@
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
+        (test vterm)
         (hafod editor editor))
 
 ;; Control character (C-a = 1, etc.).
@@ -35,6 +44,31 @@
   (let ([in-port (open-input-string input)]
         [out-port (open-output-string)])
     (read-expression prompt in-port out-port)))
+
+;; Drive the same input, but fold the editor's escape stream into the virtual
+;; terminal (render->screen forces the capability verdict on, so a plain string
+;; port receives the whole stream).  Returns two values: what read-expression
+;; read, and the screen the user is left looking at.  editor-simulate above
+;; cannot see the echo -- off a terminal the editor emits no escapes at all, and
+;; so nothing it draws or erases is observable there.
+(define (editor-echo prompt input cols)
+  (let ([line #f])
+    (let ([scr (render->screen cols
+                 (lambda (p)
+                   (set! line (read-expression prompt (open-input-string input) p))))])
+      (values line scr))))
+
+;; The 256-colour index the renderer paints the ghost with (ESC[38;5;240m).
+(define ghost-grey 240)
+
+;; Does any cell on ROW still carry the ghost's grey?  An echoed line must have
+;; none: the ghost is gone, not merely painted over.
+(define (row-has-ghost-grey? scr row)
+  (let loop ([col 0])
+    (cond
+      [(>= col (vterm-cols scr)) #f]
+      [(eqv? (cell-fg (vterm-cell scr row col)) ghost-grey) #t]
+      [else (loop (+ col 1))])))
 
 ;; Count occurrences of a character in a string.
 (define (count-char c s)
@@ -129,5 +163,59 @@
 (test-equal "End after a menu-collapsing Tab keeps the closer and drops the ghost"
   "()"
   (editor-simulate "> " (string-append "(string" TAB END submit)))
+
+;; ======================================================================
+;; (g) Submitting with a ghost up echoes the COMMITTED line, whole.  The ghost is
+;; drawn at the cursor, and the cursor -- with paredit on -- sits BEFORE the
+;; closers the buffer already holds.  So the ghost cannot be erased by clearing
+;; from the cursor to the end of the screen: that clear reaches past the ghost and
+;; takes those real closers with it, leaving a transcript that disagrees with what
+;; was evaluated ("> (+ 1 2" echoed for a submitted "(+ 1 2)").  The only truthful
+;; erase is a re-render of the committed line.  Read back off a folded screen,
+;; because off a terminal none of this is emitted at all.
+;; ======================================================================
+
+;; Re-seed "(+ 1 2)" as the newest entry -- the section above submitted "()" last,
+;; and the ghost is always the newest match for the typed prefix.
+(editor-simulate "> " (string-append "(+ 1 2" submit))
+
+;; Positive control: a ghost is genuinely showing for the prefix "(" -- End
+;; accepts it -- so the echo cases below cannot pass vacuously on a ghostless line.
+(test-equal "the re-seeded entry is the newest ghost for the prefix ("
+  "(+ 1 2)"
+  (editor-simulate "> " (string-append "(" END submit)))
+
+;; Typed on to "(+ 1 2": the buffer auto-paired to "(+ 1 2)" with the cursor
+;; before the closer, and the ghost is the entry's remaining suffix -- exactly the
+;; ")" already on the screen.  Enter must echo the whole committed line.
+(let-values ([(line scr) (editor-echo "> " (string-append "(+ 1 2" submit) 80)])
+  (test-equal "submit: the committed line is the balanced expression"
+    "(+ 1 2)" line)
+  (test-equal "submit: the echo shows the whole line, closer and all"
+    "> (+ 1 2)" (vterm-row-text scr 0))
+  (test-assert "submit: the echoed line carries no ghost residue"
+    (not (row-has-ghost-grey? scr 0))))
+
+;; The bare auto-pair: buffer "()" with the ghost "+ 1 2)" expanding inside it.
+;; Enter commits the "()" the user actually typed -- and echoes that, not the
+;; truncated "(" the ghost-clear used to leave behind.
+(let-values ([(line scr) (editor-echo "> " (string-append "(" submit) 80)])
+  (test-equal "submit: the committed line is the bare auto-pair"
+    "()" line)
+  (test-equal "submit: the echo keeps the auto-inserted closer"
+    "> ()" (vterm-row-text scr 0))
+  (test-assert "submit: the ghost is gone from the echoed line, not painted over"
+    (not (row-has-ghost-grey? scr 0))))
+
+;; Regression, no ghost: C-a empties the before-cursor text, which withholds the
+;; ghost unconditionally.  The line still echoes plainly -- the no-ghost submit
+;; path emits no redraw of its own and needs none.
+(let-values ([(line scr) (editor-echo "> " (string-append "abc" (string (ctrl #\a))
+                                                          submit)
+                                      80)])
+  (test-equal "submit without a ghost: the committed line is what was typed"
+    "abc" line)
+  (test-equal "submit without a ghost: the line echoes plainly"
+    "> abc" (vterm-row-text scr 0)))
 
 (test-end)

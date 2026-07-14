@@ -16,7 +16,11 @@
     ;; Pure parsers: machine-type symbol -> family / architecture symbol.
     machine-type->os-family machine-type->cpu-arch
     ;; Resolved artefact relocated out of errno.ss.
-    errno-accessor-name)
+    errno-accessor-name
+    ;; Pure machine-type -> stat/readdir libc symbol-name selector, and the four
+    ;; names it resolves to for THIS build host (consumed by posix-file/posix-misc).
+    inode64-symbol
+    stat-symbol-name lstat-symbol-name fstat-symbol-name readdir-symbol-name)
   (import (chezscheme))
 
   ;; ======================================================================
@@ -61,5 +65,31 @@
   ;; glibc/musl use __errno_location, macOS/FreeBSD use __error.
   (define errno-accessor-name
     (case os-family [(macos freebsd) "__error"] [else "__errno_location"]))
+
+  ;; Stat/readdir 64-bit-inode symbol selection. On 64-bit Intel macOS the bare
+  ;; libc stat/lstat/fstat/readdir resolve to the LEGACY 32-bit-inode functions,
+  ;; whose struct stat/dirent layout no longer matches the 64-bit-inode layout the
+  ;; readers expect; the asm-labelled "…$INODE64" symbols are the 64-bit-inode
+  ;; variants. The suffix is scoped strictly to the 64-bit-Intel-macOS
+  ;; machine-types: arm64 macOS never shipped a legacy variant (its bare symbol is
+  ;; already 64-bit-inode) and Linux/FreeBSD never had the inode-width split at
+  ;; all, so naming the variant anywhere else would name a symbol that does not
+  ;; exist. Keyed on the machine-type ARGUMENT (never a closed-over read of the
+  ;; live (machine-type)), mirroring machine-type->os-family, so every branch is
+  ;; exercised on any build host.
+  (define (inode64-symbol base mt)
+    (case mt
+      [(a6osx ta6osx) (string-append base "$INODE64")]
+      [else base]))
+
+  ;; The stat/readdir family's resolved libc symbol names for THIS build host.
+  ;; inode64-symbol is applied to the live (machine-type) HERE -- the hub is the
+  ;; single site that reads it -- so posix-file/posix-misc bind a plain resolved
+  ;; name exactly as errno.ss binds errno-accessor-name, never re-deriving the
+  ;; platform choice at the call site.
+  (define stat-symbol-name    (inode64-symbol "stat"    (machine-type)))
+  (define lstat-symbol-name   (inode64-symbol "lstat"   (machine-type)))
+  (define fstat-symbol-name   (inode64-symbol "fstat"   (machine-type)))
+  (define readdir-symbol-name (inode64-symbol "readdir" (machine-type)))
 
   ) ; end library

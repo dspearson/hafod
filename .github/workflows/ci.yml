@@ -24,6 +24,12 @@ jobs:
       - name: Check structural portability invariants
         run: nix develop --command make check-portability
 
+      - name: Check resource-guard release invariants
+        run: nix develop --command make check-resource-guards
+
+      - name: Prove the resource-guard audit has teeth
+        run: nix develop --command make test-check-resource-guards
+
       - name: Build (compile-wpo)
         run: nix develop --command make compile-wpo
 
@@ -47,13 +53,14 @@ jobs:
           HAFOD_LIBDIR=$(pwd) bin/hafod-native --version
           HAFOD_LIBDIR=$(pwd) bin/hafod-native -c '(display "ok\n")'
 
-      - name: Build standalone binary
-        run: nix develop --command make standalone
-
-      - name: Verify standalone binary
-        run: |
-          bin/hafod-standalone --version
-          bin/hafod-standalone -c '(display "ok\n")'
+      # Builds the standalone and proves it is one self-contained image: every
+      # entry point works from an empty directory, every library source in the
+      # tree is in its heap, and it opens no library file. Supersedes the bare
+      # --version / -c smoke check that stood here: --version never reaches the
+      # runtime (import (hafod)), so it passes on an image whose libraries cannot
+      # be resolved at all, and would have called such a build good.
+      - name: Prove the standalone binary is self-contained
+        run: nix develop --command make test-standalone-selfcontained
 
   test-macos:
     runs-on: macos-latest
@@ -77,6 +84,12 @@ jobs:
 
       - name: Check structural portability invariants
         run: nix develop --command make check-portability
+
+      - name: Check resource-guard release invariants
+        run: nix develop --command make check-resource-guards
+
+      - name: Prove the resource-guard audit has teeth
+        run: nix develop --command make test-check-resource-guards
 
       - name: Record platform
         run: uname -srm

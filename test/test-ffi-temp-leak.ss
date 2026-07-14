@@ -28,7 +28,8 @@
 (library-directories '(("src" . "src") ("." . ".")))
 (import (hafod temp-file) (hafod fd-ports) (hafod posix)
         (hafod compat) (hafod environment) (hafod fileinfo)
-        (only (hafod syntax) open-string-source)
+        (only (hafod syntax) open-string-source
+              open-string-post-open-fault open-string-read-close)
         (only (hafod internal platform) os-family)
         (except (chezscheme) vector-append open-input-file open-output-file getenv
                 file-exists? delete-file truncate-file)
@@ -150,5 +151,47 @@
     (lambda ()
       (let ([inp (open-string-source "here-string-body")])
         (guard (e [#t #f]) (close inp))))))
+
+;; ---- Read-port release on a forced post-open raise ----------------------
+;; The existing two cases force their error at the read-OPEN (EMFILE), a window
+;; that never binds the read port, so they cannot see the read-port leak.  These
+;; two drive a raise in the window AFTER the read port is opened and BEFORE the
+;; unlink (the documented posix-unlink-failure trigger) via the post-open fault
+;; seam, and count the staged read-port release through the routed close seam.
+;;
+;; The count-based observer -- not the lowest-free-fd canary -- is used here on
+;; purpose.  For temp-file-channel the mkstemp descriptor takes the low fd (the
+;; write port) and the read open takes a higher fd; the pre-fix unwind frees the
+;; low write fd while leaking the high read fd, so lowest-free returns to the low
+;; slot unchanged and the leak is invisible to that probe.  The routed close is
+;; both the release and its observation, so the two cannot silently decouple.
+;;
+;; On the pre-fix tree the read port is opened in an inner let the guard cannot
+;; see, so on the forced raise it is never closed and the observer never fires
+;; (count 0) -- the `count = 1' assertion fails (RED).  Staging the read port into
+;; the guard closes it once on the unwind (count 1, GREEN).  Deleting the staged
+;; close returns the count to 0 (RED again).  The seam still closes the port, so
+;; the test itself leaks no descriptor.
+
+(test-equal "temp-file-channel releases the staged read port on a forced post-open error"
+  1
+  (let ([counter 0])
+    (parameterize ([temp-read-close (lambda (p) (set! counter (+ counter 1)) (close p))]
+                   [temp-file-post-open-fault (lambda () (error 'forced "post-open fault"))])
+      (guard (e [#t #f])
+        (receive (iport oport) (temp-file-channel)
+          (guard (inner [#t #f]) (close iport))
+          (guard (inner [#t #f]) (close oport)))))
+    counter))
+
+(test-equal "open-string-source releases the staged read port on a forced post-open error"
+  1
+  (let ([counter 0])
+    (parameterize ([open-string-read-close (lambda (p) (set! counter (+ counter 1)) (close p))]
+                   [open-string-post-open-fault (lambda () (error 'forced "post-open fault"))])
+      (guard (e [#t #f])
+        (let ([inp (open-string-source "here-string-body")])
+          (guard (inner [#t #f]) (close inp)))))
+    counter))
 
 (test-end)

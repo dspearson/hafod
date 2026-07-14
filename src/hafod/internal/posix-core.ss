@@ -16,7 +16,11 @@
     posix-read posix-write posix-kill posix-sleep posix-pause
 
     ;; posix_spawn fast path
-    posix-spawnp posix-spawnp/pipe)
+    posix-spawnp posix-spawnp/pipe
+
+    ;; Settable post-acquire failure hook + release observer (resource-lifetime
+    ;; proof only)
+    spawn-fault spawn-release-observer)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
           (hafod internal platform-constants))
@@ -244,6 +248,24 @@
 
   (define FILEACT-SIZE SIZEOF-SPAWN-FA)
 
+  ;; A settable post-acquire failure hook, read live by posix-spawnp* on its
+  ;; failure branch. When it holds a truthy value the wrapper forces that branch:
+  ;; it skips the real spawn, runs its inline release, and raises -- so a test can
+  ;; drive the failure-path unwind (the inline release followed by the guard
+  ;; handler's release) without engineering a real spawn failure, whose return
+  ;; convention is platform-dependent. The default #f leaves the real spawn
+  ;; behaviour byte-for-byte unchanged.
+  (define spawn-fault (make-parameter #f))
+
+  ;; A release observer, run once each time posix-spawnp*'s latched release
+  ;; actually performs its frees. A genuine double-free is silently survivable on
+  ;; some allocators and aborts on others, so a subprocess exit code alone cannot
+  ;; portably distinguish one real free from two. This makes the count observable:
+  ;; with the idempotency latch the release runs its frees once, so the observer
+  ;; fires once; without it, twice. Default #f is a no-op, so the real spawn path
+  ;; is unchanged.
+  (define spawn-release-observer (make-parameter #f))
+
   ;; posix-spawnp: spawn a process without fork().
   ;; program: string, argv: list of strings.
   ;; Optional: file-actions (list of actions or #f), env-list (list of "K=V" strings or #f).
@@ -279,6 +301,10 @@
         (define (release!)
           (unless released?
             (set! released? #t)
+            ;; Observe a real release (the frees below run exactly once per pass
+            ;; of this gate); default observer is #f, so this is a no-op in
+            ;; ordinary use.
+            (let ([obs (spawn-release-observer)]) (when obs (obs)))
             (when fa-live? (c-spawn-fa-destroy fa))
             (when actions (foreign-free fa))
             (free-c-argv c-argv nargv)
@@ -295,7 +321,12 @@
                           [(open)  (c-spawn-fa-addopen fa (cadr act) (caddr act)
                                      (cadddr act) (car (cddddr act)))]))
                       actions))
-          (let ([rc (c-posix-spawnp pid-buf program fa 0 c-argv c-envp)])
+          ;; spawn-fault forces the failure branch post-acquisition (skipping the
+          ;; real spawn) so the inline release + guard-handler release path is
+          ;; exercised on demand; #f keeps the real call and behaviour unchanged.
+          (let ([rc (if (spawn-fault)
+                        1
+                        (c-posix-spawnp pid-buf program fa 0 c-argv c-envp))])
             (if (zero? rc)
                 ;; Read the pid out before the buffer holding it is released.
                 (let ([pid (foreign-ref 'int pid-buf 0)])

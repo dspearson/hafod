@@ -22,6 +22,9 @@
     open-string-source with-stdio-ports* stdports->stdio
     <<-port-holder <<-port-holder-set!
 
+    ;; Settable post-open fault hook + routed read-port close (resource-lifetime proof only)
+    open-string-post-open-fault open-string-read-close
+
     ;; Collector macros
     run/port run/string run/strings run/sexp run/sexps
     run/port+proc run/collecting run/file)
@@ -57,30 +60,50 @@
                (unless (= (posix-errno e) 2) (raise e))])  ; ENOENT=2 -> already gone
       (posix-unlink path)))
 
+  ;; A settable post-open fault hook, read live by open-string-source immediately
+  ;; after the read port is opened and before the temp path is unlinked.  When it
+  ;; holds a thunk the helper calls it, forcing a raise in that post-open window so
+  ;; the descriptor unwind can be driven without engineering a real unlink failure.
+  ;; The default #f leaves the behaviour byte-for-byte unchanged.
+  (define open-string-post-open-fault (make-parameter #f))
+
+  ;; A routed read-port close.  open-string-source releases its staged read port by
+  ;; calling ((open-string-read-close) inp), so the close and any observation of it
+  ;; are the same call and cannot drift apart.  The default IS the real close, so
+  ;; production behaviour is unchanged; overriding it counts the close.
+  (define open-string-read-close (make-parameter (lambda (p) (close p))))
+
   (define (open-string-source obj)
     (receive (path fd) (posix-mkstemp (string-append
                                         (or (getenv "TMPDIR") "/tmp")
                                         "/hafod-heredoc-XXXXXX"))
       ;; Stage the cleanup of the window between mkstemp and the successful
-      ;; return, exactly as temp-file-channel does: if display, the close, or the
-      ;; reopen raises, release the descriptor's current owner -- the raw fd
-      ;; before the port wraps it, otherwise the port (closing the raw fd as well
-      ;; would double-close a port-owned descriptor) -- and unlink the temp path,
-      ;; then re-raise.  The success path is unchanged.
-      (let ([outp #f])
+      ;; return, exactly as temp-file-channel does.  On any raise, release every
+      ;; descriptor still held: the read port first (routed through the close seam
+      ;; so the release is observable), then the writer's current owner while it is
+      ;; live -- the raw fd before the port wraps it, otherwise the port -- skipped
+      ;; once the writer is closed mid-body so it is never double-closed.  Then
+      ;; unlink the temp path and re-raise.  The success path is unchanged.
+      (let ([outp #f] [inp #f] [writer-done? #f])
         (guard (e [#t
-                   (if outp
-                       (guard (inner [#t #f]) (close outp))
-                       (guard (inner [#t #f]) (posix-close fd)))
+                   (when inp (guard (inner [#t #f]) ((open-string-read-close) inp)))
+                   (unless writer-done?
+                     (if outp
+                         (guard (inner [#t #f]) (close outp))
+                         (guard (inner [#t #f]) (posix-close fd))))
                    (unlink-temp-file path)
                    (raise e)])
           (set! outp (fdes->outport fd))
           (display obj outp)
           (close outp)
+          (set! writer-done? #t)
           ;; Reopen for reading, then unlink (fd keeps data alive)
-          (let ([inp (open-file path open/read)])
-            (posix-unlink path)
-            inp)))))
+          (set! inp (open-file path open/read))
+          ;; Force a raise in the post-open window on demand; #f by default,
+          ;; so ordinary behaviour is unchanged.
+          (let ([fault (open-string-post-open-fault)]) (when fault (fault)))
+          (posix-unlink path)
+          inp))))
 
   ;; with-stdio-ports* is imported from (hafod fd-ports)
 

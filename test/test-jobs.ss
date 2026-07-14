@@ -5,7 +5,7 @@
 ;;; resume regression fails deterministically instead of hanging the run.
 
 (library-directories '(("src" . "src") ("." . ".")))
-(import (test runner) (hafod shell jobs) (hafod procobj) (hafod posix)
+(import (test runner) (test poll) (hafod shell jobs) (hafod procobj) (hafod posix)
         (hafod signal) (chezscheme))
 
 (test-begin "jobs")
@@ -32,21 +32,6 @@
             (posix-kill wpid SIGKILL)
             (posix-waitpid wpid 0)
             result)))))
-
-;; Call (step) then test (ready?) repeatedly until ready? holds or MS milliseconds
-;; of wall-clock elapse; return #t once observed ready, #f on timeout. Bounding by
-;; real time rather than a fixed iteration count is what makes the stopped-child
-;; cases deterministic: a freshly forked child needs a scheduler slice to run its
-;; self-SIGSTOP, but a tight 200-iteration spin of a bare waitpid can burn every
-;; iteration in microseconds — before the stop is even deliverable — and give up
-;; before it is ever observable. real-time (Chez, milliseconds) bounds the wait by
-;; the wall clock; each step's waitpid syscall is itself a scheduler yield point.
-(define (poll-until ms step ready?)
-  (let ([deadline (+ (real-time) ms)])
-    (let loop ()
-      (cond [(ready?) #t]
-            [(>= (real-time) deadline) #f]
-            [else (step) (loop)]))))
 
 ;; Is NEEDLE a substring of HAYSTACK? (mirrors the test-signal.ss helper.)
 (define (substring? needle haystack)
@@ -84,9 +69,21 @@
             (begin
               (drain-notifications!)
               (job-bg! "self-stopper" (new-child-proc child))
-              (poll-until 5000 update-jobs! (lambda () (notes-contain? "Stopped")))
-              ;; fg must return an integer status; a hang trips the watchdog.
-              (integer? (job-fg! ""))))))))
+              ;; The poll's verdict is part of the assertion, not a preamble to it.
+              ;; Discarded, a timed-out poll is indistinguishable from an observed
+              ;; stop: control reaches fg either way, and the case is then decided
+              ;; by whatever the never-observed child happened to be doing.
+              (if (poll-until 5000 update-jobs!
+                              (lambda () (notes-contain? "Stopped")))
+                  ;; fg must return an integer status; a hang trips the watchdog.
+                  (integer? (job-fg! ""))
+                  ;; Timed out. fg does not run, so nothing reaps the child: kill it
+                  ;; here (SIGKILL is delivered to a stopped process) rather than
+                  ;; leave a stopped orphan behind the failing case.
+                  (begin
+                    (posix-kill child SIGKILL)
+                    (posix-waitpid child 0)
+                    #f))))))))
 
 ;; =============================================================================
 ;; No false re-stop after a bg resume (Pitfall 2)
@@ -107,15 +104,20 @@
             (begin
               (drain-notifications!)
               (job-bg! "sleeper" (new-child-proc child))
-              (poll-until 5000 update-jobs! (lambda () (notes-contain? "Stopped")))
-              (job-bg-resume! "")                    ; SIGCONT + clear the flag
-              (drain-notifications!)                 ; discard the first stop report
-              (update-jobs!)
-              (update-jobs!)
-              (let ([saw-stop (notes-contain? "Stopped")])
-                (posix-kill child SIGKILL)           ; cleanup — child was sleeping
-                (posix-waitpid child 0)
-                (not saw-stop))))))))
+              ;; The poll's verdict is part of the assertion. A timed-out poll means
+              ;; the first stop was never observed, and "not falsely re-reported as
+              ;; stopped" is then vacuously true of a job that was never stopped in
+              ;; the first place — a pass with its whole subject missing.
+              (let ([saw-stop (poll-until 5000 update-jobs!
+                                          (lambda () (notes-contain? "Stopped")))])
+                (job-bg-resume! "")                  ; SIGCONT + clear the flag
+                (drain-notifications!)               ; discard the first stop report
+                (update-jobs!)
+                (update-jobs!)
+                (let ([saw-restop (notes-contain? "Stopped")])
+                  (posix-kill child SIGKILL)         ; cleanup — child was sleeping
+                  (posix-waitpid child 0)
+                  (and saw-stop (not saw-restop))))))))))
 
 ;; =============================================================================
 ;; Proc-level reinforcement: the reaped stop is recorded, not discarded
@@ -133,13 +135,18 @@
               (posix-kill (posix-getpid) SIGSTOP)
               (posix-_exit 0))
             (let ([p (new-child-proc child)])
-              (poll-until 5000 reap-zombies (lambda () (proc:stopped? p)))
-              (let ([ok (and (proc:stopped? p)
-                             (not (proc:finished? p))
-                             (= SIGSTOP (status:stop-sig (proc:status p))))])
-                (posix-kill child SIGKILL)
-                (posix-waitpid child 0)
-                ok)))))))
+              ;; The poll's verdict is part of the assertion: it is the difference
+              ;; between "reap-zombies recorded the stop" and "reap-zombies was
+              ;; never given a stop to record".
+              (let ([saw-stop (poll-until 5000 reap-zombies
+                                          (lambda () (proc:stopped? p)))])
+                (let ([ok (and saw-stop
+                               (proc:stopped? p)
+                               (not (proc:finished? p))
+                               (= SIGSTOP (status:stop-sig (proc:status p))))])
+                  (posix-kill child SIGKILL)
+                  (posix-waitpid child 0)
+                  ok))))))))
 
 ;; =============================================================================
 ;; A job re-stopped while foregrounded stays alive, not finished
@@ -165,21 +172,32 @@
             (let ([p (new-child-proc child)])
               (drain-notifications!)
               (job-bg! "re-stopper" p)
-              ;; Bounded-poll until the first stop is detected.
-              (let poll ([n 0] [seen #f])
-                (cond [seen #t]
-                      [(> n 200) #f]
-                      [else (update-jobs!)
-                            (poll (+ n 1) (notes-contain? "Stopped"))]))
-              ;; fg resumes it; the child self-stops again and fg's blocking wait
-              ;; returns that second stop. fg reports Stopped and returns a status.
-              (let ([rc (job-fg! "")])
-                (let ([ok (and (integer? rc)
-                               (proc:stopped? p)          ; recorded stopped-alive
-                               (not (proc:finished? p)))]) ; not finished-while-alive
-                  ;; Cleanup: the child is stopped-but-alive.
-                  (posix-kill child SIGKILL)
-                  (posix-waitpid child 0)
-                  ok))))))))
+              ;; Bounded-poll until the first stop is detected — by the wall clock,
+              ;; not by an iteration count. A counted bound is not merely untidy
+              ;; here, it is silently fatal to this case: 201 spins of update-jobs!
+              ;; complete in under a millisecond, long before the freshly forked
+              ;; child has had a slice in which to run its self-SIGSTOP, so the poll
+              ;; gives up having observed nothing and fg then SIGCONTs a child that
+              ;; has not stopped. That SIGCONT is a no-op; the child goes on to its
+              ;; FIRST self-stop, fg's blocking wait returns that, and every
+              ;; assertion below is satisfied without the re-stop this case exists to
+              ;; exercise ever having happened.
+              ;;
+              ;; Which is why the poll's verdict is threaded into ok rather than
+              ;; discarded: it is what makes that failure visible. A timed-out poll
+              ;; fails the case here instead of handing it to fg to pass by accident.
+              (let ([saw-stop (poll-until 5000 update-jobs!
+                                          (lambda () (notes-contain? "Stopped")))])
+                ;; fg resumes it; the child self-stops again and fg's blocking wait
+                ;; returns that second stop. fg reports Stopped and returns a status.
+                (let ([rc (job-fg! "")])
+                  (let ([ok (and saw-stop                    ; the FIRST stop was seen
+                                 (integer? rc)
+                                 (proc:stopped? p)           ; recorded stopped-alive
+                                 (not (proc:finished? p)))]) ; not finished-while-alive
+                    ;; Cleanup: the child is stopped-but-alive.
+                    (posix-kill child SIGKILL)
+                    (posix-waitpid child 0)
+                    ok)))))))))
 
 (test-end)

@@ -13,15 +13,26 @@
 ;; (libs-visible? = #t) is REQUIRED and load-bearing: bin/hafod.sps reaches (hafod)
 ;; at run time through the `environment` procedure via
 ;;   (eval '(import (hafod)) (interaction-environment))
-;; With #f (the default) that import would load a SECOND (hafod) from src/hafod.so
-;; (still on the wrapper's --libdirs src), yielding two compilation instances and the
-;; "different compilation instance" launch crash. With #t the merged (hafod) stays
-;; visible so the runtime import reuses the already-inlined instance.
+;; With #f (the default) the merge inlines the libraries but leaves them INVISIBLE
+;; to that import, and the launch dies flatly:
+;;   Exception: attempt to import invisible library (hafod config)
+;; Chez refuses the import outright; it never gets as far as loading a second copy
+;; from src/. With #t the merged (hafod) stays visible, so the runtime import
+;; reuses the already-inlined instance.
+;;
+;; Note where the failure is NOT: --version never reaches the runtime import, so it
+;; runs perfectly happily on a #f image. Only -c, -s and the REPL touch it. A smoke
+;; test that just asks for the version would call this build good.
 (let ([left (compile-whole-program "bin/hafod.wpo" "bin/hafod.so" #t)])
   ;; `left` is the list of libraries still to be loaded at run time. A genuinely
   ;; merged launcher must leave no (hafod ...) library behind (its code is now
   ;; inlined). Boot/system libraries baked into petite.boot/scheme.boot may
   ;; legitimately remain and are reported for information only.
+  ;;
+  ;; This checks that nothing was left OUT of the image -- and only that. It is not
+  ;; a proxy for a correct merge: compile-whole-program returns () for the #f build
+  ;; above too, right before that build fails to launch. Visibility is a separate
+  ;; property, and this value cannot see it.
   (let ([hafod-left (filter (lambda (lib) (and (pair? lib) (eq? (car lib) 'hafod)))
                             left)])
     (unless (null? left)

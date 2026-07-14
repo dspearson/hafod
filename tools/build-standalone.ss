@@ -154,6 +154,24 @@
 
 (printf "Topological order: ~a libraries~n" (length sorted-names))
 
+;; Every discovered library must reach the boot image. A boot image built from a
+;; SUBSET is this build's worst failure mode and its quietest: the binary still
+;; links, still starts, still runs -- and simply does not have the missing
+;; libraries, which a user meets much later as "library (hafod srfi-9) not found".
+;; The shipped binary carries no compiler and no source tree, so whatever the boot
+;; image lacks is gone for good; there is nowhere to load it from. Fail here, where
+;; the count is still in hand.
+(let ([dropped (filter (lambda (name) (not (hashtable-ref name->file name #f)))
+                       sorted-names)])
+  (unless (null? dropped)
+    (errorf 'build-standalone
+            "~a discovered libraries have no source file: ~a"
+            (length dropped) dropped)))
+(unless (= (length sorted-files) (length all-files))
+  (errorf 'build-standalone
+          "the sort lost libraries: ~a discovered, ~a to be baked in"
+          (length all-files) (length sorted-files)))
+
 ;; ======================================================================
 ;; Step 1: Find Chez lib directory
 ;; ======================================================================
@@ -177,6 +195,114 @@
     dir))
 
 (printf "Chez lib dir: ~a~n" chez-lib-dir)
+
+;; ======================================================================
+;; The library-mode launcher's artefacts are off limits
+;; ======================================================================
+;;
+;; bin/hafod.so is the OTHER launcher: a whole-program merge produced by
+;; tools/compile-launcher.ss, and a real Make target whose prerequisites are the
+;; library sources. src/**/*.so and src/**/*.wpo are the library objects that
+;; launcher loads at run time. This build must not write any of them.
+;;
+;; Neither rule is a tidiness preference. Both are a crash, and a permanent one:
+;;
+;;   * The program compiled below is compiled against the compilation instances
+;;     make-boot-file creates in THIS process, from source. The launcher path loads
+;;     src/**/*.so, which compile-all.ss built in a DIFFERENT process. Leave this
+;;     program at bin/hafod.so and every launch of the launcher -- including
+;;     --version -- dies with "loading src/hafod/tty.ss yielded a different
+;;     compilation instance of (hafod tty) from that required by compiled program".
+;;   * And make would never repair it. The file it finds there is newer than every
+;;     prerequisite, so bin/hafod.so counts as up to date and is never re-merged.
+;;     The tree stays broken until somebody deletes the file by hand.
+;;
+;; So refuse the path before compiling anything, and then prove the artefacts were
+;; not touched. The path check is the one that reads; the fingerprint check is the
+;; one that cannot be got round by accident, because it asserts on the files
+;; themselves rather than on the name this script happens to hand compile-program.
+
+(define launcher-so "bin/hafod.so")
+
+;; Walk `dir` for files with any of `suffixes`, descending into REAL directories
+;; only. Chez's file-directory? follows symlinks, so a symlinked directory would be
+;; walked like any other -- and one that reaches its own ancestor would be walked
+;; again at every level, until the kernel's symlink limit finally refused the path.
+;; That is bounded, so it is not a hang; it is just wrong. The list would hold each
+;; real object forty-odd times over, under aliased paths naming nothing anyone could
+;; act on, and every one of them would be stat'd on both passes.
+;;
+;; Nor is it hypothetical: the CI job stages the library tree for the native binary
+;; with an `ln -sf src src`, which lands a link inside src/. That one is harmless
+;; only by accident -- it resolves to itself, so stat refuses it at the first step --
+;; and the walk should not be relying on the luck of how circular a link happens to
+;; be. Fingerprint each real object once.
+(define (find-files dir suffixes)
+  (let ([found '()])
+    (define (walk d)
+      (for-each
+        (lambda (entry)
+          (let ([path (format "~a/~a" d entry)])
+            (cond
+              [(file-symbolic-link? path)]        ; never descend, never fingerprint
+              [(file-directory? path) (walk path)]
+              [(exists (lambda (sfx) (string-suffix? sfx entry)) suffixes)
+               (set! found (cons path found))])))
+        (directory-list d)))
+    (when (file-directory? dir) (walk dir))
+    found))
+
+;; The launcher image, plus every library object it loads at run time.
+(define protected-files
+  (cons launcher-so (find-files "src" '(".so" ".wpo"))))
+
+;; (path size mtime-seconds mtime-nanoseconds), or (path #f) when absent. Any
+;; write changes at least one of these, whatever route the write took -- a
+;; compile-program aimed at the wrong path, a compile-imported-libraries that
+;; decided to rebuild a library, a stray generate-wpo-files. The check does not
+;; care which; only that the launcher's artefacts are as this build found them.
+(define (fingerprint path)
+  (if (file-exists? path)
+      (let ([t (file-modification-time path)]
+            [size (let ([p (open-file-input-port path)])
+                    (let ([n (port-length p)]) (close-port p) n))])
+        (list path size (time-second t) (time-nanosecond t)))
+      (list path #f)))
+
+(define protected-before (map fingerprint protected-files))
+
+;; `stage` names the step that was running, for the message. It must not be called
+;; `when`: that would shadow the `when` syntax for the whole body below, turning
+;; (when (file-exists? path) (delete-file path)) into an attempt to APPLY the
+;; string -- which evaluates its arguments (deleting the file) and only then fails,
+;; with "attempt to apply non-procedure" in place of the diagnosis.
+(define (assert-launcher-untouched! stage)
+  (let ([changed (filter (lambda (before)
+                           (not (equal? before (fingerprint (car before)))))
+                         protected-before)])
+    (unless (null? changed)
+      ;; Delete what we damaged, THEN fail. This is the whole point of the guard:
+      ;; a clobbered bin/hafod.so is newer than every one of its prerequisites, so
+      ;; make would count it up to date and never rebuild it -- the tree would stay
+      ;; broken across every later build, on every launch, until somebody thought
+      ;; to remove the file by hand. Removing it here turns a permanent brick into
+      ;; an ordinary failed build that the next `make` repairs.
+      (for-each (lambda (before)
+                  (let ([path (car before)])
+                    (when (file-exists? path) (delete-file path))))
+                changed)
+      (errorf 'build-standalone
+              (string-append
+                "this build wrote the library-mode launcher's artefacts while ~a: ~a.~n"
+                "  bin/hafod.so belongs to tools/compile-launcher.ss, and src/**/*.so"
+                " are the objects it loads at run time.~n"
+                "  A program compiled here carries THIS process's compilation"
+                " instances; the launcher loads a different set, so it would crash on"
+                " every launch, --version included.~n"
+                "  The damaged files have been deleted so the next `make` rebuilds"
+                " them; had they been left in place, being newer than their"
+                " prerequisites, make would never have done so.")
+              stage (map car changed)))))
 
 ;; ======================================================================
 ;; Step 2: Build hafod.boot with all libraries baked in
@@ -224,14 +350,32 @@
 (generate-wpo-files #t)
 (compile-imported-libraries #t)
 (library-directories '(("src" . "src")))
-;; Compile to our own build directory, NOT to bin/hafod.so. The standalone binary
-;; embeds this program alongside an embedded boot image of the libraries, so it does
-;; not want the whole-program merge that tools/compile-launcher.ss applies to the
-;; library-mode launcher. Writing to bin/hafod.so here would overwrite that merged
-;; image with an unmerged one -- and, being newer than its prerequisites, make would
-;; then consider it up to date and never re-merge it.
+
+;; Compile to our own build directory, NEVER to bin/hafod.so. The standalone
+;; embeds this program alongside a boot image that already holds every library, so
+;; it does not want -- and cannot use -- the whole-program merge that
+;; tools/compile-launcher.ss applies to the library-mode launcher. See the
+;; artefact guard above for what writing to bin/hafod.so would cost.
 (define standalone-program-so (format "~a/hafod-program.so" build-dir))
+
+;; Refuse the path itself, before compiling anything. An editor who redirects this
+;; output at the launcher gets a build failure naming the reason, not a tree that
+;; crashes on every launch and that make will never repair.
+(when (string=? standalone-program-so launcher-so)
+  (errorf 'build-standalone
+          (string-append
+            "refusing to compile the standalone's program to ~a: that file is the"
+            " library-mode launcher's merged image, built by"
+            " tools/compile-launcher.ss from a different set of compilation"
+            " instances. Compile to ~a/ instead.")
+          launcher-so build-dir))
+
 (compile-program "bin/hafod.sps" standalone-program-so)
+
+;; ...and prove it. The path check above only constrains the name this script
+;; passes; this constrains the filesystem, so it also catches a library quietly
+;; recompiled under src/ by the compile-imported-libraries setting above.
+(assert-launcher-untouched! "compiling the program")
 
 ;; ======================================================================
 ;; Step 4: Generate C byte arrays

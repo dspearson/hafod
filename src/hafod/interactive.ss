@@ -17,6 +17,12 @@
     terminal-width
     query-terminal-width
     query-terminal-size
+    ;; The single resize step and its handler installer.  Leaf-only exports --
+    ;; deliberately NOT re-exported from the (hafod) umbrella; a test reaches
+    ;; them via (only (hafod interactive) ...) so it can drive the REPL's OWN
+    ;; resize path rather than a copy of it.
+    refresh-terminal-width!
+    install-resize-handler!
     repl-continuation-prompt
     ansi-visible-length
     background-job-count
@@ -37,6 +43,7 @@
           (only (hafod editor editor) read-expression with-raw-mode
                 editor-history-entries editor-history-set-last-mode!)
           (only (hafod tty) tty? terminal-size refresh-terminal-size-cache!
+                cached-terminal-size
                 reassert-cooked-tty! install-terminal-guard!)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod editor render) tokenize display-colourised)
@@ -174,7 +181,21 @@
         v)))
 
   ;; Query the terminal column count, falling back to 80 off a terminal.
-  ;; Delegates to the shared tty helper.
+  ;; A LIVE query, on every call: this is public API, and what it owes its caller
+  ;; is the width of the terminal NOW, not the width of the terminal once.
+  ;;
+  ;; Deliberately NOT answered from the width cache below.  A script may call this
+  ;; far from any REPL -- `hafod -s`, `hafod -c` and a shebang script all load
+  ;; their source and exit without ever entering interactive-repl -- and in such a
+  ;; process nothing installs the SIGWINCH handler and nothing takes an editor
+  ;; entry, which are the only things that ever refresh that cache.  A cached
+  ;; answer would therefore have no refresher at all on that path: the caller
+  ;; would be frozen at the first width it ever saw, for the life of the process,
+  ;; while the user resized the window around it.
+  ;;
+  ;; The cache is for the per-render hot path, which refreshes it on every resize
+  ;; and can therefore trust it.  A caller who cannot make that promise asks the
+  ;; kernel: one ioctl is the price of an answer that is still true.
   (define (query-terminal-width)
     (let-values ([(rows cols) (terminal-size)]) cols))
 
@@ -182,6 +203,35 @@
   ;; off a terminal. Delegates to the shared tty helper.
   (define (query-terminal-size)
     (terminal-size))
+
+  ;; The single resize step, shared by REPL entry and the SIGWINCH handler.
+  ;; ONE live query fills the cache, and the width parameter is then republished
+  ;; from the cache THAT LINE HAS JUST FILLED -- so a resize asks the kernel once
+  ;; and both consumers, the cache and the parameter, are fed from that single
+  ;; answer instead of each paying for a query of its own.
+  ;;
+  ;; Republishing through query-terminal-width would ask a SECOND time, about a
+  ;; window this procedure has just measured -- and the two answers need not even
+  ;; agree, since a resize can land between them.  The answer is already in hand;
+  ;; read it back.
+  ;;
+  ;; The order is load-bearing.  Swap these two lines and the width is read
+  ;; before the refresh runs, so the parameter is republished with the PREVIOUS
+  ;; size -- and stays wrong on every render until the next resize.  It would
+  ;; fail silently, which is why the two lines are adjacent and why a test plants
+  ;; a distinct pre-resize width and cache to catch exactly that inversion.
+  (define (refresh-terminal-width!)
+    (refresh-terminal-size-cache!)
+    (let-values ([(rows cols) (cached-terminal-size)])
+      (terminal-width cols)))
+
+  ;; Install the SIGWINCH handler that reruns the resize step, returning the
+  ;; disposition that was live before it (set-signal-handler! already yields it).
+  ;; Recording it through the disposition registry keeps this handler recoverable
+  ;; as the prior one, so a scoped swap (such as the fuzzy finder's own resize
+  ;; handling) can restore it on exit instead of clobbering it.
+  (define (install-resize-handler!)
+    (set-signal-handler! SIGWINCH (lambda (sig) (refresh-terminal-width!))))
 
   ;; === Colourised output ===
 
@@ -439,12 +489,10 @@
       (dynamic-wind
         (lambda () (void))
         (lambda ()
-          ;; Initialize terminal width
-          (terminal-width (query-terminal-width))
-          ;; Seed the leaf terminal-size cache once at entry, so the editor's
-          ;; first render reads the true width from the cache rather than the
-          ;; stale 24x80 default.
-          (refresh-terminal-size-cache!)
+          ;; Seed the width cache and the width parameter at entry from ONE live
+          ;; query, so the editor's first render reads the true width rather than
+          ;; the stale 24x80 default.
+          (refresh-terminal-width!)
 
           ;; Initialize PATH cache for shell-mode classification
           (rebuild-path-cache!)
@@ -457,18 +505,10 @@
           ;; dynamic-wind cannot see.
           (install-terminal-guard!)
 
-          ;; Register the SIGWINCH handler that updates terminal-width on a
-          ;; resize.  Recording it through the disposition registry keeps it
-          ;; recoverable as the prior handler, so a scoped swap (such as the
-          ;; fuzzy finder's own resize handling) can restore it on exit instead
-          ;; of clobbering it.
-          (set-signal-handler! SIGWINCH
-            (lambda (sig)
-              (terminal-width (query-terminal-width))
-              ;; Refresh the leaf width cache on the same resize event, so the
-              ;; editor's per-render column/row reads track the new size
-              ;; without paying a live ioctl on every render.
-              (refresh-terminal-size-cache!)))
+          ;; Register the SIGWINCH handler that reruns the resize step, so both
+          ;; the width parameter and the leaf width cache track the new size --
+          ;; from a single kernel query, not one apiece.
+          (install-resize-handler!)
 
           ;; Main REPL loop with call/cc restart pattern
           ;; Determine at startup whether stdin is a terminal (editor vs bare read).

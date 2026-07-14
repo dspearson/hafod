@@ -28,6 +28,25 @@
 # installed chez-version.ss to an impossible triple, so the guard fires no
 # matter which single Chez is present -- it never needs a second interpreter.
 #
+# `make install` lands one of three launchers, and the obligation under a version
+# skew is not the same for all three, so this test asks make which one it installed
+# (print-installed-launcher, the same variable install itself selects from) rather
+# than assuming:
+#
+#   * The bin/hafod shell wrapper and bin/hafod-native both run Chez fasls out of
+#     $LIBDIR -- hafod.so and the library objects under src/ -- which were built by
+#     the recorded Chez. A skew between that record and the Chez that will run them
+#     is a raw "incompatible fasl-object" crash, so they must GUARD it: name the
+#     required version, say how to fix it, and exit non-zero.
+#   * bin/hafod-standalone carries its own kernel, boot images and program, and
+#     reads no fasl from $LIBDIR at all. No skew can reach it, so it must be IMMUNE:
+#     the same corruption must leave it launching cleanly, with nothing to remediate.
+#
+# Asserting a guard fires on the standalone would be asserting a lie, and skipping
+# the section for a C launcher would leave the case that actually ships untested --
+# `make all` builds bin/hafod-native, so the C install is the DEFAULT one. Both
+# branches carry the same four assertions.
+#
 # Copyright (c) 2026 Dominic Pearson.
 
 set -e
@@ -108,6 +127,11 @@ section "Install into a throwaway prefix"
 # DESTDIR: the wrapper bakes in the final paths, so it must run from PREFIX.
 make install PREFIX="$PREFIX" </dev/null
 
+# Which launcher did install actually land? Ask the Makefile -- do not re-derive
+# the preference order here (see the header).
+LAUNCHER="$(make -s print-installed-launcher </dev/null)"
+printf "  installed launcher: %s\n" "$LAUNCHER"
+
 if [ -x "$HAFOD" ]; then
     pass "installed launcher exists and is executable"
 else
@@ -136,26 +160,42 @@ refute_contains "installed launch is not a raw fasl-object error" \
     "incompatible fasl-object" "$out"
 refute_contains "installed happy path emits no remediation" "nix develop" "$out"
 
-section "Installed mismatch: friendly remediation, non-zero exit"
+section "Installed version skew: explained, or impossible"
 
 # Single-Chez safe: rewrite the recorded triple in the INSTALLED source to an
-# impossible value so the guard sees recorded != running whatever Chez runs.
-# G1 fires before the dispatch loads hafod.so, so the rewritten mtime never
-# reaches the recompile path -- the wrapper exits with the friendly message.
+# impossible value so a guard sees recorded != running whatever Chez runs. The
+# guard fires before the dispatch loads hafod.so, so the rewritten mtime never
+# reaches the recompile path -- the launcher exits with the friendly message.
 sed "s/build-chez-version-number '([0-9 ]*)/build-chez-version-number '(0 0 0)/" \
     "$INSTALLED_SS" > "$INSTALLED_SS.tmp"
 mv "$INSTALLED_SS.tmp" "$INSTALLED_SS"
 
 set +e
+out=$("$HAFOD" --version </dev/null 2>/dev/null)
 err=$("$HAFOD" --version </dev/null 2>&1 >/dev/null)
 code=$?
 set -e
 
-assert_contains "installed mismatch names the required version" "0.0.0 required" "$err"
-assert_contains "installed mismatch suggests nix develop" "nix develop" "$err"
-refute_contains "installed mismatch is not a raw fasl-object error" \
-    "incompatible fasl-object" "$err"
-assert_nonzero "installed mismatch exits non-zero" "$code"
+if [ "$LAUNCHER" = "bin/hafod-standalone" ]; then
+    # It embeds its kernel, its boot images and its program, and reads nothing
+    # from $LIBDIR. The corruption above cannot reach it, and it must simply run.
+    assert_eq "installed self-contained image shrugs off the recorded version" \
+        "0" "$code"
+    assert_contains "installed self-contained image still prints the hafod version" \
+        "hafod" "$out"
+    refute_contains "installed self-contained image is not a raw fasl-object error" \
+        "incompatible fasl-object" "$err"
+    refute_contains "installed self-contained image has nothing to remediate" \
+        "nix develop" "$err"
+else
+    # It loads hafod.so and the library objects under $LIBDIR/src, all built by the
+    # recorded Chez. It must refuse to load them under another one, and say why.
+    assert_contains "installed mismatch names the required version" "0.0.0 required" "$err"
+    assert_contains "installed mismatch suggests nix develop" "nix develop" "$err"
+    refute_contains "installed mismatch is not a raw fasl-object error" \
+        "incompatible fasl-object" "$err"
+    assert_nonzero "installed mismatch exits non-zero" "$code"
+fi
 
 printf "\n=== Summary ===\n"
 printf "%d passed, %d failed (out of %d)\n" "$PASS" "$FAIL" "$TOTAL"

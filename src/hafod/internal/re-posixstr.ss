@@ -4,7 +4,8 @@
 ;;; Original scsh code: Copyright (c) 1997, 1998 Olin Shivers.
 
 (library (hafod internal re-posixstr)
-  (export regexp->posix-string simplify-regexp)
+  (export regexp->posix-string simplify-regexp
+          re-line-aware? re-has-string-anchor?)
   (import (hafod internal base)
           (hafod compat)
           (hafod internal re-records))
@@ -15,6 +16,45 @@
   ;; ======================================================================
   ;; Identity for now -- the smart constructors already produce canonical forms.
   (define (simplify-regexp re) re)
+
+
+  ;; ======================================================================
+  ;; Line-awareness pre-pass
+  ;; ======================================================================
+  ;; A pattern is "line-aware" only when it contains a bol/eol node.  That is the
+  ;; single trigger for line semantics: when line-aware, the emission below and
+  ;; the engine's REG_NEWLINE choke point switch on; otherwise every token is
+  ;; emitted byte-for-byte as it was historically, so an anchor-free pattern and
+  ;; a bos/eos-only pattern compile identically to before.  A companion pass
+  ;; reports whether a string anchor (bos/eos) is present, which the engine needs
+  ;; to decide when a mixed pattern must fail loud on a libc without GNU anchors.
+
+  ;; True iff RE contains a beginning-of-line or end-of-line node anywhere.
+  (define (re-line-aware? re)
+    (or (re-bol? re) (re-eol? re)
+        (cond
+         ((re-seq? re)      (exists re-line-aware? (re-seq:elts re)))
+         ((re-choice? re)   (exists re-line-aware? (re-choice:elts re)))
+         ((re-repeat? re)   (re-line-aware? (re-repeat:body re)))
+         ((re-submatch? re) (re-line-aware? (re-submatch:body re)))
+         ((re-dsm? re)      (re-line-aware? (re-dsm:body re)))
+         (else #f))))
+
+  ;; True iff RE contains a beginning-of-string or end-of-string node anywhere.
+  (define (re-has-string-anchor? re)
+    (or (re-bos? re) (re-eos? re)
+        (cond
+         ((re-seq? re)      (exists re-has-string-anchor? (re-seq:elts re)))
+         ((re-choice? re)   (exists re-has-string-anchor? (re-choice:elts re)))
+         ((re-repeat? re)   (re-has-string-anchor? (re-repeat:body re)))
+         ((re-submatch? re) (re-has-string-anchor? (re-submatch:body re)))
+         ((re-dsm? re)      (re-has-string-anchor? (re-dsm:body re)))
+         (else #f))))
+
+  ;; Bound to #t while translating a line-aware pattern.  Defaults to #f so any
+  ;; direct call to a translate-* helper keeps the historic (string-anchor,
+  ;; newline-matching-dot) emission.
+  (define *line-aware?* (make-parameter #f))
 
 
   ;; ======================================================================
@@ -64,7 +104,12 @@
     (let ((re (simplify-regexp re)))
       (if (simple-empty-re? re)
           (values #f #f #f '#())
-          (translate-regexp re))))
+          ;; Detect line-awareness once, then translate the whole pattern under
+          ;; that decision.  The return arity is unchanged (str level pcount
+          ;; submatch-vector) -- line-awareness is an emission detail, not a
+          ;; fifth value.
+          (parameterize ((*line-aware?* (re-line-aware? re)))
+            (translate-regexp re)))))
 
   ;; Main dispatcher.
   (define (translate-regexp re)
@@ -78,13 +123,21 @@
 
      ((re-submatch? re) (translate-submatch re))
 
-     ((re-bos? re) (values "^" 1 0 '#()))
-     ((re-eos? re) (values "$" 1 0 '#()))
+     ;; bos/eos are STRING anchors.  In a line-aware pattern bare ^/$ become LINE
+     ;; anchors under REG_NEWLINE, so bos/eos instead emit glibc's GNU buffer
+     ;; anchors \` (buffer start) and \' (buffer end), which stay pinned to the
+     ;; string ends regardless of REG_NEWLINE.  Outside a line-aware pattern they
+     ;; keep the historic ^/$.
+     ((re-bos? re)
+      (values (if (*line-aware?*) (string #\\ #\`) "^") 1 0 '#()))
+     ((re-eos? re)
+      (values (if (*line-aware?*) (string #\\ #\') "$") 1 0 '#()))
 
-     ((re-bol? re) (error 'regexp->posix-string
-                          "Beginning-of-line not supported in this implementation."))
-     ((re-eol? re) (error 'regexp->posix-string
-                          "End-of-line not supported in this implementation."))
+     ;; bol/eol are LINE anchors: they emit bare ^/$, which the engine turns into
+     ;; line anchors by setting REG_NEWLINE for any line-aware pattern.  The
+     ;; historic build refused these; they are now real support.
+     ((re-bol? re) (values "^" 1 0 '#()))
+     ((re-eol? re) (values "$" 1 0 '#()))
 
      ((re-dsm? re)
       (let ((pre-dsm (re-dsm:pre-dsm re))
@@ -274,7 +327,14 @@
 
   (define (translate-char-set cset)
     (if (char-set-full? cset)
-        (values "." 1 0 '#())      ; Full set
+        ;; Full set is ".".  Under REG_NEWLINE "." stops matching newline, so a
+        ;; line-aware pattern emits the bare alternation ".|<newline>" -- a real
+        ;; 0x0A byte, not the two characters backslash-n -- to restore it.  The
+        ;; level-3 result lets the existing piece machinery add and account for
+        ;; the wrapping group; do not hand-roll the parenthesis.
+        (if (*line-aware?*)
+            (values (string #\. #\| #\newline) 3 0 '#())
+            (values "." 1 0 '#()))      ; Full set
         (let* ((cset (char-set-delete cset *nul*))
                (nchars (char-set-size cset)))
           (cond
@@ -283,15 +343,25 @@
            ((= 1 nchars)  ; Singleton
             (translate-string (string (car (char-set->list cset)))))
 
-           ;; General case: render as bracket expression
+           ;; General case: render as a bracket expression, choosing the shorter
+           ;; of the positive [...] and negated [^...] forms.
            (else
-            (let ((s- (render-bracket-expr cset #t))
-                  (s+ (render-bracket-expr
-                       (char-set-delete (char-set-complement cset) *nul*)
-                       #f)))
-              (values (if (< (string-length s-) (string-length s+))
-                          s- s+)
-                      1 0 '#())))))))
+            (let* ((s- (render-bracket-expr cset #t))
+                   (s+ (render-bracket-expr
+                        (char-set-delete (char-set-complement cset) *nul*)
+                        #f))
+                   ;; Keep the negated form on a tie, exactly as the historic
+                   ;; (if (< len- len+) s- s+) selection did.
+                   (use-neg? (not (< (string-length s-) (string-length s+)))))
+              ;; A negated [^...] class stops matching newline under REG_NEWLINE.
+              ;; When the pattern is line-aware AND this class is meant to match
+              ;; newline (the set contains it), re-add newline with a bare
+              ;; alternation at level 3 so the class keeps spanning it.  The
+              ;; positive form, and any negated class that already excludes
+              ;; newline (e.g. nonl = [^\n]), are left untouched.
+              (if (and use-neg? (*line-aware?*) (char-set-contains? cset #\newline))
+                  (values (string-append s+ "|" (string #\newline)) 3 0 '#())
+                  (values (if use-neg? s+ s-) 1 0 '#()))))))))
 
   ;; Render a char-set as a POSIX [...] or [^...] bracket expression.
   ;; in? = #t means [...], #f means [^...]

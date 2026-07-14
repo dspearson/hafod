@@ -15,20 +15,23 @@
 ;;;      bump the probe higher; an equal before/after number proves no fd (hence
 ;;;      no DIR*) leaked across the run.
 ;;;
-;;; This guards the SUCCESSFUL path.  The raise-mid-operation unwind is covered
-;;; structurally by each site's dynamic-wind after-thunk (closedir / globfree +
-;;; free / foreign-free) and, deterministically, by the forced-error temp-leak
-;;; proof in a companion suite.  A glob_t globfree omission is a heap leak this
-;;; fd probe cannot see -- closing that gap is the companion suite's job; here
-;;; the after-thunk is verifiable by reading the changed site.
+;;; Layers 1-2 guard the SUCCESSFUL path.  A third layer drives a real raise
+;;; through each unwind so the after-thunk is proven by a run, not argued from
+;;; shape -- each case goes RED if its after-thunk (the close / free) is deleted.
+;;; DIR* is fd-backed, so the lowest-free-fd canary observes it directly under a
+;;; readdir fault seam.  glob_t and winsize are pure foreign memory -- a heap
+;;; leak the fd canary cannot see (globfree / foreign-free release memory, not a
+;;; descriptor) -- so each of those is proven by a routed-free observer seam that
+;;; counts the after-thunk's free on the forced-raise unwind.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
-        (only (hafod tty) terminal-size)
+        (only (hafod tty) terminal-size winsize-fault winsize-release)
         (only (hafod fileinfo) directory-files)
         (only (hafod glob) maybe-directory-files)
-        (only (hafod internal posix-misc) posix-glob-fast)
+        (only (hafod internal posix-misc)
+              posix-glob-fast readdir-fault-after glob-fault glob-release)
         (only (hafod posix) posix-open posix-close O_RDONLY))
 
 (test-begin "ffi-leak")
@@ -102,5 +105,52 @@
   (repeat iterations (lambda () (let-values ([(r c) (terminal-size)]) #f)))
   (test-equal "terminal-size leaks no fd over 200 calls"
     before (probe-fd)))
+
+;; ======================================================================
+;; 3. forced-raise unwind proofs -- a real error enters each unwind, so the
+;;    after-thunk is proven by a run, not argued from shape.  Each case goes
+;;    RED if its after-thunk (the closedir / routed free) is deleted.
+;; ======================================================================
+
+;; DIR* -- fd-backed, so the fd canary is the observer.  readdir-fault-after N
+;; makes the (N+1)th posix-readdir raise, so directory-files fails mid-loop with
+;; its DIR* still open and the dynamic-wind after-thunk (posix-closedir) runs on
+;; the unwind.  Closed on every forced-raise unwind -> the low slot is handed
+;; back -> the probe is unchanged (GREEN).  Delete the closedir and the DIR* fd
+;; is held on each raise -> the probe climbs (RED).
+(let ([before (probe-fd)])
+  (parameterize ([readdir-fault-after 1])
+    (repeat iterations
+            (lambda () (guard (e [#t #f]) (directory-files probe-dir)))))
+  (test-equal "DIR* closed on every forced-raise readdir unwind (fd canary)"
+    before (probe-fd)))
+
+;; glob_t -- pure foreign memory, so the fd canary is BLIND to a heap leak here
+;; (a missing globfree/free leaks bytes with no ceiling: no EMFILE, no low slot
+;; held).  The proof is the routed-free observer.  glob-release is the
+;; after-thunk's SOLE free path; capture its default (the real c-globfree +
+;; foreign-free), wrap it to count the call AND perform the real free, force a
+;; post-acquire raise with glob-fault, and assert the count is exactly 1 -- freed
+;; once on the unwind.  Delete the after-thunk's routed release and the count is
+;; 0 (RED); the fd canary alone could never see that.
+(let ([n 0]
+      [real-free (glob-release)])
+  (parameterize ([glob-release (lambda (b) (set! n (+ n 1)) (real-free b))]
+                 [glob-fault (lambda () (error 'inject "forced glob unwind"))])
+    (guard (e [#t #f]) (posix-glob-fast probe-pat)))
+  (test-equal "glob_t freed exactly once on the forced-raise unwind (observer)"
+    1 n))
+
+;; winsize -- also pure foreign memory, invisible to the fd canary.  Same shape:
+;; winsize-release is the after-thunk's SOLE free path; wrap its default to count
+;; and free, force a raise with winsize-fault, assert exactly 1 free on the
+;; unwind.  Delete the after-thunk's routed release and the count is 0 (RED).
+(let ([n 0]
+      [real-free (winsize-release)])
+  (parameterize ([winsize-release (lambda (addr) (set! n (+ n 1)) (real-free addr))]
+                 [winsize-fault (lambda () (error 'inject "forced winsize unwind"))])
+    (guard (e [#t #f]) (terminal-size)))
+  (test-equal "winsize freed exactly once on the forced-raise unwind (observer)"
+    1 n))
 
 (test-end)

@@ -4,14 +4,14 @@
 # cross-references with test files, and generates a structured coverage report.
 #
 # Usage: bash tools/coverage-audit.sh
-# Output: .planning/phases/19-api-coverage-audit/COVERAGE-REPORT.md
+# Output: coverage/COVERAGE-REPORT.md (override the directory with COVERAGE_REPORT_DIR)
 
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-REPORT_DIR=".planning/phases/19-api-coverage-audit"
+REPORT_DIR="${COVERAGE_REPORT_DIR:-coverage}"
 REPORT_FILE="$REPORT_DIR/COVERAGE-REPORT.md"
 TMPDIR_AUDIT=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_AUDIT"' EXIT

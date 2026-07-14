@@ -20,8 +20,9 @@
 (import (test runner)
         (test vterm)
         (only (hafod editor render)
-              render-line render-line/suggestion
-              ansi-display-width cursor-visual-row+col count-visual-lines)
+              render-line render-line/suggestion ghost-visible-suffix
+              ansi-display-width cursor-visual-row+col count-visual-lines
+              paren-colours)
         (hafod editor gap-buffer)
         (chezscheme))
 
@@ -37,6 +38,29 @@
   (let ([gb (make-gap-buffer)])
     (gap-buffer-set-from-string! gb text)
     gb))
+
+;; A gap buffer holding TEXT with the cursor seated at INDEX, so the after-cursor
+;; string is non-empty -- the case buffer-from cannot build, and the one the
+;; editor actually produces once paredit has auto-inserted a closer.
+;; gap-buffer-set-from-string! leaves the gap at the end (index = length), so a
+;; negative move of (INDEX - length) walks it back to INDEX.
+(define (buffer-cursor-at text index)
+  (let ([gb (make-gap-buffer)])
+    (gap-buffer-set-from-string! gb text)
+    (gap-buffer-move-cursor! gb (- index (string-length text)))
+    gb))
+
+;; The 256-colour index the renderer paints the ghost with (ESC[38;5;240m).
+(define ghost-grey 240)
+
+;; Does any cell on ROW carry the ghost's dim grey?  Reads the pen the renderer
+;; actually left on each cell, so an un-drawn ghost is provable, not assumed.
+(define (row-has-ghost-grey? scr row)
+  (let loop ([col 0])
+    (cond
+      [(>= col (vterm-cols scr)) #f]
+      [(eqv? (cell-fg (vterm-cell scr row col)) ghost-grey) #t]
+      [else (loop (+ col 1))])))
 
 ;; The (row, 0-based col) the renderer's own geometry oracle predicts for a
 ;; cursor at the end of `before` under this prompt and terminal width.  Both come
@@ -191,5 +215,107 @@
     "ghijklmn" (vterm-row-text scr 1))
   (test-equal "grid wrap: the boundary glyph starts row 1"
     #\g (cell-glyph (vterm-cell scr 1 0))))
+
+;; ======================================================================
+;; (3) The ghost drawn INSIDE the auto-inserted closers -- the case an
+;; end-of-buffer cursor cannot reach.  Every fixture above seats the cursor at the
+;; end of the buffer, so the after-cursor string is empty and the ghost has
+;; nothing to be drawn in front of.  But that is not the shape the editor hands
+;; the renderer: type "(" and paredit leaves the buffer "()" with the cursor
+;; parked BETWEEN the parens, so a real closer sits past the cursor while the
+;; suggestion expands at it.  The ghost must therefore be drawn AT the cursor,
+;; ahead of that closer -- and the closer the ghost would duplicate must be
+;; elided, or the line shows it twice.  These fixtures pin both, per-cell: the
+;; ghost's glyphs read the dim grey, the buffer's closer reads its own paren
+;; colour, and the cursor stays on the user's typing row.
+;; ======================================================================
+
+;; The elision rule, pure.  The ghost is drawn minus the trailing run it shares
+;; with the after-cursor text, because the buffer is already holding those
+;; characters -- they are on the screen once already.
+(test-equal "elision: the closer the buffer already holds is dropped from the ghost"
+  "+ 1 2" (ghost-visible-suffix "+ 1 2)" ")"))
+(test-equal "elision: a ghost that is nothing but the shared closer draws nothing"
+  "" (ghost-visible-suffix ")" ")"))
+;; Nested: only ONE closer is genuinely shared -- the two-character tails "1)" and
+;; "))" already differ -- so exactly one is elided and the ghost keeps the other.
+;; The extra closer it then shows on screen is ACCEPTED: it is the honest
+;; continuation of the matched entry, and eliding further would mean guessing
+;; which of the buffer's closers the ghost's own closers correspond to.
+(test-equal "elision: only the trailing run the two genuinely share is dropped"
+  "lambda (x) x) 1" (ghost-visible-suffix "lambda (x) x) 1)" "))"))
+(test-equal "elision: with nothing after the cursor the ghost is drawn whole"
+  "-world" (ghost-visible-suffix "-world" ""))
+
+;; (a) The paredit fixture: buffer "()" with the cursor between the parens (what
+;; typing "(" leaves), ghost "+ 1 2)" from the history entry "(+ 1 2)".  The row
+;; must read "> (+ 1 2)" -- the grey suggestion INSIDE the user's real closer.
+;; The closer stays real: it keeps the renderer's depth-0 paren colour, so the
+;; screen distinguishes what is typed from what is merely suggested.
+(let* ([prompt "> "] [cols 80]
+       [scr (render->screen cols
+              (lambda (p)
+                (render-line/suggestion
+                  p prompt (buffer-cursor-at "()" 1) 0 "+ 1 2)" cols)))])
+  (test-equal "ghost in parens: the row reads the expansion, the closer last"
+    "> (+ 1 2)" (vterm-row-text scr 0))
+  (test-equal "ghost in parens: a single grid row" 1 (vterm-rows scr))
+  ;; The ghost's own glyphs, "+" at column 3 through "2" at column 7, are grey.
+  (test-equal "ghost in parens: the ghost's first glyph is +"
+    #\+ (cell-glyph (vterm-cell scr 0 3)))
+  (test-equal "ghost in parens: the ghost's first glyph is dim grey"
+    ghost-grey (cell-fg (vterm-cell scr 0 3)))
+  (test-equal "ghost in parens: the ghost's last glyph is 2"
+    #\2 (cell-glyph (vterm-cell scr 0 7)))
+  (test-equal "ghost in parens: the ghost's last glyph is dim grey"
+    ghost-grey (cell-fg (vterm-cell scr 0 7)))
+  ;; The closer past the cursor is REAL buffer text, not ghost.
+  (test-equal "ghost in parens: the trailing closer is the buffer's own )"
+    #\) (cell-glyph (vterm-cell scr 0 8)))
+  (test-equal "ghost in parens: the closer keeps the depth-0 paren colour"
+    (vector-ref paren-colours 0) (cell-fg (vterm-cell scr 0 8)))
+  (test-assert "ghost in parens: the closer is not painted as ghost grey"
+    (not (eqv? (cell-fg (vterm-cell scr 0 8)) ghost-grey)))
+  ;; The cursor rests where the user is typing: just past the "(" it typed.
+  (test-equal "ghost in parens: the cursor is on the logical typing row"
+    0 (vterm-cursor-row scr))
+  (test-equal "ghost in parens: the cursor rests just past the open paren"
+    3 (vterm-cursor-col scr)))
+
+;; (b) The fully-elided fixture: type on to "(+ 1 2" and the buffer is "(+ 1 2)"
+;; with the cursor before the auto-inserted closer, so the entry's remaining
+;; suffix is exactly the ")" already on the screen.  Drawing it would double the
+;; closer ("> (+ 1 2))"), so nothing is drawn -- the row is the buffer alone and
+;; no cell carries the ghost's grey.
+(let* ([prompt "> "] [cols 80]
+       [scr (render->screen cols
+              (lambda (p)
+                (render-line/suggestion
+                  p prompt (buffer-cursor-at "(+ 1 2)" 6) 0 ")" cols)))])
+  (test-equal "fully-elided ghost: the row shows one closer, not two"
+    "> (+ 1 2)" (vterm-row-text scr 0))
+  (test-equal "fully-elided ghost: a single grid row" 1 (vterm-rows scr))
+  (test-assert "fully-elided ghost: no cell is painted in the ghost's grey"
+    (not (row-has-ghost-grey? scr 0)))
+  (test-equal "fully-elided ghost: the cursor still rests before the closer"
+    8 (vterm-cursor-col scr)))
+
+;; (c) The end-of-buffer regression: with nothing past the cursor there is
+;; nothing to elide and nothing to draw around, so the ghost lands straight after
+;; the buffer in grey, exactly as it always did.  The buffer's own glyphs stay
+;; ungreyed, so the grey assertions above are not vacuous.
+(let* ([prompt "> "] [cols 80]
+       [scr (render->screen cols
+              (lambda (p)
+                (render-line/suggestion
+                  p prompt (buffer-cursor-at "abc" 3) 0 "-world" cols)))])
+  (test-equal "end-of-buffer ghost: the ghost trails the buffer"
+    "> abc-world" (vterm-row-text scr 0))
+  (test-equal "end-of-buffer ghost: the ghost's first glyph is dim grey"
+    ghost-grey (cell-fg (vterm-cell scr 0 5)))
+  (test-equal "end-of-buffer ghost: the ghost's last glyph is dim grey"
+    ghost-grey (cell-fg (vterm-cell scr 0 10)))
+  (test-assert "end-of-buffer ghost: the buffer's own glyphs are not grey"
+    (not (eqv? (cell-fg (vterm-cell scr 0 2)) ghost-grey))))
 
 (test-end)
