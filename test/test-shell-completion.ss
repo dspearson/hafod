@@ -1,5 +1,4 @@
 ;;; Tests for shell-mode tab completion
-;;; Phase 36 Plan 03, Task 2
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

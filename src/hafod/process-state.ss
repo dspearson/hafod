@@ -235,7 +235,7 @@
   ;; with-resources-aligned: align all resources, then run thunk.
   ;; v1 simplified: no locking, just call align! for each resource.
   ;; Handles both resource records and cons pairs (for environ-resource
-  ;; from Plan 01 which uses (name . align-thunk) convention).
+  ;; which uses the (name . align-thunk) convention).
   (define (with-resources-aligned resources thunk)
     (for-each (lambda (r)
                 (let ([align! (if (resource? r)

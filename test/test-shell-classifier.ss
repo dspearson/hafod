@@ -1,5 +1,4 @@
 ;;; Tests for shell input classifier
-;;; Phase 36 Plan 01 Task 1
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

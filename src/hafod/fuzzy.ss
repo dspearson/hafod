@@ -10,6 +10,9 @@
 (library (hafod fuzzy)
   (export fuzzy-match fuzzy-score fuzzy-filter
           fuzzy-filter/positions
+          ;; Per-candidate precompute seams (default #f — sub-library only, kept
+          ;; out of the (hafod) umbrella so every non-finder caller is unchanged)
+          fuzzy-precompute-cache fuzzy-precompute-observer
           ;; Extended search syntax
           parse-search-pattern match-search-pattern filter-search-pattern
           filter-search-pattern/positions
@@ -266,6 +269,53 @@
            (fwd (fx1+ ti) pi sidx)]))))
 
   ;; ======================================================================
+  ;; Per-candidate precompute cache (query-independent (T_ci . B))
+  ;; ======================================================================
+  ;; The V2 build loop's bonus array B is derived purely from raw character
+  ;; classes, so it is invariant to smart case; the normalised text is the
+  ;; candidate verbatim on the case-sensitive path and a fixed diacritic-fold-
+  ;; then-downcase (T_ci) on the case-insensitive path.  The two query-
+  ;; independent artefacts (T_ci . B) can therefore be built once per candidate
+  ;; and reused across keystrokes.  Both seams default to #f, which keeps every
+  ;; non-finder caller on today's inline build path — byte-identical.  A caller
+  ;; (the finder) opts in by parameterising a fresh eq-hashtable for the cache
+  ;; and, optionally, a thunk observer fired once per (T_ci . B) build.
+
+  (define fuzzy-precompute-cache    (make-parameter #f))  ; #f | eq-hashtable: candidate -> (T_ci . B)
+  (define fuzzy-precompute-observer (make-parameter #f))  ; #f | thunk fired once per (T_ci . B) build
+
+  ;; Build the two query-independent artefacts exactly as fuzzy-match-v2's fused
+  ;; build loop writes them: T_ci[ti] = (char-downcase-if raw #f) (the ci fold),
+  ;; B[ti] = (bonus-for prev-class class) threaded from an initial 'white.
+  (define (build-precompute text)                          ; -> (cons T_ci B)
+    (let* ([N (string-length text)]
+           [T (make-string N)]
+           [B (make-fxvector N 0)])
+      (let loop ([ti 0] [prev-class 'white])
+        (when (fx< ti N)
+          (let* ([raw (string-ref text ti)]
+                 [class (char-class raw)])
+            (string-set! T ti (char-downcase-if raw #f))
+            (fxvector-set! B ti (bonus-for prev-class class))
+            (loop (fx1+ ti) class))))
+      (cons T B)))
+
+  ;; Cache-aware wrapper.  With no cache installed this is exactly
+  ;; (build-precompute text) — today's behaviour, no observer.  With a cache
+  ;; present, a hit returns the stored pair; a miss builds it, stores it under
+  ;; the candidate's eq-identity, and fires the observer once.  A content-equal
+  ;; but distinct candidate simply rebuilds — never a wrong result.
+  (define (candidate-precompute text)                      ; -> (cons T_ci B)
+    (let ([cache (fuzzy-precompute-cache)])
+      (if (not cache)
+          (build-precompute text)
+          (or (hashtable-ref cache text #f)
+              (let ([tb (build-precompute text)])
+                (hashtable-set! cache text tb)
+                (let ([obs (fuzzy-precompute-observer)]) (when obs (obs)))
+                tb)))))
+
+  ;; ======================================================================
   ;; V2 algorithm: Smith-Waterman DP for optimal scoring alignment.
   ;; O(nm) where n=text length, m=pattern length.
   ;; Faithful port of fzf's FuzzyMatchV2.
@@ -275,18 +325,21 @@
     (let* ([M (string-length pattern)]
            [N (string-length text)])
 
-      ;; Phase 1: Quick check — can all pattern chars be found?
-      ;; Also record first occurrence of each pattern char (F vector)
-      ;; and the last matched text index.
-      (let* ([F (make-fxvector M 0)]  ; first occurrence of pattern[i]
-             [B (make-fxvector N 0)]   ; bonus at each text position
-             [T (make-string N)])      ; normalised text (lowered if case-insensitive)
+      ;; The query-independent (T_ci . B) is built once per candidate (cached
+      ;; when a cache is installed).  T is the candidate verbatim on the case-
+      ;; sensitive path, else the cached fold; B is valid for both cases.  Only
+      ;; the cheap F / last-idx scan below is recomputed per keystroke.
+      (let* ([tb (candidate-precompute text)]
+             [T (if case-sensitive? text (car tb))]
+             [B (cdr tb)]
+             [F (make-fxvector M 0)])  ; first occurrence of pattern[i]
 
-        ;; Build T, B, F, verify all pattern chars present.
+        ;; Phase 1: residual scan over T (plain char=?, no classification).
         ;; F[i] = first sequential occurrence of pattern[i].
         ;; last-idx = last text position matching the current pattern char
         ;; (extends past F to catch later occurrences for DP bounds).
-        (let build ([ti 0] [pi 0] [last-idx 0] [prev-class 'white]
+        ;; Also verifies every pattern char is present.
+        (let build ([ti 0] [pi 0] [last-idx 0]
                     [pchar (string-ref pattern 0)])
           (cond
             [(fx>= ti N)
@@ -296,19 +349,14 @@
                      (fuzzy-v2-single-char T B N pattern case-sensitive?)
                      (fuzzy-v2-dp T B F N M last-idx pattern text case-sensitive?)))]
             [else
-             (let* ([raw-ch (string-ref text ti)]
-                    [class (char-class raw-ch)]
-                    [ch (char-downcase-if raw-ch case-sensitive?)]
-                    [bonus (bonus-for prev-class class)])
-               (string-set! T ti ch)
-               (fxvector-set! B ti bonus)
+             (let ([ch (string-ref T ti)])
                (if (char=? ch pchar)
                    (let* ([new-pi (if (fx< pi M)
                                       (begin (fxvector-set! F pi ti) (fx1+ pi))
                                       pi)]
                           [new-pchar (string-ref pattern (fxmin new-pi (fx1- M)))])
-                     (build (fx1+ ti) new-pi ti class new-pchar))
-                   (build (fx1+ ti) pi last-idx class pchar)))])))))
+                     (build (fx1+ ti) new-pi ti new-pchar))
+                   (build (fx1+ ti) pi last-idx pchar)))])))))
 
 
   ;; V2 single-char: find best-scoring position of the single pattern char.
@@ -330,6 +378,26 @@
                  (lp (fx1+ ti) best-score best-pos)))]
           [else (lp (fx1+ ti) best-score best-pos)]))))
 
+  ;; Module-level DP scratch, shared across every V2 score.  Grown to the
+  ;; largest M*width ever scored and never shrunk within a session; the leaf
+  ;; scorer is single-threaded, so a module-level pair is safe.  The used
+  ;; [0, need) region is RE-ZEROED before every score: the DP reads a left-
+  ;; neighbour boundary cell before writing it and relies on that cell being 0,
+  ;; so a stale value from a previous (larger) candidate would silently change
+  ;; the score — the re-zero is unconditional, not merely on grow.
+  (define %H (make-fxvector 0))
+  (define %C (make-fxvector 0))
+
+  (define (dp-scratch-H need)
+    (when (fx< (fxvector-length %H) need) (set! %H (make-fxvector need)))
+    (let lp ([i 0]) (when (fx< i need) (fxvector-set! %H i 0) (lp (fx1+ i))))
+    %H)
+
+  (define (dp-scratch-C need)
+    (when (fx< (fxvector-length %C) need) (set! %C (make-fxvector need)))
+    (let lp ([i 0]) (when (fx< i need) (fxvector-set! %C i 0) (lp (fx1+ i))))
+    %C)
+
   ;; V2 DP core.
   ;; H[i][j] = best score for matching pattern[0..i] against text[0..j]
   ;; C[i][j] = length of consecutive match ending at (i,j)
@@ -337,9 +405,11 @@
   (define (fuzzy-v2-dp T B F N M last-idx pattern text case-sensitive?)
     (let* ([f0 (fxvector-ref F 0)]
            [width (fx+ (fx- last-idx f0) 1)]
-           ;; H and C matrices: M rows x width columns, stored as fxvectors
-           [H (make-fxvector (fx* M width) 0)]
-           [C (make-fxvector (fx* M width) 0)])
+           [need (fx* M width)]
+           ;; H and C matrices (M rows x width columns) reuse a grown, re-zeroed
+           ;; module-level scratch instead of a fresh per-score allocation.
+           [H (dp-scratch-H need)]
+           [C (dp-scratch-C need)])
 
       ;; Fill row 0 (first pattern character)
       (let fill-row0 ([col f0] [prev-h 0] [in-gap? #f])

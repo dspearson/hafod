@@ -2,6 +2,14 @@
 ;;; (hafod srfi-19) -- SRFI-19: Time Data Types and Procedures
 ;;; Reference: https://srfi.schemers.org/srfi-19/srfi-19.html
 ;;; Copyright (c) 2026 Dominic Pearson.
+;;;
+;;; DELIBERATE DIVERGENCES from the specification (deferred capability, not bugs):
+;;;   * TAI is treated as equal to UTC -- there is no leap-second table, so the
+;;;     monotonic/TAI conversions and time-tai<->time-utc are not provided.
+;;;   * date->string supports the ~Y ~m ~d ~H ~M ~S directives and the ~~
+;;;     literal-tilde escape only; the remaining directives, and string->date,
+;;;     are deferred. Both the leap-second table and the full directive set are
+;;;     additional surface left for a later release.
 
 (library (hafod srfi-19)
   (export
@@ -175,8 +183,10 @@
   (define (date->time-utc d)
     (let* ((jd (date->julian-day d))
            (epoch-seconds (exact (round (* (- jd 4881175/2) 86400)))))
+      ;; date->julian-day already folds in the zone offset once, so epoch-seconds
+      ;; is the absolute UTC instant -- do not subtract the offset a second time.
       (make-time time-utc (date-nanosecond d)
-                 (- epoch-seconds (date-zone-offset d)))))
+                 epoch-seconds)))
 
   ;; time-utc->date
   (define (time-utc->date t . tz-offset)
@@ -195,11 +205,14 @@
            (second (mod rem2 60)))
       ;; Howard Hinnant's civil_from_days
       (let* ((z (+ days 719468))
-             (era (div (if (>= z 0) z (- z 146096)) 146097))
+             ;; R6RS div already floors for a positive divisor, so era needs no
+             ;; C++-style truncation bias -- adding one mis-decodes negative z
+             ;; (pre-0000-03-01) dates by a day.
+             (era (div z 146097))
              (doe (- z (* era 146097)))
              (yoe (div (- doe (div doe 1460) (- (div doe 36524)) (div doe 146096)) 365))
              (y (+ yoe (* era 400)))
-             (doy (- doe (- (* 365 yoe) (div yoe 4) (- (div yoe 100)))))
+             (doy (- doe (+ (* 365 yoe) (div yoe 4) (- (div yoe 100)))))
              (mp (div (+ (* 5 doy) 2) 153))
              (day (+ (- doy (div (+ (* 153 mp) 2) 5)) 1))
              (month (+ mp (if (< mp 10) 3 -9)))

@@ -1,5 +1,4 @@
 ;;; Gap-fill tests for untested posix FFI function symbols
-;;; Phase 24 Plan 02 Task 2
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

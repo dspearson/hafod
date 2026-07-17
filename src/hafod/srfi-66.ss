@@ -42,13 +42,20 @@
   (define (u8vector=? a b)
     (bytevector=? a b))
 
+  ;; Length-first ordering per the specification: shorter vectors are always
+  ;; smaller than longer ones; vectors of equal length are compared
+  ;; lexicographically. (A shorter vector is smaller even if its first element
+  ;; is larger -- length is decided before any element is examined.)
   (define (u8vector-compare a b)
     (let ((la (bytevector-length a))
           (lb (bytevector-length b)))
-      (let ((len (min la lb)))
-        (let loop ((i 0))
-          (cond
-            ((= i len) (cond ((< la lb) -1) ((> la lb) 1) (else 0)))
-            ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) -1)
-            ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i))  1)
-            (else (loop (+ i 1)))))))))
+      (cond
+        ((< la lb) -1)
+        ((> la lb)  1)
+        (else
+         (let loop ((i 0))
+           (cond
+             ((= i la) 0)
+             ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) -1)
+             ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i))  1)
+             (else (loop (+ i 1))))))))))

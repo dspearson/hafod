@@ -1,5 +1,4 @@
 ;;; Gap-fill tests for untested file-info and stat-info accessor symbols
-;;; Phase 24 Plan 01 Task 2
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

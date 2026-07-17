@@ -262,7 +262,7 @@ done < "$TMPDIR_AUDIT/lib-order.txt"
 {
   echo "## Untested Symbols"
   echo ""
-  echo "Actionable gap list for Phase 24:"
+  echo "Actionable gap list:"
   echo ""
 } >> "$REPORT_FILE"
 

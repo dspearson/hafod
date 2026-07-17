@@ -1,6 +1,5 @@
 #!chezscheme
 ;;; test-scsh-regex-compat.ss -- Ported scsh/rx/ regex test material
-;;; Requirements: SCSH-02
 ;;; Copyright (c) 2026 Dominic Pearson.
 ;;; Original scsh tests: Copyright (c) 1997, 1998 Olin Shivers.
 
@@ -12,7 +11,7 @@
 (test-begin "scsh Regex Compatibility")
 
 ;; =============================================================================
-;; Section 1: SCSH-02 -- RE ADT tests (ported from scsh/rx/tests/re-adt-tests.scm)
+;; Section 1: RE ADT tests (ported from scsh/rx/tests/re-adt-tests.scm)
 ;; =============================================================================
 
 ;; re-string constructors and predicates
@@ -106,7 +105,7 @@
 )
 
 ;; =============================================================================
-;; Section 2: SCSH-02 -- RE procedure tests (ported from scsh/rx/tests/re-procs-tests.scm)
+;; Section 2: RE procedure tests (ported from scsh/rx/tests/re-procs-tests.scm)
 ;; =============================================================================
 
 ;; regexp? predicate
@@ -259,7 +258,7 @@
 )
 
 ;; =============================================================================
-;; Section 3: SCSH-02 -- SRE tools tests (ported from scsh/rx/tests/sre-tools-tests.scm)
+;; Section 3: SRE tools tests (ported from scsh/rx/tests/sre-tools-tests.scm)
 ;; =============================================================================
 
 ;; if-sre-form basics

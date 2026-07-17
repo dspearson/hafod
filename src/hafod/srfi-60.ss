@@ -3,6 +3,20 @@
 ;;; Reference: https://srfi.schemers.org/srfi-60/srfi-60.html
 ;;; Copyright (c) 2026 Dominic Pearson.
 ;;; Re-exports Chez bitwise operations with SRFI-60 names.
+;;;
+;;; DELIBERATE DIVERGENCE: this library keeps a coherent 0/1-integer convention
+;;; where the specification uses booleans, and keeps hafod's own copy-bit-field
+;;; argument order:
+;;;   * copy-bit takes a 0/1 integer bit (the spec passes a boolean);
+;;;   * integer->list emits a list of 0/1 integers (the spec emits #t/#f);
+;;;   * list->integer consumes 0/1 integers (the spec consumes booleans);
+;;;   * copy-bit-field takes (to start end from); the spec orders (to from start end).
+;;; The 0/1 convention is internally coherent -- reverse-bit-field and
+;;; rotate-bit-field are wired to it -- so switching to booleans or the spec
+;;; argument order would silently break every existing 0/1 caller. The convention
+;;; is therefore retained deliberately rather than changed. The remaining
+;;; procedures (logand, logior, logxor, ash, bit-field, integer-length, ...) are
+;;; conformant.
 
 (library (hafod srfi-60)
   (export logand logior logxor lognot

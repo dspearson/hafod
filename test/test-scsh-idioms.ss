@@ -1,6 +1,5 @@
 #!chezscheme
 ;;; test-scsh-idioms.ss -- Tests for scsh shell idioms and EPF patterns
-;;; Requirements: SCSH-03
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library-directories '(("src" . "src") ("." . ".")))
@@ -34,7 +33,7 @@
 (define test-base (string-append "/tmp/hafod-scsh-idioms-" (number->string (pid))))
 
 ;; =============================================================================
-;; Section 1: SCSH-03 -- Here-string idioms
+;; Section 1: Here-string idioms
 ;; =============================================================================
 
 ;; Here-string as stdin
@@ -55,7 +54,7 @@
     (run/string (cat) (<< ,x))))
 
 ;; =============================================================================
-;; Section 2: SCSH-03 -- Process substitution patterns (run/port as input source)
+;; Section 2: Process substitution patterns (run/port as input source)
 ;; =============================================================================
 
 ;; Read process output as port
@@ -79,7 +78,7 @@
   (run/string (begin (display (run/string (echo "hello"))))))
 
 ;; =============================================================================
-;; Section 3: SCSH-03 -- EPF form patterns
+;; Section 3: EPF form patterns
 ;; =============================================================================
 
 ;; Multiple redirections: stdout to one file, stderr to another
@@ -133,7 +132,7 @@
     (test-equal "EPF: input + output redirect" "round-trip" content)))
 
 ;; =============================================================================
-;; Section 4: SCSH-03 -- Conditional process sequencing idioms
+;; Section 4: Conditional process sequencing idioms
 ;; =============================================================================
 
 ;; || short-circuit: first success stops
@@ -158,7 +157,7 @@
       (|| (true) (false))))
 
 ;; =============================================================================
-;; Section 5: SCSH-03 -- begin process form patterns
+;; Section 5: begin process form patterns
 ;; =============================================================================
 
 ;; begin with Scheme I/O

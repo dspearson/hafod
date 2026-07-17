@@ -98,14 +98,25 @@ hafod supports three build modes:
 
 | Mode | Command | Output | Size | Startup | Runtime dependencies |
 |------|---------|--------|------|---------|---------------------|
-| Native (default) | `make` | `bin/hafod-native` | ~850KB | ~85ms | boot files + compiled libs (copied in on install) |
-| Library | `make compile` | `bin/hafod` | n/a | ~74ms† | `scheme` on PATH |
-| Standalone | `make standalone` | `bin/hafod-standalone` | ~5.1MB | ~62ms | none |
+| Native (default) | `make` | `bin/hafod-native` | ~850KB | ~105ms | boot files + compiled libs (copied in on install) |
+| Library | `make compile` | `bin/hafod` | n/a | ~88ms† | `scheme` on PATH + the compiled libraries |
+| Standalone | `make standalone` | `bin/hafod-standalone` | ~5.1MB | ~79ms‡ | none |
 
-† Since 1.9 the library launcher's image is whole-program-merged: every `(hafod)`
-library is inlined into `bin/hafod.so`, so the launcher loads one image instead of
-some sixty.  On the development host that cut its startup by ~15% (164ms → 140ms,
-best of seven); the figures in the table are indicative and host-dependent.
+Startup figures are the median of forty interleaved `-c '(void)'` runs on the
+development host, and are indicative only — they vary with the machine.
+
+† The library launcher's program image is whole-program-merged, which is where
+its startup gain comes from.  Note what the merge does *not* do: Chez inlines
+the run-time code but not the visit (macro) information, and the launcher
+resolves `(hafod)` through `environment` at run time — so the compiled libraries
+must still be on the library path.  `bin/hafod` is faster than the native
+binary, but it is not self-contained.
+
+‡ The standalone is the only self-contained image, and the fastest binary hafod
+ships.  Its libraries are baked into an embedded boot image, so it opens no
+library files at all at run time — it will run from an empty directory.  It is
+deliberately *not* whole-program-merged: merging on top of the boot image is
+slower, larger, and drops the SRFI libraries.
 
 **Native** (default) links against Chez's `libkernel.a` for a small native
 binary.  In the build tree it loads `petite.boot`/`scheme.boot` and the
@@ -147,8 +158,8 @@ resolves the version from `git describe --tags`, falling back to the tracked
 To cut a release:
 
 ```sh
-git tag v1.9               # what `hafod --version` and the man page report
-printf '1.9\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
+git tag v1.9.2               # what `hafod --version` and the man page report
+printf '1.9.2\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
 ```
 
 ## Installation
@@ -190,6 +201,24 @@ hafod loads `~/.config/hafod/init.ss` on startup in interactive mode.
 The config directory follows the XDG Base Directory specification: if
 `XDG_CONFIG_HOME` is set, hafod loads `$XDG_CONFIG_HOME/hafod/init.ss`
 instead.
+
+### Files hafod writes
+
+| Path | What it is |
+|------|------------|
+| `~/.config/hafod/init.ss` | Your config, read at startup (XDG-aware; see above) |
+| `~/.hafod_history.db` | Command history — an SQLite database, mode-tagged |
+| `~/.hafod_history.db-wal`, `-shm` | SQLite's write-ahead log and its index, present while a session is open |
+
+The history database holds the commands you type, so it is readable only by its
+owner (mode 0600); hafod tightens the permissions of an existing history file
+when it opens one.  The `-wal` and `-shm` sidecars inherit that mode.
+
+History uses write-ahead logging, so concurrent hafod sessions do not lose each
+other's writes.  The log is checkpointed back into the database on a clean
+close, so a `-wal` file left lying about means a session is still running, or
+was killed.  If history cannot be written, hafod says so once and carries on
+with an in-memory history.
 
 Config files are plain Scheme, evaluated in the interaction environment.
 Any definitions or side effects take effect before the first REPL prompt:
@@ -698,40 +727,42 @@ To port a scsh script to hafod:
 
 ## Performance
 
-hafod 1.4 (Chez Scheme 10.0) vs scsh 0.7 (Scheme48 1.9.2) on
-x86_64 Linux.  In-process timing (startup excluded) — each runtime
-is started once and all operations are measured within the process.
-Ratio < 1.0 means hafod is faster.
+Measured on hafod 1.9.2 (Chez Scheme 10.4.1) vs scsh 0.7 (Scheme 48
+1.9.2, built from source), on an idle AMD Ryzen 9 5950X, x86_64 Linux.
+In-process timing (startup excluded) — each runtime is started once and
+all operations are measured within the process.  Best of five interleaved
+runs per side.  Ratio = hafod/scsh; < 1.0 means hafod is faster.
 
 | Benchmark | N | hafod (ms) | scsh (ms) | Ratio | Winner |
 |-----------|---|-----------|-----------|-------|--------|
-| fork-exec | 500 | 1750 | 892 | 1.96x | scsh |
-| pipeline | 200 | 1726 | 1275 | 1.35x | scsh |
-| string I/O | 200 | 302 | 839 | 0.36x | hafod |
-| regex match | 10k | 5 | 237 | 0.02x | hafod |
-| file ops | 500 | 8 | 62 | 0.12x | hafod |
-| computation (fib 35) | 1 | 766 | 1406 | 0.54x | hafod |
-| env ops | 50k | 30 | 279 | 0.11x | hafod |
-| glob | 100 | 659 | 7849 | 0.08x | hafod |
-| read-line | 500 | 760 | 2494 | 0.30x | hafod |
-| field split | 5k | 22 | 1815 | 0.01x | hafod |
-| AWK | 200 | 302 | 990 | 0.31x | hafod |
-| regex subst | 5k | 11 | 430 | 0.03x | hafod |
-| output capture | 500 | 3029 | 1597 | 1.90x | scsh |
-| temp file | 2k | 22 | 204 | 0.11x | hafod |
-| with-cwd | 50k | 115 | 819 | 0.14x | hafod |
+| fork-exec | 500 | 1050 | 499 | 2.11x | scsh |
+| pipeline | 200 | 677 | 732 | 0.93x | hafod |
+| string I/O | 200 | 437 | 588 | 0.74x | hafod |
+| regex match | 10k | 3 | 167 | 0.02x | hafod |
+| file ops | 500 | 6 | 51 | 0.13x | hafod |
+| computation (fib 35) | 1 | 555 | 927 | 0.60x | hafod |
+| env ops | 50k | 47 | 191 | 0.25x | hafod |
+| glob | 100 | 187 | 2913 | 0.06x | hafod |
+| read-line | 500 | 1134 | 1724 | 0.66x | hafod |
+| field split | 5k | 13 | 1374 | 0.01x | hafod |
+| AWK | 200 | 444 | 603 | 0.74x | hafod |
+| regex subst | 5k | 5 | 305 | 0.02x | hafod |
+| output capture | 500 | 2485 | 862 | 2.88x | scsh |
+| temp file | 2k | 23 | 160 | 0.15x | hafod |
+| with-cwd | 50k | 139 | 591 | 0.23x | hafod |
 
-**Summary:** hafod wins 12 of 15 benchmarks.  The largest gains are
-in field splitting (82x), regex matching (51x), regex substitution
-(39x), and glob (12x).  scsh wins fork-exec, pipeline, and output
-capture — all process-creation-heavy workloads where Scheme48's
+**Summary:** hafod wins 13 of 15 benchmarks — losing only fork-exec and
+output capture, both process-creation-heavy workloads where Scheme 48's
 smaller address space makes `fork(2)` cheaper (less copy-on-write
-overhead).
+overhead).  The largest margins are in field splitting and regex work
+(~60–100x) and glob (~16x); the text engines and the compiled regex path
+are where hafod's lead is widest.
 
 Startup is not included in these numbers.  Chez Scheme's library-based
-startup (~84ms) is slower than Scheme48's image resume (~13ms); for
-short-lived scripts, use the standalone build (`make standalone`) which
-reduces startup via embedded boot files.
+startup is slower than Scheme 48's image resume, so for short-lived
+scripts the gap narrows; use the standalone build (`make standalone`),
+which is the fastest-starting binary hafod ships because its libraries
+are baked into an embedded boot image.
 
 hafod green threads (no scsh equivalent):
 

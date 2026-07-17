@@ -1,6 +1,5 @@
 #!chezscheme
 ;;; test-scsh-scripts.ss -- End-to-end realistic scsh-style script tests
-;;; Requirements: SCSH-04
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library-directories '(("src" . "src") ("." . ".")))
@@ -56,7 +55,7 @@
 (create-directory base-dir)
 
 ;; =============================================================================
-;; Section 1: SCSH-04 -- Sysadmin script: File inventory and monitoring
+;; Section 1: Sysadmin script: File inventory and monitoring
 ;; =============================================================================
 
 (let* ([dir (string-append base-dir "/inventory")]
@@ -123,7 +122,7 @@
   (delete-directory dir))
 
 ;; =============================================================================
-;; Section 2: SCSH-04 -- Text processing pipeline: Word frequency analysis
+;; Section 2: Text processing pipeline: Word frequency analysis
 ;; =============================================================================
 
 (let* ([dir (string-append base-dir "/wordfreq")]
@@ -180,7 +179,7 @@
   (delete-directory dir))
 
 ;; =============================================================================
-;; Section 3: SCSH-04 -- Text processing pipeline: Log parsing with regex
+;; Section 3: Text processing pipeline: Log parsing with regex
 ;; =============================================================================
 
 (let* ([dir (string-append base-dir "/logparse")]
@@ -229,7 +228,7 @@
   (delete-directory dir))
 
 ;; =============================================================================
-;; Section 4: SCSH-04 -- File management script: Backup with verify
+;; Section 4: File management script: Backup with verify
 ;; =============================================================================
 
 (let* ([src-dir (string-append base-dir "/backup-src")]
@@ -314,7 +313,7 @@
   (delete-directory src-dir))
 
 ;; =============================================================================
-;; Section 5: SCSH-04 -- Combined: Environment + process + file workflow
+;; Section 5: Combined: Environment + process + file workflow
 ;; =============================================================================
 
 (let* ([tmpdir (string-append base-dir "/combined")]

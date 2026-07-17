@@ -83,7 +83,7 @@
       (and (> rows 0) (> cols 0)))))
 
 ;; ======================================================================
-;; (hafod finder) library tests (Plan 02)
+;; (hafod finder) library tests
 ;; ======================================================================
 
 ;; Library loads without error (verified by successful import above)

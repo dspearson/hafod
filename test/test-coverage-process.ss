@@ -1,5 +1,4 @@
 ;;; Gap-fill tests for untested process, process-state, and procobj symbols
-;;; Phase 24 Plan 03 Task 1
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

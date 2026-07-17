@@ -337,16 +337,20 @@
          (do-ec qual ... (set! result expr))
          result))))
 
+  ;; Spec argument order: the expression precedes the combiner(s) --
+  ;; (fold-ec x0 qualifier* expression f) and
+  ;; (fold3-ec x0 qualifier* expression f1 f2). The bodies already apply
+  ;; (f expr acc) / (f1 v) then (f2 v acc); only the pattern positions move.
   (define-syntax fold-ec
     (syntax-rules ()
-      ((_ knil qual ... f expr)
+      ((_ knil qual ... expr f)
        (let ((acc knil))
          (do-ec qual ... (set! acc (f expr acc)))
          acc))))
 
   (define-syntax fold3-ec
     (syntax-rules ()
-      ((_ knil qual ... f1 f2 expr)
+      ((_ knil qual ... expr f1 f2)
        (let ((acc #f) (started #f))
          (do-ec qual ...
            (let ((v expr))

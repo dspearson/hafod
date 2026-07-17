@@ -27,31 +27,37 @@
                           (start 0)
                           (end   (string-length buf)))
       (let ((cset (x->char-set delims)))
+        ;; The loop stays STRICTLY char-at-a-time -- one get-char while the buffer
+        ;; has room, one lookahead-char when it is full, and at most a single
+        ;; unget-char -- so it never over-reads a shared port. i, start and end are
+        ;; the fixnum indices string-set!/string-length work in, so fixnum
+        ;; arithmetic is byte-identical here while trimming the inner-loop overhead;
+        ;; the per-char membership resolves to an O(1) bitset load for finite sets.
         (let lp ((i start))
           (cond
            ;; Buffer full -- peek to check for delimiter or EOF
-           ((>= i end)
+           ((fx>=? i end)
             (let ((c (lookahead-char port)))
               (cond
                ((eof-object? c)
-                (values c (- i start)))
+                (values c (fx- i start)))
                ((char-set-contains? cset c)
                 (when gobble? (get-char port))
-                (values c (- i start)))
+                (values c (fx- i start)))
                (else
-                (values #f (- i start))))))
+                (values #f (fx- i start))))))
            ;; Buffer has room -- read next char
            (else
             (let ((c (get-char port)))
               (cond
                ((eof-object? c)
-                (values c (- i start)))
+                (values c (fx- i start)))
                ((char-set-contains? cset c)
                 (unless gobble? (unget-char port c))
-                (values c (- i start)))
+                (values c (fx- i start)))
                (else
                 (string-set! buf i c)
-                (lp (+ i 1)))))))))))
+                (lp (fx+ i 1)))))))))))
 
   ;;; ========== read-delimited! ==========
   ;;; Returns:
@@ -65,37 +71,42 @@
                           (delim-action 'trim)
                           (start        0)
                           (end          (string-length buf)))
-      (receive (terminator num-read)
-               (%read-delimited! delims buf
-                                 (not (eq? delim-action 'peek))
-                                 port
-                                 start
-                                 (if (eq? delim-action 'concat)
-                                     (- end 1)  ; Room for terminator
-                                     end))
-        (if terminator    ; Check for buffer overflow
-            (let ((retval (if (and (zero? num-read)
-                                   (eof-object? terminator))
-                              terminator
-                              num-read)))
-              (case delim-action
-                ((peek trim) retval)
-                ((split) (values retval terminator))
-                ((concat) (cond ((char? terminator)
-                                 (string-set! buf (+ start num-read) terminator)
-                                 (+ num-read 1))
-                                (else retval)))))
+      ;; Coerce the delimiter set ONCE and reuse it for both the core read and the
+      ;; buffer-overflow concat branch below.  x->char-set is idempotent on an
+      ;; already-coerced set, so this is byte-identical -- it simply drops the
+      ;; second redundant coercion (mirrors read-delimited's own hoist).
+      (let ((cset (x->char-set delims)))
+        (receive (terminator num-read)
+                 (%read-delimited! cset buf
+                                   (not (eq? delim-action 'peek))
+                                   port
+                                   start
+                                   (if (eq? delim-action 'concat)
+                                       (- end 1)  ; Room for terminator
+                                       end))
+          (if terminator    ; Check for buffer overflow
+              (let ((retval (if (and (zero? num-read)
+                                     (eof-object? terminator))
+                                terminator
+                                num-read)))
+                (case delim-action
+                  ((peek trim) retval)
+                  ((split) (values retval terminator))
+                  ((concat) (cond ((char? terminator)
+                                   (string-set! buf (+ start num-read) terminator)
+                                   (+ num-read 1))
+                                  (else retval)))))
 
-            ;; Buffer overflow
-            (case delim-action
-              ((peek trim) #f)
-              ((split) (values #f #f))
-              ((concat) (let ((last (get-char port)))
-                          (if (char? last)
-                              (string-set! buf (+ start num-read) last))
-                          (and (or (eof-object? last)
-                                   (char-set-contains? (x->char-set delims) last))
-                               (+ num-read 1)))))))))
+              ;; Buffer overflow
+              (case delim-action
+                ((peek trim) #f)
+                ((split) (values #f #f))
+                ((concat) (let ((last (get-char port)))
+                            (if (char? last)
+                                (string-set! buf (+ start num-read) last))
+                            (and (or (eof-object? last)
+                                     (char-set-contains? cset last))
+                                 (+ num-read 1))))))))))
 
   ;;; ========== read-delimited ==========
   ;;; Unbounded version: allocates buffers dynamically, doubling each time.

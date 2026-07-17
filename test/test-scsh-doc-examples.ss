@@ -1,6 +1,5 @@
 #!chezscheme
 ;;; test-scsh-doc-examples.ss -- Tests extracted from scsh documentation code examples
-;;; Requirements: SCSH-01
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library-directories '(("src" . "src") ("." . ".")))
@@ -31,7 +30,7 @@
         s)))
 
 ;; =============================================================================
-;; Section 1: SCSH-01 -- Process forms (from process-notation.scribble)
+;; Section 1: Process forms (from process-notation.scribble)
 ;; =============================================================================
 
 ;; run/string with cat reading a file
@@ -71,7 +70,7 @@
   (not (zero? (status:exit-val (run (false))))))
 
 ;; =============================================================================
-;; Section 2: SCSH-01 -- I/O redirections (from process-notation.scribble)
+;; Section 2: I/O redirections (from process-notation.scribble)
 ;; =============================================================================
 
 ;; Output redirect (> file)
@@ -127,7 +126,7 @@
   (status:exit-val (run (true) (- 2))))
 
 ;; =============================================================================
-;; Section 3: SCSH-01 -- Collection forms (from process-notation.scribble)
+;; Section 3: Collection forms (from process-notation.scribble)
 ;; =============================================================================
 
 ;; run/string returns stdout as string
@@ -171,7 +170,7 @@
     (test-equal "run/port+proc port content" "port+proc\n" content)))
 
 ;; =============================================================================
-;; Section 4: SCSH-01 -- Conditional process sequencing
+;; Section 4: Conditional process sequencing
 ;; =============================================================================
 
 ;; || returns #t when any succeeds
@@ -199,7 +198,7 @@
   (|| (true) (false)))
 
 ;; =============================================================================
-;; Section 5: SCSH-01 -- Port utilities
+;; Section 5: Port utilities
 ;; =============================================================================
 
 ;; port->string reads all from port

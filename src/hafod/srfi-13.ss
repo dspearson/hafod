@@ -783,12 +783,16 @@
       [(s bound) (string-hash s bound 0 (string-length s))]
       [(s bound start) (string-hash s bound start (string-length s))]
       [(s bound start end)
+       ;; Accumulate with generic (bignum-safe) arithmetic: the fixnum ops
+       ;; overflowed once h left the fixnum range on a long string. The
+       ;; recurrence is unchanged, so short-string values are preserved.
        (let loop ([i start] [h 0])
          (if (fx>= i end)
              (modulo h bound)
              (loop (fx+ i 1)
-                   (fx+ (fxsll h 5) (fxsra h 27)
-                        (char->integer (string-ref s i))))))]))
+                   (+ (bitwise-arithmetic-shift-left h 5)
+                      (bitwise-arithmetic-shift-right h 27)
+                      (char->integer (string-ref s i))))))]))
 
   (define string-hash-ci
     (case-lambda
@@ -796,12 +800,14 @@
       [(s bound) (string-hash-ci s bound 0 (string-length s))]
       [(s bound start) (string-hash-ci s bound start (string-length s))]
       [(s bound start end)
+       ;; Generic arithmetic as in string-hash: bignum-safe, value-preserving.
        (let loop ([i start] [h 0])
          (if (fx>= i end)
              (modulo h bound)
              (loop (fx+ i 1)
-                   (fx+ (fxsll h 5) (fxsra h 27)
-                        (char->integer (char-downcase (string-ref s i)))))))]))
+                   (+ (bitwise-arithmetic-shift-left h 5)
+                      (bitwise-arithmetic-shift-right h 27)
+                      (char->integer (char-downcase (string-ref s i)))))))]))
 
   ;; =========================================================
   ;; Linear-update & aliases

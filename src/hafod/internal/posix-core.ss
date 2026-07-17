@@ -64,12 +64,13 @@
   ;; "name：720" into bytes no exec could match. Invalid UTF-8 is replaced, not
   ;; raised, so a stray non-UTF-8 name never aborts a directory read.
   (define (ptr->string ptr)
-    (let ([len (let loop ([i 0])
-                 (if (= (foreign-ref 'unsigned-8 ptr i) 0) i (loop (+ i 1))))])
-      (let ([bv (make-bytevector len)])
-        (do ([i 0 (+ i 1)]) ((= i len))
-          (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 ptr i)))
-        (utf8->string bv))))
+    ;; One strlen for the length, one memcpy for the payload, then the same
+    ;; UTF-8 decode. The bytevector is sized to the strlen result first, so the
+    ;; copy reads exactly the terminated string's bytes and no further.
+    (let* ([len (c-strlen ptr)]
+           [bv  (make-bytevector len)])
+      (c-memcpy-in bv ptr len)
+      (utf8->string bv)))
 
   ;; Build a C char** array from a list of Scheme strings.
   ;; The array is null-terminated. Caller must free with free-c-argv.
@@ -130,6 +131,20 @@
   (define c-write (foreign-procedure "write" (int void* size_t) ssize_t))
   (define c-kill (foreign-procedure "kill" (int int) int))
   (define c-pause (foreign-procedure "pause" () int))
+
+  ;; Bulk byte-marshalling primitives. memcpy replaces the per-byte
+  ;; foreign-ref/foreign-set! loops in ptr->string, posix-read and posix-write
+  ;; with a single vectorised copy; strlen scans a null-terminated C string's
+  ;; length in one call. These stay PRIVATE -- deliberately absent from the
+  ;; export list -- so the (hafod) umbrella count is unchanged. The bytevector
+  ;; endpoint is passed as u8* (its data pointer, pinned for the call); the
+  ;; foreign-alloc buffer is passed as uptr, exactly as c-read/c-write already
+  ;; declare their void* buffer. Each copy length is bounded to the negotiated
+  ;; count (strlen result / syscall n / bytevector-length) and the destination is
+  ;; sized to that count first, so no copy can run past either endpoint.
+  (define c-memcpy-in  (foreign-procedure "memcpy" (u8* uptr size_t) void)) ; dest bytevector <- src address
+  (define c-memcpy-out (foreign-procedure "memcpy" (uptr u8* size_t) void)) ; dest address <- src bytevector
+  (define c-strlen     (foreign-procedure "strlen" (uptr) size_t))
 
   ;; posix_spawn FFI
   (define c-posix-spawnp
@@ -194,10 +209,11 @@
   (define (posix-read fd count)
     (with-foreign-buffer ([buf count])
       (let ([n (posix-call read (c-read fd buf count))])
+        ;; Size the result to the syscall's actual return n (a short read yields
+        ;; fewer bytes than count), then bulk-copy exactly n bytes out of the
+        ;; foreign buffer. n = 0 makes memcpy a defined no-op.
         (let ([bv (make-bytevector n)])
-          (do ([i 0 (+ i 1)])
-              ((= i n))
-            (bytevector-u8-set! bv i (foreign-ref 'unsigned-8 buf i)))
+          (c-memcpy-in bv buf n)
           bv))))
 
   ;; Write to a file descriptor. Accepts a bytevector.
@@ -205,9 +221,9 @@
   (define (posix-write fd bv)
     (let* ([len (bytevector-length bv)])
       (with-foreign-buffer ([buf len])
-        (do ([i 0 (+ i 1)])
-            ((= i len))
-          (foreign-set! 'unsigned-8 buf i (bytevector-u8-ref bv i)))
+        ;; Bulk-copy the whole bytevector into the foreign buffer sized to its
+        ;; length, then write; the copy count equals the buffer size exactly.
+        (c-memcpy-out buf bv len)
         (posix-call write (c-write fd buf len)))))
 
   ;; Replace the current process with a new program.

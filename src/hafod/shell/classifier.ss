@@ -1,6 +1,5 @@
 ;;; (hafod shell classifier) -- Input classification for shell mode
 ;;; Routes user input to Scheme eval, shell parser, or builtin execution.
-;;; Phase 36 Plan 01
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library (hafod shell classifier)

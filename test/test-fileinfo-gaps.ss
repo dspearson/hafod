@@ -1,6 +1,6 @@
 ;;; Tests for fileinfo gap filling: file-info predicates, file:* accessors,
 ;;; create-fifo, sync-file, sync-file-system
-;;; Part of hafod v2.0 Phase 8 Plan 01
+;;; Part of hafod
 
 (import (chezscheme)
         (hafod fileinfo)

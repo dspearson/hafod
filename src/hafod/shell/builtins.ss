@@ -1,6 +1,5 @@
 ;;; (hafod shell builtins) -- Shell builtin commands
 ;;; cd, pushd, popd, export -- must execute in-process.
-;;; Phase 36 Plan 01
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library (hafod shell builtins)

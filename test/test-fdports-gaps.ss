@@ -1,5 +1,5 @@
 ;;; Tests for fd-ports gap filling: seek/tell, error-output-port, file-option aliases
-;;; Part of hafod v2.0 Phase 8 Plan 01
+;;; Part of hafod
 
 (import (chezscheme)
         (hafod fd-ports)

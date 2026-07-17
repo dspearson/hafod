@@ -25,42 +25,73 @@
           char-set:ascii char-set:any)
   (import (chezscheme))
 
-  ;; Char-set record: wraps a membership predicate
+  ;; Char-set record: a membership predicate plus an optional 256-byte bitset.
+  ;; When bits is a bytevector the set is finite within Latin-1 and membership is an
+  ;; O(1) bytevector load; when bits is #f the pred closure answers (this keeps the
+  ;; Unicode-wide named sets and every algebra result exact above Latin-1).  The
+  ;; case-lambda protocol lets the 1-arg (pred) callers stay untouched.
   (define-record-type char-set-type
-    (fields pred)
-    (nongenerative hafod-char-set-type))
+    (fields pred bits)
+    (protocol (lambda (new)
+                (case-lambda
+                  ((pred)      (new pred #f))       ; closure set -- unchanged callers
+                  ((pred bits) (new pred bits)))))  ; finite set -- carries a bitset
+    (nongenerative hafod-char-set-type-v2))
 
   ;; Public predicate (re-export from record definition)
   (define (char-set? x)
     (char-set-type? x))
 
+  ;; ======================================================================
+  ;; Finite-set construction (bitset-backed when provably within Latin-1)
+  ;; ======================================================================
+
+  ;; Build a bitset-backed set from a list of chars when every member is within
+  ;; Latin-1 (code point < 256); otherwise keep a memv closure so an astral member
+  ;; is preserved (a 256-byte bitset could not represent it).
+  (define (chars->finite-set chars)
+    (if (for-all (lambda (c) (fx<? (char->integer c) 256)) chars)
+        (let ((bv (make-bytevector 256 0)))
+          (for-each (lambda (c) (bytevector-u8-set! bv (char->integer c) 1)) chars)
+          (make-char-set-type #f bv))            ; pred is #f -- never consulted
+        (make-char-set-type (lambda (c) (and (memv c chars) #t)))))
+
+  ;; Precompute a bitset from a predicate KNOWN to be a subset of [0,256) by
+  ;; scanning 0-255 through it, so the bitset is equivalent to it by construction.
+  (define (predicate->finite-set pred)
+    (let ((bv (make-bytevector 256 0)))
+      (do ((i 0 (fx+ i 1))) ((fx=? i 256))
+        (when (pred (integer->char i)) (bytevector-u8-set! bv i 1)))
+      (make-char-set-type #f bv)))
+
   ;; Constructor: (char-set #\a #\b #\c) => char-set containing a, b, c
   (define (char-set . chars)
-    (make-char-set-type (lambda (c) (and (memv c chars) #t))))
+    (chars->finite-set chars))
 
-  ;; Membership test
+  ;; Membership test.  A bitset-backed set answers with a guarded bytevector load --
+  ;; the (fx<? cp 256) guard makes any code point >=256 a miss and keeps the result a
+  ;; proper #t/#f, so downstream eq? comparisons (char-set=) stay valid.  Otherwise
+  ;; the predicate closure answers.
   (define (char-set-contains? cs c)
-    ((char-set-type-pred cs) c))
+    (let ((bits (char-set-type-bits cs)))
+      (if bits
+          (let ((cp (char->integer c)))
+            (and (fx<? cp 256) (fx=? 1 (bytevector-u8-ref bits cp))))
+          ((char-set-type-pred cs) c))))
 
   ;; Pre-defined char-sets
   (define char-set:whitespace
     (make-char-set-type char-whitespace?))
 
   (define char-set:newline
-    (make-char-set-type (lambda (c) (char=? c #\newline))))
+    (predicate->finite-set (lambda (c) (char=? c #\newline))))
 
   ;; Coerce string/char/char-set to char-set
   (define (x->char-set x)
     (cond
       ((char-set-type? x) x)
       ((char? x) (char-set x))
-      ((string? x)
-       (make-char-set-type
-        (lambda (c)
-          (let lp ((i 0))
-            (and (< i (string-length x))
-                 (or (char=? c (string-ref x i))
-                     (lp (+ i 1))))))))
+      ((string? x) (chars->finite-set (string->list x)))
       (else (error 'x->char-set "cannot coerce to char-set" x))))
 
   ;; ======================================================================
@@ -125,19 +156,30 @@
        (and (char-set-contains? cs c)
             (not (memv c chars))))))
 
-  ;; string->char-set str [base-cs] => char-set of chars in str, unioned with base-cs
+  ;; string->char-set str [base-cs] => char-set of chars in str, unioned with base-cs.
+  ;; The union is bitset-backed only when base-cs is itself bitset-backed AND every
+  ;; char in str is within Latin-1: base's bitset is copied and the string's chars are
+  ;; OR-ed in.  Otherwise (a predicate base, or an astral char in str) the original
+  ;; union-with-base closure is preserved unchanged.
   (define string->char-set
     (case-lambda
       ((str)
-       (string->char-set str (make-char-set-type (lambda (c) #f))))
+       (chars->finite-set (string->list str)))
       ((str base-cs)
-       (make-char-set-type
-        (lambda (c)
-          (or (char-set-contains? base-cs c)
-              (let lp ((i 0))
-                (and (< i (string-length str))
-                     (or (char=? c (string-ref str i))
-                         (lp (+ i 1)))))))))))
+       (let ((base-bits (char-set-type-bits base-cs)))
+         (if (and base-bits
+                  (for-all (lambda (c) (fx<? (char->integer c) 256)) (string->list str)))
+             (let ((bv (bytevector-copy base-bits)))
+               (for-each (lambda (c) (bytevector-u8-set! bv (char->integer c) 1))
+                         (string->list str))
+               (make-char-set-type #f bv))
+             (make-char-set-type
+              (lambda (c)
+                (or (char-set-contains? base-cs c)
+                    (let lp ((i 0))
+                      (and (< i (string-length str))
+                           (or (char=? c (string-ref str i))
+                               (lp (+ i 1)))))))))))))
 
   ;; Full and empty named sets
   (define char-set:full
@@ -192,7 +234,7 @@
     (make-char-set-type char-alphabetic?))
 
   (define char-set:digit
-    (make-char-set-type
+    (predicate->finite-set
      (lambda (c) (and (char>=? c #\0) (char<=? c #\9)))))
 
   (define char-set:letter+digit
@@ -233,18 +275,18 @@
          (or (< n 32) (= n 127))))))
 
   (define char-set:hex-digit
-    (make-char-set-type
+    (predicate->finite-set
      (lambda (c)
        (or (and (char>=? c #\0) (char<=? c #\9))
            (and (char>=? c #\a) (char<=? c #\f))
            (and (char>=? c #\A) (char<=? c #\F))))))
 
   (define char-set:blank
-    (make-char-set-type
+    (predicate->finite-set
      (lambda (c) (or (char=? c #\space) (char=? c #\tab)))))
 
   (define char-set:ascii
-    (make-char-set-type
+    (predicate->finite-set
      (lambda (c) (< (char->integer c) 128))))
 
   ;; Matches any character (used by char-set-intersection with no args)

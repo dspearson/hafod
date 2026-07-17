@@ -19,7 +19,12 @@
     (set! *check-passed* 0)
     (set! *check-failed* 0))
 
-  (define (check-passed?) *check-passed*)
+  ;; Spec: unary boolean -- #t iff there were no failures and exactly the given
+  ;; number of checks passed.
+  (define (check-passed? expected)
+    (and (= *check-failed* 0) (= *check-passed* expected)))
+  ;; check-failed? is a hafod extension (not in the specification): the nullary
+  ;; count of failed checks. Retained unchanged.
   (define (check-failed?) *check-failed*)
 
   (define-syntax check

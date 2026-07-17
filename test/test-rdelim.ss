@@ -300,4 +300,52 @@
   (let ((p (open-string-input-port "\t  \nhello")))
     (skip-char-set char-set:whitespace p)))
 
+;;; ========== large-input equivalence + shared-port interleave ==========
+
+;; Independent reference for read-line, computed directly over the string: a line is
+;; a maximal run of non-newline chars; each newline terminates a line; a trailing
+;; newline yields no trailing empty line (read-line returns eof next).
+(define (ref-lines s)
+  (let ((len (string-length s)))
+    (let lp ((i 0) (start 0) (acc '()))
+      (cond
+       ((>= i len)
+        (if (> i start) (reverse (cons (substring s start i) acc)) (reverse acc)))
+       ((char=? (string-ref s i) #\newline)
+        (lp (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+       (else (lp (+ i 1) start acc))))))
+
+;; Tens of thousands of lines driven through read-line must match the reference
+;; exactly -- the reader stays char-at-a-time and never over-reads or drops a line.
+(test-equal "read-line over a large multi-line input matches the reference"
+  (let ((p (open-output-string)))
+    (do ((i 0 (+ i 1))) ((= i 20000))
+      (put-string p "line ") (put-string p (number->string i)) (put-char p #\newline))
+    (ref-lines (get-output-string p)))
+  (let ((p (open-output-string)))
+    (do ((i 0 (+ i 1))) ((= i 20000))
+      (put-string p "line ") (put-string p (number->string i)) (put-char p #\newline))
+    (let ((rp (open-string-input-port (get-output-string p))))
+      (let lp ((acc '()))
+        (let ((r (read-line rp)))
+          (if (eof-object? r) (reverse acc) (lp (cons r acc))))))))
+
+;; Shared-port interleave: read-line -> skip-char-set -> read-delimited -> read-line
+;; on ONE port, asserting the exact returned sequence. Reads are sequenced with let*
+;; (Chez evaluates arguments right-to-left). This proves no char is lost for a
+;; following reader on the same port.
+(test-assert "interleaved read-line / skip-char-set / read-delimited lose no data"
+  (let ((p (open-string-input-port "alpha\n   beta:gamma\nomega\n")))
+    (let* ((r1 (read-line p))
+           (r2 (skip-char-set " " p))
+           (r3 (read-delimited ":" p))
+           (r4 (read-line p))
+           (r5 (read-line p)))
+      (and (equal? "alpha" r1)
+           (= 3 r2)
+           (equal? "beta" r3)
+           (equal? "gamma" r4)
+           (equal? "omega" r5)
+           (eof-object? (read-line p))))))
+
 (test-end)

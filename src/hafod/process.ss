@@ -387,8 +387,12 @@
   ;; ======================================================================
 
   ;; Build "KEY=VALUE" string list from Scheme environment for posix_spawnp.
+  ;; Delegates to the cached list in (hafod environment): an unchanged
+  ;; environment reuses the cache, so a spawn loop rebuilds it once, not once
+  ;; per spawn.  The C char** envp is still built and freed per spawn inside
+  ;; posix-spawnp*; only the Scheme string list is cached.
   (define (spawn-env-strings)
-    (alist->env-list (env->alist)))
+    (cached-env-strings))
 
   ;; Temporarily align CWD and umask to Scheme parameters for spawn,
   ;; then restore. Environment is passed explicitly via envp, not aligned.

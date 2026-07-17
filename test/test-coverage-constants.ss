@@ -1,5 +1,4 @@
 ;;; Gap-fill tests for untested constant/flag symbols
-;;; Phase 24 Plan 01 Task 1
 ;;; Copyright (c) 2026 Dominic Pearson.
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)

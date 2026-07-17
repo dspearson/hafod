@@ -14,7 +14,7 @@
           ;; filtered vector back, and resolve a candidate's display string.
           query-insert! finder-state-filtered display-version)
   (import (chezscheme)
-          (only (hafod fuzzy) filter-search-pattern/positions)
+          (only (hafod fuzzy) filter-search-pattern/positions fuzzy-precompute-cache)
           (only (hafod srfi-13) string-prefix?)
           (only (hafod editor input-decode)
                 read-key-event key-event? key-event-type key-event-value key-event-mods
@@ -894,7 +894,22 @@
                            (lambda ()
                              (with-alternate-screen
                                (lambda ()
-                                 (finder-loop state resize-flag)))))))])
+                                 ;; One fuzzy precompute cache per finder session: a
+                                 ;; fresh table installed here lives for the whole
+                                 ;; keystroke loop and is released when the finder tears
+                                 ;; down, so every re-score within the session reuses each
+                                 ;; candidate's precomputed (T_ci . B) instead of rebuilding
+                                 ;; it, while a re-open starts from an empty cache -- the
+                                 ;; exact candidate-set boundary.  The candidate set is
+                                 ;; fixed for the session, so the eq-keys stay valid:
+                                 ;; refilter! feeds the same item objects (or their
+                                 ;; narrowing survivors) unchanged.  It is installed ONCE
+                                 ;; around the loop, not reset per keystroke -- resetting
+                                 ;; per keystroke would defeat the reuse -- and the default
+                                 ;; #f everywhere else keeps every non-finder fuzzy caller
+                                 ;; byte-identical.
+                                 (parameterize ([fuzzy-precompute-cache (make-eq-hashtable)])
+                                   (finder-loop state resize-flag))))))))])
                 ;; Re-seed the leaf width cache once the finder has torn down (raw
                 ;; mode, alternate screen and the finder's own SIGWINCH handler
                 ;; all restored).  Belt-and-braces alongside the in-loop refresh:

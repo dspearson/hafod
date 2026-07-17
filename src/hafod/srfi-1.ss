@@ -541,7 +541,9 @@
        (let loop ([lst lst] [acc '()])
          (if (null? lst) (reverse acc)
              (let ([x (car lst)])
-               (if (any (lambda (y) (= x y)) acc)
+               ;; Spec order: the earlier (already-kept) element y is the first
+               ;; argument, the later element x the second -- (= y x), not (= x y).
+               (if (any (lambda (y) (= y x)) acc)
                    (loop (cdr lst) acc)
                    (loop (cdr lst) (cons x acc))))))]))
 

@@ -27,20 +27,20 @@
     ;; Initialization
     init-fdports!
 
-    ;; Guardian drain (for Phase 5 to call before fork)
+    ;; Guardian drain (call before fork)
     drain-port-guardian!
 
-    ;; Move and dup (Plan 02)
+    ;; Move and dup
     move->fdes dup dup->fdes dup->inport dup->outport
 
-    ;; Open file (Plan 02)
+    ;; Open file
     open-file open-input-file open-output-file
 
-    ;; File option constants (Plan 02)
+    ;; File option constants
     open/read open/write open/read+write
     open/create open/truncate open/append open/exclusive open/non-blocking
 
-    ;; Port rebinding macros (Plan 02)
+    ;; Port rebinding macros
     with-current-input-port with-current-output-port with-current-error-port
     with-current-input-port* with-current-output-port* with-current-error-port*
 
@@ -67,7 +67,7 @@
     ;; Internal (needed by later phases)
     set-fdport! delete-fdport! maybe-ref-fdport evict-ports
     make-input-fdport make-output-fdport
-    %set-cloexec
+    %set-cloexec cloexec-fcntl-observer
     *fd-table* *port-table* *port-guardian*)
 
   (import (hafod internal base)
@@ -77,9 +77,11 @@
   ;; Data Structures
   ;; ======================================================================
 
-  ;; Forward table: fd (integer) -> (port-or-weak . revealed-count)
-  ;; When revealed=0, car is (weak-cons port #f)
-  ;; When revealed>0, car is the port directly
+  ;; Forward table: fd (integer) -> #(port-or-weak revealed-count cloexec)
+  ;; Slot 0: when revealed=0, (weak-cons port #f); when revealed>0, the port.
+  ;; Slot 1: the revealed count.
+  ;; Slot 2: the FD_CLOEXEC bit last written for this fd (#t on / #f off), so
+  ;;   set-fdport! can skip a redundant F_GETFD/F_SETFD pair when it is unchanged.
   (define *fd-table* (make-eqv-hashtable))
 
   ;; Reverse table: port (object identity) -> fd (integer)
@@ -92,12 +94,21 @@
   ;; Helper: close-on-exec flag management
   ;; ======================================================================
 
+  ;; Test seam: when set, fired once per fcntl %set-cloexec actually issues, so a
+  ;; suite can count the syscalls a reveal transition makes. Default #f is a
+  ;; no-op, leaving the real path byte-for-byte unchanged (the spawn-release-
+  ;; observer idiom). This primitive stays dumb -- it always issues both fcntls;
+  ;; the skip that elides a redundant pair lives in set-fdport!.
+  (define cloexec-fcntl-observer (make-parameter #f))
+
   (define (%set-cloexec fd on?)
-    (let ([flags (posix-fcntl fd F_GETFD)])
-      (posix-fcntl fd F_SETFD
-        (if on?
-            (bitwise-ior flags FD_CLOEXEC)
-            (bitwise-and flags (bitwise-not FD_CLOEXEC))))))
+    (let ([obs (cloexec-fcntl-observer)])
+      (let ([flags (begin (when obs (obs)) (posix-fcntl fd F_GETFD))])
+        (when obs (obs))
+        (posix-fcntl fd F_SETFD
+          (if on?
+              (bitwise-ior flags FD_CLOEXEC)
+              (bitwise-and flags (bitwise-not FD_CLOEXEC)))))))
 
   ;; ======================================================================
   ;; Core table operations
@@ -108,14 +119,25 @@
   ;; When revealed=0: store weak reference (weak-cons), set close-on-exec.
   ;; When revealed>0: store strong reference, clear close-on-exec.
   (define (set-fdport! fd port revealed)
-    ;; Remove old entry first
-    (delete-fdport! fd)
-    (let ([entry (if (zero? revealed)
-                     (cons (weak-cons port #f) revealed)
-                     (cons port revealed))])
-      (hashtable-set! *fd-table* fd entry)
+    ;; Read the prior cloexec bit BEFORE delete-fdport! discards the entry.
+    (let* ([prior    (hashtable-ref *fd-table* fd #f)]
+           [prior-cx (and (vector? prior) (vector-ref prior 2))]
+           [desired  (zero? revealed)])
+      ;; Remove old entry first
+      (delete-fdport! fd)
+      (let ([ref (if (zero? revealed) (weak-cons port #f) port)])
+        (hashtable-set! *fd-table* fd (vector ref revealed desired)))
       (hashtable-set! *port-table* port fd)
-      (%set-cloexec fd (zero? revealed))
+      ;; A fresh fd (no prior entry) always establishes the bit; a same-side
+      ;; reveal that leaves the desired state unchanged skips the fcntl pair.
+      ;; The skip trusts *fd-table* slot 2 as the sole authority for a tracked
+      ;; fd's kernel FD_CLOEXEC bit: every cloexec change to a tracked fd flows
+      ;; through set-fdport!, and the raw-integer fd operations never alias an fd
+      ;; number owned by a port, so the cached bit cannot drift from the kernel.
+      ;; (The pre-cache code re-forced the fcntl unconditionally and so self-healed
+      ;; such an alias; that narrower invariant is what makes this elision safe.)
+      (unless (and prior (eq? prior-cx desired))
+        (%set-cloexec fd desired))
       ;; Register with guardian when unrevealed so GC can clean up
       (when (zero? revealed)
         (*port-guardian* port))))
@@ -124,8 +146,8 @@
   (define (delete-fdport! fd)
     (let ([entry (hashtable-ref *fd-table* fd #f)])
       (when entry
-        (let ([port-or-weak (car entry)]
-              [revealed (cdr entry)])
+        (let ([port-or-weak (vector-ref entry 0)]
+              [revealed (vector-ref entry 1)])
           ;; Remove from reverse table
           (let ([port (if (zero? revealed)
                           ;; Weak reference case
@@ -142,8 +164,8 @@
   (define (maybe-ref-fdport fd)
     (let ([entry (hashtable-ref *fd-table* fd #f)])
       (and entry
-           (let ([port-or-weak (car entry)]
-                 [revealed (cdr entry)])
+           (let ([port-or-weak (vector-ref entry 0)]
+                 [revealed (vector-ref entry 1)])
              (if (zero? revealed)
                  ;; Weak reference: port-or-weak is (weak-cons port #f)
                  (let ([port (car port-or-weak)])
@@ -392,8 +414,8 @@
     (let-values ([(keys vals) (hashtable-entries *fd-table*)])
       (vector-for-each
         (lambda (fd entry)
-          (let ([port-or-weak (car entry)]
-                [revealed (cdr entry)])
+          (let ([port-or-weak (vector-ref entry 0)]
+                [revealed (vector-ref entry 1)])
             (let ([port (if (zero? revealed)
                             (let ([p (car port-or-weak)])
                               (if (bwp-object? p) #f p))
@@ -406,7 +428,7 @@
   (define flush-all-ports-no-threads flush-all-ports)
 
   ;; ======================================================================
-  ;; Move and dup operations (Plan 02 additions)
+  ;; Move and dup operations
   ;; ======================================================================
 
   ;; Move an fd/port to target fd. Evicts any port at target.
