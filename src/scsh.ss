@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; (scsh) -- Compatibility alias for (hafod)
 ;;; Allows (import (scsh)) as an alternative to (import (hafod)).
-;;; AUTO-GENERATED -- 1026 symbols re-exported from (hafod).
+;;; AUTO-GENERATED -- 1045 symbols re-exported from (hafod).
 
 (library (scsh)
   (export  %exec %exit %fork %fork/pipe %fork/pipe+ %homedir %read-delimited! %set-cloexec & 
@@ -16,9 +16,9 @@
     S_IFBLK S_IFCHR S_IFDIR S_IFIFO S_IFLNK S_IFMT S_IFREG S_IFSOCK S_IRGRP S_IROTH S_IRUSR 
     S_ISGID S_ISUID S_ISVTX S_IWGRP S_IWOTH S_IWUSR S_IXGRP S_IXOTH S_IXUSR TCIFLUSH TCIOFF 
     TCIOFLUSH TCION TCOFLUSH TCOOFF TCOON TCSADRAIN TCSAFLUSH TCSANOW W_OK X_OK 
-    __errno_location absolute-file-name add-after add-before add-exit-hook! align-env! 
+    __errno_location abbr abbr-expand? absolute-file-name add-after add-before add-exit-hook! alias align-env!
     alist->env alist->env-list alist-compress alist-delete alist-update arg arg* argv 
-    arithmetic-shift ascii->char awk awk/posix-string baud-rates become-session-leader 
+    arithmetic-shift ascii->char auto-cd? awk awk/posix-string baud-rates become-session-leader
     bitwise-and bitwise-ior bitwise-not bitwise-xor bogus-substring-spec? break-dot-lock 
     c-strerror call-exit-hooks! call-exit-hooks-and-run call-terminally call-with-input-file 
     call-with-output-file call-with-string-output-port call/fdes channel-close 
@@ -39,11 +39,11 @@
     create-directory create-fifo create-hard-link create-symlink create-temp-file 
     current-error-port current-thread cwd cwd-resource date date->string date:hour 
     date:minute date:month date:month-day date:seconds date:summer? date:tz-name date:tz-secs 
-    date:week-day date:year date:year-day date? decode-baud-rate default-lib-dirs 
+    date:week-day date:year date:year-day date? decode-baud-rate default-aliases? default-lib-dirs
     define-simple-syntax delete-directory delete-fdport! delete-file delete-filesys-object 
     deprecated-proc directory-as-file-name directory-files directory-stream? disable-tty-char 
     display drain-port-guardian! drain-tty dup dup->fdes dup->inport dup->outport 
-    egid-resource encode-baud-rate ensure-file-name-is-directory 
+    egid-resource enable-informative-prompt! encode-baud-rate ensure-file-name-is-directory
     ensure-file-name-is-nondirectory env->alist environ-resource errno-error error 
     error-output-port euid-resource evict-ports exec exec-epf exec-path exec-path-list 
     exec-path-search exec-path/env exec/env exit expand-file-name fd/port? fdes->inport 
@@ -66,9 +66,9 @@
     fork/pipe fork/pipe+ format format-date free-c-argv getenv glob glob-quote group-info 
     group-info-gid group-info-members group-info-name group-info-passwd group-info:gid 
     group-info:members group-info:name group-info? hafod-major-version hafod-minor-version 
-    hafod-version-string halts? home-dir home-directory home-file if-match if-sre-form 
+    hafod-version-string halts? history-search-mode home-dir home-directory home-file if-match if-sre-form
     infix-splitter init-exec-path-list init-fdports! init-home-directory initialize-vector 
-    input-port? integer->char join-strings let-match let-optionals let-optionals* lib-dirs 
+    input-port? integer->char interactive-enhancements? join-strings let-match let-optionals let-optionals* lib-dirs
     lib-dirs-append! lib-dirs-append-script-dir! lib-dirs-prepend! 
     lib-dirs-prepend-script-dir! list->string make-channel make-char-port-filter 
     make-control-tty make-date make-input-fdport make-output-fdport make-posix-error 
@@ -85,14 +85,14 @@
     open/read open/read+write open/truncate open/write output-port? parent-pid 
     parse-file-name passwd-info-dir passwd-info-gecos passwd-info-gid passwd-info-name 
     passwd-info-passwd passwd-info-shell passwd-info-uid passwd-info? path-list->file-name 
-    pause pid pid->proc pid/proc? pipe pipe* port->fdes port->list port->sexp-list 
+    pause pid pid->proc pid/proc? pipe pipe* plain-shell! port->fdes port->list port->sexp-list
     port->string port->string-list port-fold port-revealed posix-_exit posix-access 
     posix-call posix-chdir posix-chmod posix-chown posix-close posix-closedir posix-ctermid 
     posix-dup posix-dup2 posix-errno posix-error? posix-exec posix-execve posix-fchmod 
     posix-fchown posix-fcntl posix-fnmatch posix-fork posix-fstat posix-fsync posix-ftruncate 
     posix-getcwd posix-getegid posix-getenv posix-geteuid posix-getgid posix-getgrgid 
     posix-getgrnam posix-getgroups posix-getlogin posix-getpgrp posix-getpid posix-getppid 
-    posix-getpwnam posix-getpwuid posix-gettimeofday posix-getuid posix-gmtime posix-isatty 
+    posix-getpwent-all posix-getpwnam posix-getpwuid posix-gettimeofday posix-getuid posix-gmtime posix-isatty 
     posix-kill posix-link posix-localtime posix-lseek posix-lstat posix-mkdir posix-mkfifo 
     posix-mkstemp posix-mktime posix-open posix-opendir posix-pause posix-pipe posix-read 
     posix-readdir posix-readlink posix-regcomp posix-regerror posix-regexec posix-regfree 
@@ -103,8 +103,10 @@
     posix-tcsetattr posix-tcsetpgrp posix-time posix-times posix-truncate posix-ttyname 
     posix-umask posix-uname posix-unlink posix-unsetenv posix-utimes posix-waitpid 
     posix-write preserve-ports proc:finished? proc:pid proc:status proc:zombie? proc? 
-    process-chdir process-cwd process-group process-sleep process-sleep-until process-times 
-    ptr->string pty-name->tty-name raise-posix-error re-any re-any? re-bol re-bol? re-bos 
+    process-chdir process-cwd process-group process-sleep process-sleep-until process-times
+    prompt-colour-ok? prompt-exit-segment prompt-git-segment prompt-path-segment
+    prompt-timing-segment prompt-timing-threshold
+    ptr->string pty-name->tty-name raise-posix-error re-any re-any? re-bol re-bol? re-bos
     re-bos? re-char-class? re-char-set:cset re-char-set? re-choice re-choice:elts 
     re-choice:tsm re-choice? re-dsm re-dsm:body re-dsm:post-dsm re-dsm:pre-dsm re-dsm:tsm 
     re-dsm? re-empty re-empty? re-eol re-eol? re-eos re-eos? re-nonl re-repeat re-repeat:body 
@@ -132,7 +134,7 @@
     set-tty-info:input-speed set-tty-info:local-flags set-tty-info:min 
     set-tty-info:output-flags set-tty-info:output-speed set-tty-info:time 
     set-tty-process-group set-uid set-umask set-user-effective-gid set-user-effective-uid 
-    setenv shell-open signal signal-process signal-process-group simplify-file-name 
+    setenv shell-highlight-paths? shell-highlight? shell-open signal signal-process signal-process-group simplify-file-name 
     simplify-regexp skip-char-set sleazy-call/fdes sloppy-suffix-splitter spawn 
     split-colon-list split-file-name sre->regexp sre-form? start-tty-input start-tty-output 
     stat-info-atime stat-info-blksize stat-info-blocks stat-info-ctime stat-info-dev 
@@ -169,7 +171,7 @@
     ttyout/fill-w/del ttyout/nl->crnl ttyout/nl-delay ttyout/nl-delay0 ttyout/nl-delay1 
     ttyout/nl-does-cr ttyout/no-col0-cr ttyout/tab-delay ttyout/tab-delay0 ttyout/tab-delay1 
     ttyout/tab-delay2 ttyout/tab-delayx ttyout/uppercase ttyout/vtab-delay ttyout/vtab-delay0 
-    ttyout/vtab-delay1 umask umask-resource uname uname-info? uname:machine uname:node-name 
+    ttyout/vtab-delay1 umask umask-resource unabbr unalias uname uname-info? uname:machine uname:node-name
     uname:os-name uname:release uname:version uncase uncase-char-set uncase-string 
     user-effective-gid user-effective-uid user-gid user-info user-info:gid user-info:home-dir 
     user-info:name user-info:shell user-info:uid user-info? user-login-name 

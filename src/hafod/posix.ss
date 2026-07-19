@@ -74,7 +74,7 @@
     posix-setuid posix-setgid posix-seteuid posix-setegid
 
     ;; User/group database
-    posix-getpwnam posix-getpwuid posix-getgrnam posix-getgrgid
+    posix-getpwnam posix-getpwuid posix-getpwent-all posix-getgrnam posix-getgrgid
     passwd-info? passwd-info-name passwd-info-passwd passwd-info-uid
     passwd-info-gid passwd-info-gecos passwd-info-dir passwd-info-shell
     group-info? group-info-name group-info-passwd group-info-gid group-info-members

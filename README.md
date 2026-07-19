@@ -58,7 +58,7 @@ seasonal shell.
   SRFIs that scsh bundled via Scheme 48 are available as
   `(import (hafod srfi-N))`
 - **Full scsh compatibility** -- 1:1 coverage of the scsh public API
-  (1,349 exported symbols); `(import (scsh))` works as an alias for
+  (1,369 exported symbols); `(import (scsh))` works as an alias for
   `(import (hafod))`; all scsh accessor names, predicates, char-sets,
   file-options, RE ADT layer, and version aliases
 
@@ -653,7 +653,7 @@ hafod adds several capabilities beyond the original scsh:
 - **Interactive editor** -- gap-buffer line editor with syntax
   colouring (rainbow parens, rainbow identifiers, strings,
   comments, numbers, booleans), smart enter, bracketed paste,
-  prefix-filtered Up/Down, undo/redo (C-/ and M-/), fish-style
+  substring-filtered Up/Down, undo/redo (C-/ and M-/), fish-style
   auto-suggestions, command timing display, terminal-wrap-aware
   multiline rendering, `(show-keybindings)` reference,
   `(run-tutorial)` interactive walkthrough
@@ -683,10 +683,44 @@ hafod adds several capabilities beyond the original scsh:
   anchoring, `.suffix`), Unicode normalisation (é→e, ñ→n),
   tiebreak by length then first-match position
 - **Programmable completions** -- command-specific completers for
-  git (subcommands, branches, modified files), ssh (hosts from
-  `~/.ssh/config` and `known_hosts`), kill (PIDs with process
-  names), make (targets from Makefile), with description display
-  in completion menu; user-extensible via `register-completer!`
+  git (subcommands, branches, modified files, remotes, tags, stash),
+  ssh (hosts from `~/.ssh/config` and `known_hosts`), kill (PIDs with
+  process names), make (targets from Makefile), option flags parsed
+  from any command's `--help`/man output (cached per command), and
+  `~user` home-directory completion, with aligned description display
+  in the completion menu; user-extensible via `register-completer!`
+- **Informative prompt** -- a one-call `enable-informative-prompt!`
+  preset composing a home-relative, fish-truncated path, a git segment
+  (branch, dirty/staged markers, ahead/behind counts), and a
+  right-hand prompt carrying a red exit-code badge and a command-timing
+  readout; every segment is overridable and 256-colour output is gated
+  on terminal capability
+- **Aliases & abbreviations** -- `alias`/`unalias` builtins (and the
+  same forms from `init.ss`) that expand on execution, plus fish-style
+  command-head abbreviations that expand as you type (Space/Enter) as a
+  single undo step
+- **Auto-cd** -- typing a bare existing directory at the shell prompt
+  changes into it, gated to shell mode and real directories (a command,
+  builtin, alias, or binding always wins)
+- **Directory frecency** -- `z`/`zi` for a zoxide-style jump to a
+  frequently/recently visited directory, ranked by a frecency score
+  over a persistent, owner-only SQLite visit database updated on `cd`
+- **Substring history recall** -- Up/Down and the reverse-i-search
+  match a substring anywhere in the line (smart-case), not only the
+  prefix, cycling through matches; prefix behaviour stays reachable via
+  `history-search-mode`
+- **Live command-line highlighting** -- shell command lines are
+  syntax-highlighted as they are typed: the command head is coloured
+  green when it resolves (PATH / builtin / alias) and marked when it
+  does not, with distinct colours for strings, option flags,
+  redirections and path arguments (a non-existent path is flagged)
+- **Default aliases & one-switch plain shell** -- an interactive
+  session installs a small, portable set of conveniences familiar from
+  zsh + prezto (colourised `ls`/`ll`/`la`/`grep`, human-readable
+  `df`/`du`, clobber-guarded `rm`/`cp`/`mv`), each skipped if you have
+  already defined it; a master `interactive-enhancements?` gate and a
+  one-call `plain-shell!` turn every interactive enhancement off at
+  once for a bare REPL
 - **Paredit** -- structural editing with auto-pairing, toggleable
   at runtime via `toggle-paredit!`
 - **Feature toggles** -- all non-core features can be individually
@@ -722,7 +756,7 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,349 scsh-compatible symbols are
+5. Most scripts work unchanged -- 1,369 scsh-compatible symbols are
    exported, including SRFI-1 and SRFI-13 at the top level
 
 ## Performance

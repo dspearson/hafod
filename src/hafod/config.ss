@@ -1,19 +1,27 @@
 ;;; (hafod config) -- User configuration module: XDG discovery, config loading, key binding API
 ;;; Provides xdg-config-home, hafod-config-dir, hafod-init-file, load-config-file,
-;;; set-prompt!, bind-key!, and parse-key-description.
+;;; set-prompt!, enable-informative-prompt!, bind-key!, and parse-key-description.
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod config)
   (export xdg-config-home hafod-config-dir hafod-init-file
           load-config-file
           set-prompt!
+          plain-shell!
+          enable-informative-prompt!
+          alias unalias abbr unabbr
           bind-key!
           parse-key-description)
-  (import (chezscheme)
+  ;; `alias` is excluded from the Chez import so this module can bind it as the
+  ;; user-facing command-alias helper below; Chez's own `alias` form is unused here.
+  (import (except (chezscheme) alias)
           (hafod editor input-decode)
           (hafod editor keymap)
           (hafod editor editor)
           (hafod interactive)
+          (only (hafod shell classifier) alias-set! alias-remove!)
+          (only (hafod editor render) shell-highlight? shell-highlight-paths?)
+          (only (hafod shell default-aliases) default-aliases?)
           (hafod user-group))
 
   ;; ======================================================================
@@ -52,6 +60,41 @@
 
   (define (set-prompt! str)
     (repl-prompt-string str))
+
+  ;; ======================================================================
+  ;; plain-shell! -- master switch: a bare interactive surface
+  ;; ======================================================================
+
+  ;; One call in init.ss turns OFF every interactive enhancement at once -- the
+  ;; default alias set, directory-visit recording, shell-line highlighting,
+  ;; auto-cd, inline abbreviations, and substring history recall -- leaving a
+  ;; plain Scheme REPL.  The individual toggles still work for finer control; this
+  ;; is the convenience that flips them all.  (The informative prompt is opt-in and
+  ;; off by default, so a plain shell simply never enables it.)  Because init.ss is
+  ;; loaded before the REPL, clearing interactive-enhancements? here also
+  ;; suppresses the REPL-entry visit recording and default-alias install.
+  (define (plain-shell!)
+    (interactive-enhancements? #f)
+    (default-aliases? #f)
+    (shell-highlight? #f)
+    (shell-highlight-paths? #f)
+    (auto-cd? #f)
+    (abbr-expand? #f)
+    (history-search-mode 'prefix))
+
+  ;; ======================================================================
+  ;; alias / unalias / abbr / unabbr -- init-file helpers
+  ;; ======================================================================
+
+  ;; Thin wrappers so an init.ss can define command aliases and inline
+  ;; abbreviations in plain Scheme, for example (alias "ll" "ls -la") or
+  ;; (abbr "gco" "git checkout").  Each delegates to the very table the shell
+  ;; classifier (aliases) and the editor (abbreviations) already consult, so a
+  ;; definition made at start-up behaves exactly as one typed at the prompt.
+  (define (alias name value) (alias-set! name value))
+  (define (unalias name) (alias-remove! name))
+  (define (abbr name value) (abbr-set! name value))
+  (define (unabbr name) (abbr-remove! name))
 
   ;; ======================================================================
   ;; parse-key-description -- Emacs-style key description parser

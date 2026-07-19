@@ -6,6 +6,10 @@
 (library (hafod interactive)
   (export
     interactive-repl
+    ;; interactive-enhancements? -- master gate for the REPL-entry default-on
+    ;; affordances (visit recording, the default alias set).  init.ss sets it #f
+    ;; for a bare interactive surface; re-exported through the (hafod) umbrella.
+    interactive-enhancements?
     eval-script
     repl-prompt-hook
     repl-prompt-string
@@ -26,6 +30,44 @@
     repl-continuation-prompt
     ansi-visible-length
     background-job-count
+    ;; prompt-path-segment -- pure home-relative + fish-truncated path renderer.
+    ;; User-facing: the (hafod) umbrella re-exports it so init.ss config can
+    ;; compose a working-directory prompt segment.
+    prompt-path-segment
+    ;; prompt-git-segment -- single-spawn, coloured, sanitised, fail-quiet git
+    ;; state renderer; prompt-colour-ok? -- the overridable colour verdict thunk
+    ;; (default (colour-ok? 1)) that every coloured prompt segment gates on.
+    ;; Both user-facing (a later plan re-exports them from the (hafod) umbrella).
+    prompt-git-segment
+    prompt-colour-ok?
+    ;; prompt-exit-segment -- the red "✘N" exit-code badge for the right prompt,
+    ;; shown only after a non-zero last command.  User-facing: a later plan
+    ;; re-exports it from the (hafod) umbrella.
+    prompt-exit-segment
+    ;; prompt-timing-segment -- a format-duration readout for the right prompt,
+    ;; shown only when the last command ran at least prompt-timing-threshold (a
+    ;; parameter defaulting to 2000 ms).  Both user-facing: a later plan re-exports
+    ;; them from the (hafod) umbrella.
+    prompt-timing-segment
+    prompt-timing-threshold
+    ;; enable-informative-prompt! -- the one-call preset that composes the four
+    ;; prompt segments into the existing left/right hooks, configured by a
+    ;; quoted-symbol option plist with sensible defaults and still overridable
+    ;; segment by segment.  User-facing: a later plan re-exports it from the
+    ;; (hafod) umbrella and the config surface, beside set-prompt!.
+    enable-informative-prompt!
+    ;; sanitize-control -- pure C0/ESC/DEL/CR/LF stripper for prompt-derived
+    ;; text.  Leaf-only export (white-box test surface): a test reaches it via
+    ;; (only (hafod interactive) ...) to prove the prompt's control-byte defence
+    ;; directly.  Deliberately NOT re-exported from the (hafod) umbrella, the
+    ;; same convention as refresh-terminal-width! above.
+    sanitize-control
+    ;; parse-git-porcelain-v2 -- pure `git status --porcelain=v2 --branch` line
+    ;; parser.  Leaf-only export (white-box test surface): a test reaches it via
+    ;; (only (hafod interactive) ...) to prove the field extraction directly, the
+    ;; same convention as sanitize-control above.  NOT re-exported from the
+    ;; (hafod) umbrella.
+    parse-git-porcelain-v2
     ;; Shell mode re-exports (for config access)
     rebuild-path-cache!
     classify-input
@@ -33,10 +75,23 @@
     shell-mode?
     history-expansion?
     batch-mode?
-    use-editor?*)
+    use-editor?*
+    ;; auto-cd? -- when #t (default), a bare shell-mode line naming an existing
+    ;; directory changes into it.  User-facing: a later plan re-exports it from
+    ;; the (hafod) umbrella and the config surface so init.ss can switch it off.
+    auto-cd?
+    ;; auto-cd-target / auto-cd-decision / run-auto-cd! -- the leaf pieces of the
+    ;; auto-cd decision: the once-per-submit directory probe, the mode+toggle
+    ;; composite, and the literal-path change.  Leaf-only exports (white-box test
+    ;; surface): a test reaches them via (only (hafod interactive) ...) to drive
+    ;; the REPL's own auto-cd decision rather than a copy of it, the same
+    ;; convention as sanitize-control above.  NOT re-exported from the umbrella.
+    auto-cd-target
+    auto-cd-decision
+    run-auto-cd!)
 
   (import (except (chezscheme) getenv)
-          (only (hafod posix) status:exit-val SIGWINCH)
+          (only (hafod posix) status:exit-val SIGWINCH posix-waitpid)
           (only (hafod signal) set-signal-handler!)
           (only (hafod environment) getenv setenv)
           (only (hafod procobj) background-job-count)
@@ -47,10 +102,23 @@
                 reassert-cooked-tty! install-terminal-guard!)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod editor render) tokenize display-colourised)
+          ;; Pure prompt-path helpers: logical "."/".."/"//" cleanup, $HOME and
+          ;; the current directory (the latter two feed the impure prompt caller
+          ;; and are held in scope here), and the wcwidth display-width oracle so
+          ;; the path budget counts rendered columns rather than characters.
+          (only (hafod fname) simplify-file-name)
+          (only (hafod user-group) home-directory)
+          (only (hafod process-state) cwd)
+          (only (hafod editor input-decode) string-display-width)
           (only (hafod shell classifier) classify-input rebuild-path-cache! path-cache
-                command-not-found-suppress? command-not-found-suggestions)
-          (only (hafod shell parser) parse-shell-command)
-          (only (hafod shell builtins) run-builtin! builtin-names dir-stack)
+                command-not-found-suppress? command-not-found-suggestions alias-expand-line)
+          (only (hafod shell parser) parse-shell-command parse-command-words)
+          (only (hafod shell builtins) run-builtin! builtin-names dir-stack builtin-cd-path)
+          ;; visit-recording? gates the directory visit store; interactive-repl
+          ;; turns it on so an interactive session records visits, while a
+          ;; -c/-s/batch run leaves it off and never opens the database.
+          (only (hafod shell visit-db) visit-recording?)
+          (only (hafod shell default-aliases) default-aliases? install-default-aliases!)
           (only (hafod shell jobs) install-job-signals! update-jobs! drain-notifications!)
           (only (hafod shell history-expand) history-expand))
 
@@ -143,6 +211,48 @@
   ;; executor.  Set to #f to treat all input as Scheme expressions.
   (define shell-mode?
     (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for auto-cd.
+  ;; When #t (default), a bare shell-mode line that names an existing directory
+  ;; -- and resolves to no command, builtin, alias, or bound identifier -- changes
+  ;; into that directory instead of being evaluated.  Set to #f to switch it off.
+  (define auto-cd?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; auto-cd-target -- the sole filesystem probe on the auto-cd path, run once per
+  ;; submitted line (never on the per-keystroke classify path).  Returns the
+  ;; expanded directory word when LINE is a single bare shell token naming an
+  ;; existing directory that resolves to nothing else, or #f otherwise.  The
+  ;; single-word gate -- parse-command-words yielding exactly one word -- rejects
+  ;; any line carrying a shell operator or redirect, and command-not-found-suppress?
+  ;; declines the moment the token is a builtin, keyword, literal, alias, PATH
+  ;; command, or a bound Scheme identifier, so a real command or a bound variable
+  ;; always wins over a same-named directory.
+  (define (auto-cd-target line)
+    (let ([words (parse-command-words line)])
+      (and (pair? words)
+           (null? (cdr words))
+           (let ([word (car words)])
+             (and (not (command-not-found-suppress? word))
+                  (file-directory? word)
+                  word)))))
+
+  ;; auto-cd-decision -- compose the mode gate, the toggle, and the target so the
+  ;; dispatch and the tests share one predicate.  Returns the directory to enter,
+  ;; or #f when shell mode is off, auto-cd is off, or the line is not a bare
+  ;; existing-directory token.
+  (define (auto-cd-decision line)
+    (and (shell-mode?) (auto-cd?) (auto-cd-target line)))
+
+  ;; run-auto-cd! -- enter DIR through the injection-safe literal-cd seam.  DIR
+  ;; reaches chdir verbatim (never a rebuilt "cd " command line), so a directory
+  ;; whose name holds shell metacharacters is entered with no side effect.
+  ;; Return (void) so the REPL loops without evaluating anything.  The history
+  ;; entry is tagged 'shell once by the dispatch (which computes the auto-cd
+  ;; decision ahead of the case), so this no longer re-tags it.
+  (define (run-auto-cd! dir)
+    (builtin-cd-path dir)
+    (void))
 
   ;; Toggle for history expansion (!!, !$, !n, !-n, !prefix).
   ;; When #t (default), history expansion is performed before evaluation.
@@ -283,6 +393,311 @@
           [else
            (loop (+ i 1) (+ visible 1))]))))
 
+  ;; Strip terminal-hostile bytes from a prompt-derived string.  A directory or
+  ;; repository name may legally carry ESC, other C0 controls, CR, LF or DEL, and
+  ;; those bytes -- emitted verbatim -- would let a hostile name repaint the
+  ;; line, move the cursor or otherwise spoof the prompt.  Every path- and
+  ;; repository-derived string therefore passes through here before display: the
+  ;; result keeps every character of code >= space except DEL (#x7f) and the C1
+  ;; control range (#x80-#x9f), and drops ESC (#x1b) together with all other C0
+  ;; controls below the space code (so CR, LF and TAB are removed too).  The C1
+  ;; range is dropped as well because a UTF-8 terminal can read those code points
+  ;; as an eight-bit CSI (#x9b) or OSC (#x9d) introducer -- a second escape route
+  ;; a repository or directory name must not reach.  A single left-to-right walk
+  ;; mirrors ansi-visible-length above; no regex.
+  (define (sanitize-control str)
+    (let ([len (string-length str)]
+          [out (open-output-string)])
+      (let loop ([i 0])
+        (if (>= i len)
+            (get-output-string out)
+            (let* ([ch (string-ref str i)]
+                   [c (char->integer ch)])
+              (when (and (>= c #x20)
+                         (not (= c #x7f))
+                         (not (and (>= c #x80) (<= c #x9f))))
+                (write-char ch out))
+              (loop (+ i 1)))))))
+
+  ;; === Prompt path segment (pure) ===
+
+  ;; Split a string on "/", preserving empty segments so a leading "/" yields a
+  ;; leading empty segment (and thus a preserved leading slash on rejoin).
+  (define (split-on-slash str)
+    (let ([len (string-length str)])
+      (let loop ([i 0] [start 0] [acc '()])
+        (cond
+          [(>= i len) (reverse (cons (substring str start len) acc))]
+          [(char=? (string-ref str i) #\/)
+           (loop (+ i 1) (+ i 1) (cons (substring str start i) acc))]
+          [else (loop (+ i 1) start acc)]))))
+
+  ;; Rejoin path segments with "/".
+  (define (join-on-slash segs)
+    (if (null? segs)
+        ""
+        (let loop ([rest (cdr segs)] [acc (car segs)])
+          (if (null? rest)
+              acc
+              (loop (cdr rest) (string-append acc "/" (car rest)))))))
+
+  ;; Abbreviate one leading path segment to its first character, with two
+  ;; exceptions: a hidden segment (leading ".") keeps its dot and the following
+  ;; character (".config" -> ".c"), and "~" passes through unchanged.  An empty
+  ;; segment (the leading-slash placeholder) is returned untouched.  The "first
+  ;; character" is a whole Scheme char, so a wide/multibyte name abbreviates to
+  ;; one glyph, not one byte.
+  (define (abbreviate-segment seg)
+    (cond
+      [(string=? seg "~") "~"]
+      [(= (string-length seg) 0) seg]
+      [(char=? (string-ref seg 0) #\.)
+       (if (>= (string-length seg) 2) (substring seg 0 2) seg)]
+      [else (substring seg 0 1)]))
+
+  ;; Fish-style truncation of an already home-relative, simplified path: keep the
+  ;; last non-empty segment in full and abbreviate every earlier non-empty
+  ;; segment.  A path of only slashes (no non-empty segment) is returned as given.
+  (define (fish-truncate-path str)
+    (let* ([segs (split-on-slash str)]
+           [last-idx (let loop ([i (- (length segs) 1)])
+                       (cond
+                         [(< i 0) #f]
+                         [(> (string-length (list-ref segs i)) 0) i]
+                         [else (loop (- i 1))]))])
+      (if (not last-idx)
+          str
+          (join-on-slash
+            (let loop ([rest segs] [i 0] [acc '()])
+              (cond
+                [(null? rest) (reverse acc)]
+                [(= i last-idx) (loop (cdr rest) (+ i 1) (cons (car rest) acc))]
+                [else (loop (cdr rest) (+ i 1)
+                            (cons (abbreviate-segment (car rest)) acc))]))))))
+
+  ;; Render an absolute path home-relative and, past a display-width budget,
+  ;; fish-truncated -- purely, touching neither the filesystem nor git.  The
+  ;; caller passes the path string, the home string and the budget; nothing here
+  ;; reads $PWD, resolves a symlink or spawns a process, so the whole renderer is
+  ;; a table-driven unit under test.  Steps, in order:
+  ;;   1. Strip control bytes from the input (a directory name may carry
+  ;;      ESC/CR/LF/C0/DEL -- the boundary defence).
+  ;;   2. Home-relative: an exact match of home renders "~"; a path under home
+  ;;      (home followed by "/") has that prefix replaced with "~".  The boundary
+  ;;      is exact -- /home/user2 does NOT collapse to ~2 when home is
+  ;;      /home/user, because the character after the home prefix must be "/".
+  ;;      simplify-file-name then folds logical "."/".."/"//" without ever
+  ;;      resolving a symlink.
+  ;;   3. Within budget -- measured by DISPLAY width, so a wide CJK/emoji name
+  ;;      counts its rendered columns, not its character count -- the path is
+  ;;      returned untruncated.  The budget triggers truncation; it is not a hard
+  ;;      cap.
+  ;;   4. Otherwise fish-truncate.  Root "/" always renders "/".
+  (define (prompt-path-segment path home budget)
+    (let* ([clean (sanitize-control path)]
+           [home-len (string-length home)]
+           [rel (cond
+                  ;; An empty home (HOME unset or "") has no prefix to collapse --
+                  ;; without this guard every absolute path would match the "" prefix
+                  ;; and render as "~/...".
+                  [(= home-len 0) clean]
+                  [(string=? clean home) "~"]
+                  [(and (> (string-length clean) home-len)
+                        (string=? (substring clean 0 home-len) home)
+                        (char=? (string-ref clean home-len) #\/))
+                   (string-append "~" (substring clean home-len (string-length clean)))]
+                  [else clean])]
+           [simplified (simplify-file-name rel)])
+      (cond
+        [(string=? simplified "/") "/"]
+        [(<= (string-display-width simplified) budget) simplified]
+        [else (fish-truncate-path simplified)])))
+
+  ;; === Prompt git segment ===
+
+  ;; Return the remainder of LINE after PREFIX when LINE begins with PREFIX, else
+  ;; #f -- how the value is plucked from a porcelain-v2 "# branch.<field> <value>"
+  ;; header line.
+  (define (git-header-value line prefix)
+    (let ([plen (string-length prefix)]
+          [llen (string-length line)])
+      (and (>= llen plen)
+           (string=? (substring line 0 plen) prefix)
+           (substring line plen llen))))
+
+  ;; Does LINE begin with the kind byte C followed by a space?  Porcelain-v2 tags
+  ;; each entry with a leading kind byte -- "1"/"2" for a changed entry, "u" for
+  ;; an unmerged one, "?" for an untracked path -- then a space.
+  (define (git-line-kind? line c)
+    (and (>= (string-length line) 2)
+         (char=? (string-ref line 0) c)
+         (char=? (string-ref line 1) #\space)))
+
+  ;; Magnitude of a signed ahead/behind token: "+1" and "-1" both yield 1.  Git
+  ;; always prints the sign, so the sign carries no information the +/- position
+  ;; does not; only the count matters.
+  (define (ab-magnitude tok)
+    (let ([n (string->number tok)])
+      (if (and n (integer? n)) (abs n) 0)))
+
+  ;; Parse the "+N -M" body of a "# branch.ab" line into two non-negative counts.
+  ;; A malformed body (no separating space) degrades to 0/0 rather than raising.
+  (define (parse-ahead-behind body)
+    (let* ([len (string-length body)]
+           [sp (let loop ([i 0])
+                 (cond
+                   [(>= i len) #f]
+                   [(char=? (string-ref body i) #\space) i]
+                   [else (loop (+ i 1))]))])
+      (if (not sp)
+          (values 0 0)
+          (values (ab-magnitude (substring body 0 sp))
+                  (ab-magnitude (substring body (+ sp 1) len))))))
+
+  ;; Pure parser over the lines of `git status --porcelain=v2 --branch`.  Returns
+  ;; six values and performs no I/O or rendering -- it only reads the line list:
+  ;;   head    text after "# branch.head " (may be the literal "(detached)"); #f
+  ;;           when no such line is present, which an empty list -- not a
+  ;;           repository -- yields.
+  ;;   oid     text after "# branch.oid " (may be the literal "(initial)" on an
+  ;;           unborn branch); #f when absent.
+  ;;   ahead   the +N magnitude of "# branch.ab +N -M"; 0 when the line is absent.
+  ;;   behind  the -M magnitude; 0 when absent.  A branch with no upstream carries
+  ;;           no branch.ab line at all, so both default to 0 rather than erroring.
+  ;;   staged? any "1"/"2" entry whose staged (X) column is not ".", or any "u"
+  ;;           unmerged entry.
+  ;;   dirty?  any "1"/"2" entry whose worktree (Y) column is not ".", any "u"
+  ;;           unmerged entry, or any "?" untracked entry.  Untracked-as-dirty is
+  ;;           a deliberate policy: an untracked-only tree is not clean -- it
+  ;;           renders yellow with a "*" marker -- which keeps the marker set to
+  ;;           just "*"/"+" with no third glyph.
+  (define (parse-git-porcelain-v2 lines)
+    (let loop ([ls lines] [head #f] [oid #f] [ahead 0] [behind 0]
+               [staged? #f] [dirty? #f])
+      (if (null? ls)
+          (values head oid ahead behind staged? dirty?)
+          (let ([line (car ls)] [rest (cdr ls)])
+            (cond
+              [(git-header-value line "# branch.head ")
+               => (lambda (v) (loop rest v oid ahead behind staged? dirty?))]
+              [(git-header-value line "# branch.oid ")
+               => (lambda (v) (loop rest head v ahead behind staged? dirty?))]
+              [(git-header-value line "# branch.ab ")
+               => (lambda (v)
+                    (let-values ([(a b) (parse-ahead-behind v)])
+                      (loop rest head oid a b staged? dirty?)))]
+              [(or (git-line-kind? line #\1) (git-line-kind? line #\2))
+               (if (>= (string-length line) 4)
+                   (loop rest head oid ahead behind
+                         (or staged? (not (char=? (string-ref line 2) #\.)))
+                         (or dirty?  (not (char=? (string-ref line 3) #\.))))
+                   (loop rest head oid ahead behind staged? dirty?))]
+              [(git-line-kind? line #\u)
+               (loop rest head oid ahead behind #t #t)]
+              [(git-line-kind? line #\?)
+               (loop rest head oid ahead behind staged? #t)]
+              [else
+               (loop rest head oid ahead behind staged? dirty?)])))))
+
+  ;; Single-spawn collector for the git segment: run `git status --porcelain=v2
+  ;; --branch` and return its stdout lines, closing both child pipes and
+  ;; swallowing any error.  Kept private and copied from the completion helper's
+  ;; one-shot pattern rather than shared, so the prompt owns its own git probe.
+  ;; Three properties are load-bearing.  The command is a fixed literal -- no
+  ;; repository- or user-derived token is concatenated into it, so there is
+  ;; nothing to inject through.  The stderr pipe is closed unread, so git's
+  ;; "fatal: not a git repository" outside a working tree is discarded rather than
+  ;; scrolling above the prompt.  And the child is reaped before returning, on
+  ;; every path, so it does not linger as a zombie until the next collection: the
+  ;; segment runs on every prompt draw, and an unreaped child here would let the
+  ;; process table fill across a long session.  The blocking wait returns at once
+  ;; because stdout has already reached EOF, so git has finished; a missing child
+  ;; (already reaped by a collector guardian) surfaces as an error and is ignored.
+  ;; A spawn failure (git absent) is caught and read as no lines, i.e. an empty
+  ;; segment.
+  (define (git-status-porcelain-v2)
+    (guard (e [#t '()])
+      (let-values ([(to-stdin from-stdout from-stderr pid)
+                    (open-process-ports
+                      "git status --porcelain=v2 --branch"
+                      (buffer-mode block)
+                      (make-transcoder (utf-8-codec)))])
+        (close-port to-stdin)
+        (dynamic-wind
+          (lambda () (void))
+          (lambda ()
+            (let loop ([acc '()])
+              (let ([line (get-line from-stdout)])
+                (if (eof-object? line)
+                    (reverse acc)
+                    (loop (cons line acc))))))
+          (lambda ()
+            (close-port from-stdout)
+            (close-port from-stderr)
+            (guard (e [#t (void)])
+              (let-values ([(w s) (posix-waitpid pid 0)]) (void))))))))
+
+  ;; The colour verdict for coloured prompt segments, held as an overridable
+  ;; thunk.  It MUST gate on the real terminal, never on the current output port:
+  ;; while the left-prompt hook runs, both the console and current output ports
+  ;; are rebound to a string capture port (the editor reads the captured prompt
+  ;; back), so a port-based verdict would read "not a terminal" and every segment
+  ;; would be plain in real use.  The default asks whether fd 1 -- the descriptor
+  ;; the editor renders to -- may carry colour.  A user (or a test) may rebind it
+  ;; to force the decision; a test uses this as the deterministic, PTY-free seam
+  ;; for the fd-1 gate.  The validator requires a procedure, mirroring the prompt
+  ;; hooks above.
+  (define prompt-colour-ok?
+    (make-parameter
+      (lambda () (colour-ok? 1))
+      (lambda (v)
+        (unless (procedure? v)
+          (error 'prompt-colour-ok? "expected a procedure" v))
+        v)))
+
+  ;; Build the git-state segment from one `git status --porcelain=v2 --branch`
+  ;; spawn: the branch name (or "@" + a 7-char short oid when detached), "*" when
+  ;; the working tree is dirty and "+" when it has staged changes, then "⇡N"/"⇣M"
+  ;; ahead/behind counts.  Empty outside a repository or when git is absent -- a
+  ;; quiet, escape-free "".  The branch head is stripped of control bytes before
+  ;; display, since a repository name is attacker-controlled, and the detached oid
+  ;; is sliced to seven hex characters.  Colour is 256-colour SGR -- green
+  ;; (index 2) when clean, yellow (index 3) when dirty or staged -- emitted only
+  ;; when the injectable colour verdict is true; a false verdict yields the same
+  ;; glyphs as plain text.  The up/down arrows are written as hex escapes so the
+  ;; source is unambiguous about the exact code points (U+21E1, U+21E3), both
+  ;; display-width 1.
+  (define (prompt-git-segment)
+    (let ([lines (git-status-porcelain-v2)])
+      (if (null? lines)
+          ""
+          (let-values ([(head oid ahead behind staged? dirty?)
+                        (parse-git-porcelain-v2 lines)])
+            (if (not head)
+                ""
+                (let* ([name (if (string=? head "(detached)")
+                                 (string-append
+                                   "@" (if (string? oid)
+                                           (substring oid 0 (min 7 (string-length oid)))
+                                           ""))
+                                 (sanitize-control head))]
+                       [markers (string-append (if dirty? "*" "") (if staged? "+" ""))]
+                       [ab (string-append
+                             (if (> ahead 0)
+                                 (string-append "\x21e1;" (number->string ahead)) "")
+                             (if (> behind 0)
+                                 (string-append "\x21e3;" (number->string behind)) ""))]
+                       [body (string-append
+                               name
+                               (if (string=? markers "") "" (string-append " " markers))
+                               (if (string=? ab "") "" (string-append " " ab)))]
+                       [clean? (and (not dirty?) (not staged?))])
+                  (if ((prompt-colour-ok?))
+                      (string-append (if clean? "\x1b;[38;5;2m" "\x1b;[38;5;3m")
+                                     body
+                                     "\x1b;[39m")
+                      body)))))))
+
   ;; Display right prompt at the right terminal edge using ANSI cursor positioning.
   ;; Captures right prompt hook output, calculates column, emits ESC 7 / ESC[colG / ESC 8.
   ;; Skips if output is empty or terminal too narrow.
@@ -415,6 +830,160 @@
               (when colour? (display "\x1b;[39m" (console-error-port)))
               (newline (console-error-port))))))))
 
+  ;; === Prompt exit and timing segments (right prompt) ===
+
+  ;; Build the exit-code segment for the right prompt: the empty string after a
+  ;; successful last command -- success is silent -- and "✘N", N being the
+  ;; decimal last status, after a failure.  The badge is red 256-colour SGR
+  ;; (index 1) when the injectable colour verdict is true and the same glyphs
+  ;; plain when it is false, exactly the discipline the git segment follows:
+  ;; colour gates on prompt-colour-ok? (fd 1 by default), never on the string
+  ;; capture port the prompt is drawn into.  The cross U+2718 is written as a hex
+  ;; escape so the source is unambiguous about the code point; it is
+  ;; display-width 1.
+  (define (prompt-exit-segment)
+    (let ([s (last-status)])
+      (if (zero? s)
+          ""
+          (let ([body (string-append "\x2718;" (number->string s))])
+            (if ((prompt-colour-ok?))
+                (string-append "\x1b;[38;5;1m" body "\x1b;[39m")
+                body)))))
+
+  ;; The command-timing display threshold in milliseconds, an overridable
+  ;; parameter so a user may raise or lower the point at which the right prompt
+  ;; begins to show a duration.  Default 2000 ms, matching display-command-timing!'s
+  ;; own fixed gate.  Validated as a non-negative exact integer, mirroring
+  ;; last-duration above.
+  (define prompt-timing-threshold
+    (make-parameter 2000
+      (lambda (v)
+        (unless (and (integer? v) (exact? v) (>= v 0))
+          (error 'prompt-timing-threshold "expected a non-negative exact integer" v))
+        v)))
+
+  ;; Build the command-timing segment for the right prompt.  It is the empty
+  ;; string unless the last command ran at least the threshold in milliseconds AND
+  ;; format-duration yields a string; otherwise it is that formatted duration.  The
+  ;; two gates are independent: the threshold is the configurable point at which
+  ;; timing begins to show, while format-duration returns #f below one second
+  ;; regardless -- so a threshold under 1000 still shows nothing until the duration
+  ;; crosses a second.  With no argument the live prompt-timing-threshold is read;
+  ;; a threshold may also be passed explicitly.  Coloured grey (256-colour
+  ;; index 240, matching display-command-timing!) when the injectable colour
+  ;; verdict is true and plain when it is false.
+  (define prompt-timing-segment
+    (case-lambda
+      [() (prompt-timing-segment (prompt-timing-threshold))]
+      [(threshold)
+       (let ([dur (last-duration)])
+         (if (>= dur threshold)
+             (let ([str (format-duration dur)])
+               (if str
+                   (if ((prompt-colour-ok?))
+                       (string-append "\x1b;[38;5;240m" str "\x1b;[39m")
+                       str)
+                   ""))
+             ""))]))
+
+  ;; === Informative prompt preset ===
+
+  ;; Join the non-empty strings of PARTS with a single space, dropping the empty
+  ;; ones, so a hidden right-prompt segment leaves no stray separator.  Only two
+  ;; parts arise here (the exit badge and the timing readout), but the fold is
+  ;; written for any count.
+  (define (join-nonempty-space parts)
+    (let loop ([ps parts] [acc ""])
+      (cond
+        [(null? ps) acc]
+        [(string=? (car ps) "") (loop (cdr ps) acc)]
+        [(string=? acc "") (loop (cdr ps) (car ps))]
+        [else (loop (cdr ps) (string-append acc " " (car ps)))])))
+
+  ;; The current directory as the shell sees it: the logical $PWD when it is set
+  ;; and non-empty, otherwise the real working directory from (cwd).  Reading $PWD
+  ;; keeps a path through a symbolic link exactly as the user reached it -- the
+  ;; logical PWD semantics every shell follows -- rather than resolving the link;
+  ;; the (cwd) fallback covers a process started with no PWD in its environment.
+  ;; This impure read is kept OUT of the pure prompt-path-segment, which is handed
+  ;; the directory string and so stays filesystem-free and table-testable.
+  (define (prompt-logical-cwd)
+    (let ([p (getenv "PWD")])
+      (if (and p (> (string-length p) 0)) p (cwd))))
+
+  ;; Install the informative prompt in a single call: compose the path and git
+  ;; segments into the left prompt and the exit-code and command-timing segments
+  ;; into the right prompt, by SETTING the two existing hook parameters.  It adds
+  ;; no dispatch mechanism and no theme language of its own -- it only wires the
+  ;; segment procedures already defined above into repl-prompt-hook and
+  ;; repl-right-prompt-hook.
+  ;;
+  ;; OPTS is a plist of QUOTED SYMBOLS (key value key value ...), not reader
+  ;; keywords.  Chez has no keyword objects, so a written "#:git" would read as a
+  ;; fresh uninterned symbol that could never match a key and would be silently
+  ;; ignored; the keys are therefore plain symbols -- (enable-informative-prompt!
+  ;; 'git #f 'path-width 60).  Each key has a sensible default, so a bare
+  ;; (enable-informative-prompt!) installs a working prompt.  Recognised keys:
+  ;;   git                 boolean, default #t  -- include the git-state segment
+  ;;   path-width          integer, default 40  -- the path truncation budget
+  ;;   timing-threshold-ms integer, default 2000 -- the timing display threshold
+  ;;   exit-code           boolean, default #t  -- include the exit-code badge
+  ;;   timing              boolean, default #t  -- include the command-timing readout
+  ;; An odd-length option list or an unknown key raises a clear error rather than
+  ;; silently mis-configuring the prompt.
+  ;;
+  ;; The preset stays overridable segment by segment precisely because it composes
+  ;; the existing parameters rather than freezing a rendering: rebinding
+  ;; repl-prompt-hook or repl-right-prompt-hook wholesale after this call replaces
+  ;; the whole line on the next draw, and the timing threshold is published through
+  ;; prompt-timing-threshold, so raising or lowering it later still takes effect.
+  ;; Nothing here captures a hook or a segment by value.
+  (define (enable-informative-prompt! . opts)
+    (let loop ([o opts] [git? #t] [path-width 40] [timing-ms 2000]
+               [exit? #t] [timing? #t])
+      (cond
+        [(null? o)
+         ;; Publish the timing threshold so the right hook -- and any later bare
+         ;; (prompt-timing-segment) -- reads it, and so an invalid value is
+         ;; rejected here rather than at the first prompt draw.
+         (prompt-timing-threshold timing-ms)
+         (repl-prompt-hook
+           (lambda ()
+             (let ([path (prompt-path-segment
+                           (prompt-logical-cwd) (home-directory) path-width)]
+                   [git (if git? (prompt-git-segment) "")])
+               (display path (current-output-port))
+               (unless (string=? git "")
+                 (display " " (current-output-port))
+                 (display git (current-output-port)))
+               ;; A trailing space separates the prompt from the typed input.
+               (display " " (current-output-port)))))
+         (repl-right-prompt-hook
+           (lambda ()
+             (display
+               (join-nonempty-space
+                 (list (if exit? (prompt-exit-segment) "")
+                       (if timing? (prompt-timing-segment) "")))
+               (current-output-port))))]
+        [(null? (cdr o))
+         (error 'enable-informative-prompt! "odd option list" opts)]
+        [else
+         (let ([key (car o)] [val (cadr o)] [rest (cddr o)])
+           (case key
+             [(git)                 (loop rest val path-width timing-ms exit? timing?)]
+             [(path-width)
+              ;; Validate here, at configuration time, rather than letting a bad
+              ;; width raise inside the prompt hook at draw time -- that raise would
+              ;; land outside the REPL's eval guard and disrupt the read loop.
+              (unless (and (integer? val) (exact? val) (positive? val))
+                (error 'enable-informative-prompt!
+                       "path-width must be a positive exact integer" val))
+              (loop rest git? val timing-ms exit? timing?)]
+             [(timing-threshold-ms) (loop rest git? path-width val exit? timing?)]
+             [(exit-code)           (loop rest git? path-width timing-ms val timing?)]
+             [(timing)              (loop rest git? path-width timing-ms exit? val)]
+             [else (error 'enable-informative-prompt! "unknown option" key)]))])))
+
   ;; === Command-not-found suggestions ===
 
   ;; Extract first whitespace-delimited token from a string.
@@ -481,7 +1050,25 @@
 
   ;; === REPL loop ===
 
+  ;; Master switch for the REPL-entry default-on affordances.  init.ss is loaded
+  ;; BEFORE the REPL runs, so a bare (visit-recording? #f) there would be undone
+  ;; by the enablement below; this gate lets init.ss (or plain-shell!) turn the
+  ;; whole default-on set off up front.  #t installs them, #f leaves a bare REPL;
+  ;; the individual toggles (shell-highlight?, auto-cd?, ...) still apply on top.
+  (define interactive-enhancements?
+    (make-parameter #t (lambda (v) (and v #t))))
+
   (define (interactive-repl)
+    ;; The REPL-entry default-on affordances, all behind the master gate so a
+    ;; plain-shell! / (interactive-enhancements? #f) in init.ss (loaded first)
+    ;; suppresses them: recording directory visits (an interactive-session
+    ;; affordance, off at program top-level so a -c/-s/batch run never opens the
+    ;; visit database) and installing the default alias set (each alias skipped
+    ;; when the user already defined it in init.ss).
+    (when (interactive-enhancements?)
+      (visit-recording? #t)
+      (when (default-aliases?)
+        (install-default-aliases!)))
     ;; SHLVL management: increment on entry, decrement on exit
     (let ([old-shlvl (let ([v (getenv "SHLVL")])
                        (if v (or (string->number v) 0) 0))])
@@ -585,12 +1172,43 @@
                                                  (display expanded (console-error-port))
                                                  (newline (console-error-port))
                                                  expanded))])
-                              (let ([class (if (shell-mode?)
-                                               (classify-input line)
-                                               'scheme)])
-                                ;; Tag the history entry with its eval mode
+                              (let* ([class (if (shell-mode?)
+                                                (classify-input line)
+                                                'scheme)]
+                                     ;; The line actually executed.  An alias head
+                                     ;; is expanded to its target here, at exec
+                                     ;; time, so the builtin, shell and scheme arms
+                                     ;; all run the expansion -- while history and
+                                     ;; the echoed line keep the raw alias name
+                                     ;; (aliases stay invisible, unlike
+                                     ;; history-expand, which prints its rewrite
+                                     ;; above).  The scheme arm reads exec-line too:
+                                     ;; an alias whose expansion is a Scheme form, a
+                                     ;; literal, or a bare bound identifier DOES
+                                     ;; classify as scheme, so it lands there and
+                                     ;; must run the expansion, not the raw name.
+                                     ;; The auto-cd rescue keeps the raw line, as an
+                                     ;; aliased head is command-not-found suppressed
+                                     ;; and so never auto-cds.
+                                     [exec-line (if (shell-mode?)
+                                                    (alias-expand-line line)
+                                                    line)]
+                                     ;; The auto-cd decision, computed once: a bare
+                                     ;; existing-directory token in shell mode
+                                     ;; (which classifies as scheme).  Reused to tag
+                                     ;; history AND to dispatch below, so the tag is
+                                     ;; written a single time here -- run-auto-cd!
+                                     ;; no longer re-tags it.
+                                     [cd-dir (and (eq? class 'scheme)
+                                                  (auto-cd-decision line))])
+                                ;; Tag the history entry with its eval mode: a
+                                ;; builtin, a shell command, or an auto-cd all act
+                                ;; as shell; only a genuine Scheme evaluation is
+                                ;; tagged 'scheme.
                                 (editor-history-set-last-mode!
-                                  (if (memq class '(shell builtin)) 'shell 'scheme))
+                                  (if (or (memq class '(shell builtin)) cd-dir)
+                                      'shell
+                                      'scheme))
                                 (case class
                                   [(builtin)
                                    ;; Execute builtin directly, skip eval
@@ -600,14 +1218,27 @@
                                                   (display-condition exn (console-error-port))
                                                   (when colour? (display "\x1b;[39m" (console-error-port)))
                                                   (newline (console-error-port)))])
-                                     (run-builtin! line))
+                                     (run-builtin! exec-line))
                                    ;; Return (void) so the existing cond path skips display
                                    (void)]
                                   [(shell)
                                    ;; Parse to EPF datum, return for eval
-                                   (parse-shell-command line)]
+                                   (parse-shell-command exec-line)]
                                   [else
-                                   ;; Original path (scheme)
+                                   ;; Original path (scheme), with a leading
+                                   ;; auto-cd rescue: a bare shell-mode token that
+                                   ;; names an existing directory (resolving to no
+                                   ;; command, builtin, alias, or bound identifier)
+                                   ;; changes into it and skips eval, returning
+                                   ;; (void) so the loop continues just as the
+                                   ;; builtin arm does.  A real command/builtin/alias
+                                   ;; never reaches this arm (it classifies as
+                                   ;; 'shell or 'builtin), so "a real command wins"
+                                   ;; needs no extra code here.
+                                   (cond
+                                     [cd-dir
+                                      => (lambda (dir) (run-auto-cd! dir) (void))]
+                                     [else
                                    ;; Check for command-not-found when input doesn't
                                    ;; start with Scheme prefix chars
                                    (let* ([trimmed (let skip ([i 0])
@@ -622,21 +1253,44 @@
                                                 (not (memv first-ch '(#\( #\' #\` #\# #\, #\[))))
                                        (command-not-found-check line)))
                                    ;; Read all s-expressions from the input.
-                                   ;; Multiple expressions are tagged so the
-                                   ;; eval loop can process each one individually,
-                                   ;; printing results between them.
-                                   (let* ([p (open-input-string line)]
-                                          [first (read p)])
-                                     (if (eof-object? first)
-                                         first
-                                         (let ([second (read p)])
-                                           (if (eof-object? second)
-                                               first
-                                               (let gather ([acc (list second first)])
-                                                 (let ([next (read p)])
-                                                   (if (eof-object? next)
-                                                       (cons %multi-form-tag (reverse acc))
-                                                       (gather (cons next acc)))))))))])))])))
+                                   ;; Multiple expressions are tagged so the eval
+                                   ;; loop can process each one individually,
+                                   ;; printing results between them.  read-forms is
+                                   ;; applied to exec-line when an alias expanded to
+                                   ;; a Scheme form (so the EXPANSION runs, not the
+                                   ;; bare alias name), and to the raw line
+                                   ;; otherwise -- the two are identical for all
+                                   ;; genuine, non-alias Scheme input, so that path
+                                   ;; is byte-for-byte unchanged.  A malformed alias
+                                   ;; expansion is caught rather than aborting the
+                                   ;; REPL, and an empty one is a no-op instead of
+                                   ;; an EOF (which would quit the loop).
+                                   (let ([read-forms
+                                          (lambda (src)
+                                            (let* ([p (open-input-string src)]
+                                                   [first (read p)])
+                                              (if (eof-object? first)
+                                                  first
+                                                  (let ([second (read p)])
+                                                    (if (eof-object? second)
+                                                        first
+                                                        (let gather ([acc (list second first)])
+                                                          (let ([next (read p)])
+                                                            (if (eof-object? next)
+                                                                (cons %multi-form-tag (reverse acc))
+                                                                (gather (cons next acc))))))))))])
+                                     (if (string=? exec-line line)
+                                         (read-forms line)
+                                         (let ([forms
+                                                (guard (exn
+                                                         [#t (let ([colour? (colour-ok? (console-error-port))])
+                                                               (when colour? (display "\x1b;[31m" (console-error-port)))
+                                                               (display-condition exn (console-error-port))
+                                                               (when colour? (display "\x1b;[39m" (console-error-port)))
+                                                               (newline (console-error-port)))
+                                                             (void)])
+                                                  (read-forms exec-line))])
+                                           (if (eof-object? forms) (void) forms))))])])))])))
                          ;; Non-terminal mode: existing behaviour
                          (begin
                            ;; 1. Display right prompt (before left prompt)

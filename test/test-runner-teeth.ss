@@ -34,7 +34,7 @@
 (import (test runner)
         (except (chezscheme) vector-append exit open-input-file open-output-file
                              truncate-file delete-file rename-file
-                             make-date date? getenv)
+                             make-date date? getenv alias)
         (hafod)
         (hafod temp-file))
 

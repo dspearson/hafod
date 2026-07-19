@@ -11,13 +11,15 @@
           history-entries history-count history-ref history-entry-mode
           history-set-last-mode!
           history-search-backward history-prefix-search-backward
+          history-substring-search-backward history-substring-suffix
+          smart-substring-match?
           string-prefix?)
   (import (chezscheme)
           (hafod editor sqlite3)
           (hafod fuzzy)
           (only (hafod exit-hooks) add-exit-hook!)
           (only (hafod internal posix-file) posix-chmod)
-          (only (hafod srfi-13) string-prefix?))
+          (only (hafod srfi-13) string-prefix? string-contains string-contains-ci))
 
   ;; History record:
   ;;   db          — SQLite database handle (or #f if unavailable)
@@ -452,21 +454,33 @@
   ;; Search helpers
   ;; ======================================================================
 
-  ;; Substring search: return #t if needle is found anywhere in haystack.
-  (define (string-contains haystack needle)
-    (let ([hlen (string-length haystack)]
-          [nlen (string-length needle)])
-      (cond
-        [(= nlen 0) #t]
-        [(> nlen hlen) #f]
-        [else
-         (let loop ([i 0])
-           (cond
-             [(> (+ i nlen) hlen) #f]
-             [(string=? needle (substring haystack i (+ i nlen))) #t]
-             [else (loop (+ i 1))]))])))
+  ;; string-prefix? / string-contains / string-contains-ci imported from
+  ;; (hafod srfi-13) — the substring predicates return the match INDEX (truthy,
+  ;; including 0) or #f, rather than a plain boolean.
 
-  ;; string-prefix? imported from (hafod srfi-13)
+  ;; True when the needle carries no uppercase letter.  This is the smart-case
+  ;; gate: an all-lowercase needle is treated as case-insensitive, a needle with
+  ;; any uppercase as case-sensitive.  Mirrors the fuzzy matcher's convention so
+  ;; substring recall and fuzzy recall agree on what "smart-case" means.
+  (define (needle-all-lower? s)
+    (let ([len (string-length s)])
+      (let loop ([i 0])
+        (or (>= i len)
+            (and (not (char-upper-case? (string-ref s i)))
+                 (loop (+ i 1)))))))
+
+  ;; Does `entry` contain `needle` anywhere, honouring smart-case?  Returns the
+  ;; SRFI 13 match index (truthy, including 0) or #f.  An empty needle matches
+  ;; everything — the SRFI 13 semantics — which is the correct "no filter"
+  ;; behaviour when the user has typed nothing to narrow by.
+  ;;
+  ;; This is the single predicate both the backward scan below and the editor's
+  ;; forward scan are meant to share, so Up and Down can never disagree about
+  ;; what counts as a match.
+  (define (smart-substring-match? needle entry)
+    (if (needle-all-lower? needle)
+        (string-contains-ci entry needle)
+        (string-contains entry needle)))
 
   ;; Search backward through history entries for a fuzzy match.
   ;; h: history object, query: search string, start-idx: index to start from (inclusive).
@@ -487,5 +501,41 @@
         [(< i 0) #f]
         [(string-prefix? prefix (history-ref h i)) i]
         [else (loop (- i 1))])))
+
+  ;; Search backward through history entries for a substring match.
+  ;; h: history object, needle: search string, start-idx: index to start from
+  ;; (inclusive).  Identical in shape to history-prefix-search-backward, but the
+  ;; match is a smart-case substring found ANYWHERE in the entry rather than only
+  ;; at its head — so a mid-line match is found where a prefix search would miss
+  ;; it.  Returns the index of the first matching entry, or #f.  The predicate is
+  ;; smart-substring-match?, shared with the editor's forward scan.
+  (define (history-substring-search-backward h needle start-idx)
+    (let loop ([i start-idx])
+      (cond
+        [(< i 0) #f]
+        [(smart-substring-match? needle (history-ref h i)) i]
+        [else (loop (- i 1))])))
+
+  ;; The tail of the most recent entry that contains `needle` as a smart-case
+  ;; substring -- the entry text that FOLLOWS the matched occurrence -- or "" when
+  ;; no entry contains it.  Sits beside history-substring-search-backward and
+  ;; shares its predicate: the search finds the entry, then smart-substring-match?
+  ;; gives back the very index that entry matched at, so the slice starts exactly
+  ;; past the matched occurrence (match index + needle length) and runs to the end
+  ;; of the entry.  This is the substring suffix the ghost autosuggestion falls
+  ;; through to when nothing HEADS with the typed text: reaching for "amend" over
+  ;; a past "git commit --amend" offers " " onwards, where a prefix search --
+  ;; anchored at the head of every entry -- would offer nothing at all.  A truthy
+  ;; match index includes 0, so the (smart-substring-match? ...) result is used as
+  ;; the offset directly; the search already proved it is not #f.
+  (define (history-substring-suffix h needle start-idx)
+    (let ([idx (history-substring-search-backward h needle start-idx)])
+      (if idx
+          (let* ([entry (history-ref h idx)]
+                 [moff (smart-substring-match? needle entry)])
+            (substring entry
+                       (+ moff (string-length needle))
+                       (string-length entry)))
+          "")))
 
 ) ; end library

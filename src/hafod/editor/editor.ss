@@ -67,6 +67,17 @@
           editor-finder-proc
           ;; Feature toggles
           fuzzy-finder? tab-completions?
+          ;; History recall search mode: 'substring (default) matches the typed
+          ;; needle anywhere in a past line, 'prefix keeps the strict
+          ;; head-anchored behaviour.  A user-facing parameter published through
+          ;; the umbrella later; exported here so the recall suite drives it.
+          history-search-mode
+          ;; Command-head abbreviations: the pure cores, table accessors and the
+          ;; Space command are white-box exports the suite drives directly;
+          ;; abbr-expand? is user-facing and re-exported by the umbrella later.
+          expand-abbr-head expand-first-abbr
+          abbr-set! abbr-remove! abbr-ref abbr-expand?
+          cmd-expand-abbr-or-space
           ;; Help
           show-keybindings run-tutorial)
   (import (chezscheme)
@@ -83,7 +94,8 @@
           (hafod tty)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
           (only (hafod shell classifier) path-cache scheme-prefix-chars)
-          (only (hafod shell completers) lookup-completer)
+          (only (hafod shell completers)
+                lookup-completer user-completer command-flag-completer)
           (only (hafod collect) run/strings*)
           (only (hafod process) exec-path))
 
@@ -773,12 +785,25 @@
 
   ;; Always submit for eval (Enter in normal mode)
   (define (cmd-submit es)
-    (let* ([gb (editor-state-gb es)]
-           [text (gap-buffer->string gb)])
-      (history-add! editor-history text)
-      (history-reset-nav! editor-history)
-      (editor-state-done?-set! es #t)
-      (editor-state-result-set! es text)))
+    (let ([gb (editor-state-gb es)])
+      ;; Fish "expand on execute": expand a pending command-head abbreviation
+      ;; into the visible buffer before the line is taken, so both the submitted
+      ;; line and its history entry carry the expansion.  Gated on abbr-expand?
+      ;; so the toggle's "nothing expands when off" contract holds on Enter just
+      ;; as it does on Space; with the toggle off the buffer is submitted
+      ;; verbatim.  A Scheme buffer is left untouched by the shell-context gate
+      ;; inside expand-first-abbr.  Folded into one undo step via editor-snapshot!
+      ;; for symmetry with the Space path.
+      (when (abbr-expand?)
+        (let-values ([(nt nc) (expand-first-abbr (gap-buffer->string gb))])
+          (when nt
+            (editor-snapshot! gb)
+            (editor-replace-text! gb nt nc))))
+      (let ([text (gap-buffer->string gb)])
+        (history-add! editor-history text)
+        (history-reset-nav! editor-history)
+        (editor-state-done?-set! es #t)
+        (editor-state-result-set! es text))))
 
   ;; Helper: find the line number (0-based) of a position in a string
   (define (cursor-line text pos)
@@ -869,7 +894,14 @@
             (if history-prefix
                 (let* ([cur (history-cursor editor-history)]
                        [start (if (= cur -1) (- (history-count editor-history) 1) (- cur 1))]
-                       [idx (history-prefix-search-backward editor-history history-prefix start)])
+                       ;; Branch the backward scan on the search mode: the default
+                       ;; matches the needle anywhere in a line, 'prefix keeps the
+                       ;; head-anchored search.  cmd-history-next's forward loop
+                       ;; branches on the same mode through the same predicate, so
+                       ;; Up and Down agree on which entries match.
+                       [idx (if (eq? (history-search-mode) 'prefix)
+                                (history-prefix-search-backward editor-history history-prefix start)
+                                (history-substring-search-backward editor-history history-prefix start))])
                   (when idx
                     (history-cursor-set! editor-history idx)
                     (gap-buffer-set-from-string! gb (history-ref editor-history idx))))
@@ -899,7 +931,13 @@
                      (history-cursor-set! editor-history -1)
                      (set! history-prefix #f)
                      (gap-buffer-set-from-string! gb (history-saved-input editor-history))]
-                    [(string-prefix? history-prefix (history-ref editor-history i))
+                    ;; Same mode dispatch as the backward scan in
+                    ;; cmd-history-prev, through the shared smart-substring-match?
+                    ;; predicate, so the forward cycle matches exactly the set the
+                    ;; backward scan does (Up and Down never diverge).
+                    [(if (eq? (history-search-mode) 'prefix)
+                         (string-prefix? history-prefix (history-ref editor-history i))
+                         (smart-substring-match? history-prefix (history-ref editor-history i)))
                      (history-cursor-set! editor-history i)
                      (gap-buffer-set-from-string! gb (history-ref editor-history i))]
                     [else (loop (+ i 1))])))
@@ -1812,13 +1850,30 @@
   (define suggestion-text "")  ; the ghost suffix to display after cursor
 
   ;; history-ghost-suffix: compute the dim ghost suffix to show after the cursor,
-  ;; or "" when none.  Pure over the history object.  Keys the search off `before`
-  ;; (the typed before-cursor prefix, ignoring paredit's auto-inserted trailing
-  ;; closers) and only offers a suggestion when `after` is empty or all closing
-  ;; delimiters/quotes -- i.e. the cursor sits at the end of the typed region.
-  ;; The suffix is cut at the typed-prefix length, so it continues exactly where
-  ;; the user stopped typing.  Bounds are safe: `before` is a proven string-prefix?
-  ;; of `entry`, so (string-length before) <= (string-length entry).
+  ;; or "" when none.  Keys the search off `before` (the typed before-cursor
+  ;; prefix, ignoring paredit's auto-inserted trailing closers) and only offers a
+  ;; suggestion when `after` is empty or all closing delimiters/quotes -- i.e. the
+  ;; cursor sits at the end of the typed region.
+  ;;
+  ;; The suffix is drawn from a cascade of sources, most relevant first:
+  ;;   1. history PREFIX -- the tail of the most recent past line that BEGINS with
+  ;;      the typed text.  This is the original behaviour, unchanged: whenever a
+  ;;      line heads with `before` its result is exactly what it was before, and
+  ;;      history-prefix-search-backward is untouched.
+  ;;   2. history SUBSTRING -- only on a prefix miss, the tail after the typed text
+  ;;      found ANYWHERE in a past line, so a mid-line recall still offers where a
+  ;;      prefix search would not.
+  ;;   3. PATH-cache COMPLETION -- only on a substring miss too, a single
+  ;;      unambiguous completion of a bare command head.
+  ;; A real past command outranks a synthesised completion, hence the order.  The
+  ;; two fallbacks are computed ONLY inside the prefix-miss branch, so a keystroke
+  ;; that matches a past prefix pays exactly what it did before -- no substring
+  ;; scan and no fuzzy filter on the common path.
+  ;;
+  ;; Bounds are safe in every arm: arm 1 cuts at the typed-prefix length and
+  ;; `before` is a proven string-prefix? of the entry; arm 2 cuts past a matched
+  ;; occurrence that lies within the entry; arm 3 cuts at the typed length of a
+  ;; candidate proven to have `before` as a literal prefix.
   (define (history-ghost-suffix before after history)
     (if (or (= (string-length before) 0)
             (not (only-closing-delimiters? after)))
@@ -1827,11 +1882,52 @@
         ;; history through the O(1) count/ref accessors -- never the right-sized
         ;; history-entries view, which would copy the whole store per keystroke.
         (let* ([n (history-count history)]
-               [idx (history-prefix-search-backward history before (- n 1))])
-          (if idx
-              (let ([entry (history-ref history idx)])
-                (substring entry (string-length before) (string-length entry)))
-              ""))))
+               [idx (history-prefix-search-backward history before (- n 1))]
+               [prefix-suffix
+                (if idx
+                    (let ([entry (history-ref history idx)])
+                      (substring entry (string-length before) (string-length entry)))
+                    "")])
+          (if (> (string-length prefix-suffix) 0)
+              prefix-suffix                              ; arm 1 -- common path
+              ;; Prefix miss: try a mid-line recall, then a lone completion.  Both
+              ;; live here so they never run when the prefix source answered.
+              (let ([sub-suffix (history-substring-suffix history before (- n 1))])
+                (if (> (string-length sub-suffix) 0)
+                    sub-suffix                           ; arm 2 -- substring recall
+                    (completion-ghost-suffix before))))))) ; arm 3 -- lone completion
+
+  ;; The ghost's last resort: a single unambiguous PATH-cache completion of a BARE
+  ;; command head.  Reached only when neither a history prefix nor a history
+  ;; substring offered anything, so a keystroke matching a past command never pays
+  ;; for the fuzzy pass.  Confined to a bare head -- no whitespace in `before` --
+  ;; because argument-position completion would have to read the filesystem, which
+  ;; the render hot path must not do; the source is shell-completions, a pure
+  ;; fuzzy pass over the PATH-cache keys with no directory read and no subprocess.
+  ;; A suffix is offered ONLY when exactly one candidate comes back AND it really
+  ;; does begin with the typed text, so the tail is a genuine continuation of it;
+  ;; an ambiguous (more than one) or empty result, or a merely-fuzzy candidate
+  ;; that does not head with `before`, contributes nothing.
+  (define (completion-ghost-suffix before)
+    (if (bare-head? before)
+        (let ([cands (shell-completions before)])
+          (if (and (pair? cands) (null? (cdr cands)))
+              (let ([name (car (car cands))])
+                (if (string-prefix? before name)
+                    (substring name (string-length before) (string-length name))
+                    ""))
+              ""))
+        ""))
+
+  ;; True when `before` is a single bare token -- it holds no whitespace -- so a
+  ;; PATH-cache completion of it names a command head rather than an argument.
+  (define (bare-head? before)
+    (let ([len (string-length before)])
+      (let loop ([i 0])
+        (cond
+          [(>= i len) #t]
+          [(char-whitespace? (string-ref before i)) #f]
+          [else (loop (+ i 1))]))))
 
   ;; Update suggestion: search history for a prefix match of the typed text (the
   ;; before-cursor string), ignoring paredit's auto-inserted trailing closers, and
@@ -2257,10 +2353,44 @@
     (make-parameter #t (lambda (v) (and v #t))))
 
   ;; ======================================================================
-  ;; Prefix-filtered history state
+  ;; Command-head abbreviations (fish-style expand-as-typed)
   ;; ======================================================================
 
-  (define history-prefix #f)  ; #f or string prefix for filtered Up/Down
+  ;; A command-head abbreviation expands the VISIBLE, editable buffer at the
+  ;; word boundary: pressing Space (or Enter) after a lone command-head token
+  ;; that names an abbreviation rewrites the token to its expansion in place, so
+  ;; the user sees and can edit the result.  This is distinct from an alias,
+  ;; which stays hidden until the line is run.  The table is a string -> string
+  ;; map living beside the keymaps, populated from a user's init.
+  (define abbr-table-ht (make-hashtable string-hash string=?))
+  (define (abbr-set! name expansion) (hashtable-set! abbr-table-ht name expansion))
+  (define (abbr-remove! name) (hashtable-delete! abbr-table-ht name))
+  (define (abbr-ref name) (hashtable-ref abbr-table-ht name #f))
+
+  ;; Toggle for command-head abbreviation expansion.  Default on (daily-driver
+  ;; ergonomics); when off, Space inserts a literal space and nothing expands.
+  (define abbr-expand?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; ======================================================================
+  ;; History search state
+  ;; ======================================================================
+
+  ;; How Up/Down recall matches the typed needle against past lines.  The
+  ;; default 'substring finds the needle anywhere in a line (fish-style recall);
+  ;; 'prefix restores the strict head-anchored behaviour.  Validated: any other
+  ;; value is rejected at the set site, so a stray value in a user's init fails
+  ;; fast rather than silently disabling recall.  Both scan directions
+  ;; (cmd-history-prev backward, cmd-history-next forward) branch on this through
+  ;; the one shared predicate, so Up and Down can never disagree on a match.
+  (define history-search-mode
+    (make-parameter 'substring
+      (lambda (v)
+        (if (memq v '(substring prefix))
+            v
+            (error 'history-search-mode "expected 'substring or 'prefix" v)))))
+
+  (define history-prefix #f)  ; #f or the typed needle for filtered Up/Down
 
   ;; ======================================================================
   ;; Tab completion state (module-level, one editor at a time)
@@ -2445,6 +2575,87 @@
         [(char-whitespace? (string-ref text i)) (loop (- i 1))]
         [else #f])))
 
+  ;; Pure command-head abbreviation expansion (no gap buffer, no I/O) so the
+  ;; whole decision is exhaustively unit-testable over a flat string.  The head
+  ;; token is rewritten to its abbreviation only when EVERY gate holds:
+  ;;   * the buffer is shell context -- the first non-whitespace character is not
+  ;;     a Scheme-prefix char, so a Scheme expression is never touched;
+  ;;   * the head sits in command position (nothing non-whitespace precedes it);
+  ;;   * for the Space path the cursor sits at the END of that head token, so a
+  ;;     mid-token or later-word Space never expands -- a #f cursor lifts this
+  ;;     gate for the Enter/submit path, which expands the pending head even when
+  ;;     arguments are already typed;
+  ;;   * the head token names an abbreviation.
+  ;; On success it returns (values new-text new-cursor) with the head span
+  ;; replaced by its expansion and the cursor at the end of the inserted text; in
+  ;; every other case it returns (values #f #f).  The command-head detectors
+  ;; (shell-mode-buffer? / first-token / first-token-position?) are reused rather
+  ;; than re-derived.
+  (define (abbr-expand-head-token text cursor)
+    (let* ([head (first-token text)]
+           [hlen (string-length head)])
+      (if (= hlen 0)
+          (values #f #f)
+          (let* ([ts (let skip ([i 0])
+                       (if (and (< i (string-length text))
+                                (char-whitespace? (string-ref text i)))
+                           (skip (+ i 1))
+                           i))]
+                 [te (+ ts hlen)])
+            (cond
+              [(and (shell-mode-buffer? text)
+                    (first-token-position? text ts)
+                    (or (not cursor) (= cursor te))
+                    (abbr-ref head))
+               => (lambda (expansion)
+                    (values (string-append (substring text 0 ts)
+                                           expansion
+                                           (substring text te (string-length text)))
+                            (+ ts (string-length expansion))))]
+              [else (values #f #f)])))))
+
+  ;; Space path: expand only when the cursor is at the end of the head token.
+  (define (expand-abbr-head text cursor)
+    (abbr-expand-head-token text cursor))
+
+  ;; Enter/submit path: expand the pending first-word head regardless of cursor
+  ;; position (fish "expand on execute"), so the submitted line and its history
+  ;; entry both carry the expansion.
+  (define (expand-first-abbr text)
+    (abbr-expand-head-token text #f))
+
+  ;; Space in the INSERT keymap: expand a command-head abbreviation in the
+  ;; visible buffer, then insert the space.  The space is inserted on EVERY path
+  ;; (match or not) or Space would stop working.  On a match the expansion and
+  ;; its trailing space are folded into ONE undo step -- editor-snapshot! opens
+  ;; the step, editor-replace-text! rewrites the head, and the low-level
+  ;; gap-buffer-insert! adds the space WITHOUT a further snapshot.  Routing the
+  ;; space through cmd-self-insert would push a fresh whitespace snapshot and
+  ;; split the edit into two undo steps (a single undo would then stop at the
+  ;; expansion rather than restoring the original abbreviation), so the match
+  ;; path deliberately avoids it.  With the toggle off, Space is a literal space.
+  (define (cmd-expand-abbr-or-space es)
+    (if (not (abbr-expand?))
+        (cmd-self-insert es #\space)
+        (let ([gb (editor-state-gb es)])
+          (let-values ([(nt nc) (expand-abbr-head (gap-buffer->string gb)
+                                                  (gap-buffer-cursor-pos gb))])
+            (cond
+              [nt
+               (editor-snapshot! gb)
+               (editor-replace-text! gb nt nc)
+               ;; Add the separating space only when the expansion does not
+               ;; already butt against following whitespace.  If the head was
+               ;; expanded mid-line with arguments already present (`gco arg`,
+               ;; cursor at the head-token end), the existing space is the
+               ;; separator and inserting another would double it.  The undo
+               ;; step opened above still folds the whole edit either way.
+               (unless (and (< nc (string-length nt))
+                            (char-whitespace? (string-ref nt nc)))
+                 (gap-buffer-insert! gb #\space))]
+              [else
+               (cmd-self-insert es #\space)])))))
+
   ;; longest-common-prefix: find shared prefix across a list of strings.
   (define (longest-common-prefix strs)
     (cond
@@ -2474,6 +2685,16 @@
         [(char=? (string-ref text i) #\") (+ i 1)]
         [else (loop (- i 1))])))
 
+  ;; Helper: does the string contain the given character?  Used to tell a bare
+  ;; ~name (a login to complete) from a ~name/rest (a path under a home).
+  (define (string-has-char? str ch)
+    (let ([len (string-length str)])
+      (let loop ([i 0])
+        (cond
+          [(>= i len) #f]
+          [(char=? (string-ref str i) ch) #t]
+          [else (loop (+ i 1))]))))
+
   ;; Helper: apply completions to editor state.
   ;; replace-start is cursor position where the prefix starts.
   ;; candidates is a list of (name . positions) pairs.
@@ -2483,6 +2704,15 @@
       [(gb text pos replace-start candidates)
        (apply-completions! gb text pos replace-start candidates #f)]
       [(gb text pos replace-start candidates descs)
+       ;; Insertion is byte-exact.  Candidate names (and descriptions) are stored
+       ;; and inserted with their ORIGINAL bytes, so completing a filename or path
+       ;; that legally carries a control byte names the real file rather than a
+       ;; lossily-stripped near-miss.  The control-strip that stops a crafted name
+       ;; from repainting the screen lives at the SINGLE display choke-point --
+       ;; render-completion-grid, where the menu is drawn -- so what is SHOWN is
+       ;; sanitised while what is INSERTED (the single match, the longest common
+       ;; prefix, and the completion-candidates that cycle-insert reads back) stays
+       ;; exact.
        (let ([names (map car candidates)])
          (cond
            [(null? (cdr candidates))
@@ -2549,43 +2779,72 @@
              [(and (> len 0) (shell-mode-buffer? text))
               (let-values ([(prefix start) (word-at-cursor gb)])
                 (when (> (string-length prefix) 0)
-                  (if (first-token-position? text start)
+                  ;; A ~-token with no slash completes login names.  It is tried
+                  ;; first, in both command and argument position, so it intercepts
+                  ;; before filename-completions would prepend $HOME and mangle a
+                  ;; bare ~name; a ~name/rest token (slash present) is a path under a
+                  ;; home directory and is left to the filename fallback below.
+                  (let ([tilde-results
+                         (if (and (char=? (string-ref prefix 0) #\~)
+                                  (not (string-has-char? prefix #\/)))
+                             (guard (e [#t '()]) (user-completer prefix '()))
+                             '())])
+                    (cond
+                      ;; ~user arm: login names -> home directories.
+                      [(not (null? tilde-results))
+                       (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) tilde-results)]
+                             [descs (map caddr tilde-results)])
+                         (apply-completions! gb text pos start pairs descs))]
                       ;; First token: PATH executables merged with filenames
-                      (let* ([shell-cands (shell-completions prefix)]
-                             [file-cands (filename-completions prefix)]
-                             [ht (make-hashtable string-hash string=?)]
-                             [all (append shell-cands file-cands)]
-                             [deduped (let lp ([rest all] [acc '()])
-                                       (cond
-                                         [(null? rest) (reverse acc)]
-                                         [(hashtable-ref ht (caar rest) #f)
-                                          (lp (cdr rest) acc)]
-                                         [else
-                                          (hashtable-set! ht (caar rest) #t)
-                                          (lp (cdr rest) (cons (car rest) acc))]))])
-                        (unless (null? deduped)
-                          (apply-completions! gb text pos start deduped)))
+                      [(first-token-position? text start)
+                       (let* ([shell-cands (shell-completions prefix)]
+                              [file-cands (filename-completions prefix)]
+                              [ht (make-hashtable string-hash string=?)]
+                              [all (append shell-cands file-cands)]
+                              [deduped (let lp ([rest all] [acc '()])
+                                        (cond
+                                          [(null? rest) (reverse acc)]
+                                          [(hashtable-ref ht (caar rest) #f)
+                                           (lp (cdr rest) acc)]
+                                          [else
+                                           (hashtable-set! ht (caar rest) #t)
+                                           (lp (cdr rest) (cons (car rest) acc))]))])
+                         (unless (null? deduped)
+                           (apply-completions! gb text pos start deduped)))]
                       ;; Subsequent tokens: check for registered completer
-                      (let* ([cmd (first-token text)]
-                             [completer (lookup-completer cmd)])
-                        (if completer
-                            ;; Registered completer returns (name positions desc) triples
-                            (let* ([ctx (list (cons 'args (previous-args text start)))]
-                                   [results (guard (e [#t '()])
-                                              (completer prefix ctx))])
-                              (if (null? results)
-                                  ;; Fall back to filenames
-                                  (let ([fc (filename-completions prefix)])
-                                    (unless (null? fc)
-                                      (apply-completions! gb text pos start fc)))
-                                  ;; Extract pairs and descriptions from triples
-                                  (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) results)]
-                                        [descs (map caddr results)])
-                                    (apply-completions! gb text pos start pairs descs))))
-                            ;; No completer: filenames
-                            (let ([fc (filename-completions prefix)])
-                              (unless (null? fc)
-                                (apply-completions! gb text pos start fc))))))))]
+                      [else
+                       (let* ([cmd (first-token text)]
+                              [completer (lookup-completer cmd)])
+                         (if completer
+                             ;; Registered completer returns (name positions desc) triples
+                             (let* ([ctx (list (cons 'args (previous-args text start)))]
+                                    [results (guard (e [#t '()])
+                                               (completer prefix ctx))])
+                               (if (null? results)
+                                   ;; Fall back to filenames
+                                   (let ([fc (filename-completions prefix)])
+                                     (unless (null? fc)
+                                       (apply-completions! gb text pos start fc)))
+                                   ;; Extract pairs and descriptions from triples
+                                   (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) results)]
+                                         [descs (map caddr results)])
+                                     (apply-completions! gb text pos start pairs descs))))
+                             ;; No registered completer: a dash-prefixed token offers
+                             ;; the command's option flags, parsed from its --help/man
+                             ;; output; anything else falls back to filenames.
+                             (if (char=? (string-ref prefix 0) #\-)
+                                 (let ([results (guard (e [#t '()])
+                                                  (command-flag-completer cmd prefix))])
+                                   (if (null? results)
+                                       (let ([fc (filename-completions prefix)])
+                                         (unless (null? fc)
+                                           (apply-completions! gb text pos start fc)))
+                                       (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) results)]
+                                             [descs (map caddr results)])
+                                         (apply-completions! gb text pos start pairs descs))))
+                                 (let ([fc (filename-completions prefix)])
+                                   (unless (null? fc)
+                                     (apply-completions! gb text pos start fc))))))]))))]
              ;; Normal Scheme context: symbol completion
              [else
               (let-values ([(prefix start) (word-at-cursor gb)])
@@ -2656,9 +2915,12 @@
   ;; Predict render-completion-grid's column/row layout for the current candidate
   ;; list at term-cols WITHOUT drawing it, mirroring the grid's own geometry so the
   ;; drawn height is known before the draw -- needed to anchor the menu and to bound
-  ;; its rows.  Candidate names never carry an escape, so ansi-display-width matches
-  ;; the grid's own width measure for them, and descriptions force a single column
-  ;; exactly as the grid does.
+  ;; its rows.  A stored candidate name is byte-exact and so may carry a stray
+  ;; control byte (the grid strips those only at draw time); such a name is
+  ;; measured a shade wider here than it renders, which can over-estimate the menu
+  ;; height by a row -- cosmetic and bounds-safe, and never reached by the ordinary
+  ;; escape-free name, for which this width matches the grid's exactly.  Descriptions
+  ;; force a single column exactly as the grid does.
   (define (completion-grid-dimensions term-cols)
     (let* ([n (length completion-candidates)]
            [has-descs? (not (null? completion-descriptions))]
@@ -3259,6 +3521,14 @@
   ;; of library so all definitions precede expressions as R6RS requires).
   (keymap-bind! editor-insert-keymap
     (list (make-key-event 'special 'tab 0)) cmd-complete)
+
+  ;; Bind Space to command-head abbreviation expansion in the INSERT keymap ONLY
+  ;; (never the shared or normal keymap): a command-head abbreviation expands the
+  ;; visible buffer, then the space is inserted; when no abbreviation matches, or
+  ;; the toggle is off, Space inserts a literal space.  Placed here beside Tab so
+  ;; the command definition precedes this expression.
+  (keymap-bind! editor-insert-keymap
+    (list (make-key-event 'char #\space 0)) cmd-expand-abbr-or-space)
 
   ;; Wire up vi.ss procedure hooks (must be after all cmd-* definitions)
   (vi-snapshot!-proc (lambda (es) (editor-snapshot! (editor-state-gb es))))

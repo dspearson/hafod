@@ -148,7 +148,7 @@
     posix-getpid posix-getppid posix-getpgrp posix-setpgid posix-setsid
     posix-getuid posix-getgid posix-geteuid posix-getegid
     posix-setuid posix-setgid posix-seteuid posix-setegid
-    posix-getpwnam posix-getpwuid posix-getgrnam posix-getgrgid
+    posix-getpwnam posix-getpwuid posix-getpwent-all posix-getgrnam posix-getgrgid
     passwd-info? passwd-info-name passwd-info-passwd passwd-info-uid
     passwd-info-gid passwd-info-gecos passwd-info-dir passwd-info-shell
     group-info? group-info-name group-info-passwd group-info-gid
@@ -416,10 +416,20 @@
     last-status last-duration terminal-width query-terminal-width
     repl-continuation-prompt ansi-visible-length
     background-job-count
+    ;; Informative-prompt surface: the four prompt segments, the colour verdict,
+    ;; the timing threshold, and the one-call preset that composes them so an
+    ;; init.ss can turn the informative prompt on in a single line.  The
+    ;; leaf-only helpers (sanitize-control, parse-git-porcelain-v2) stay
+    ;; unexported here -- a test reaches them via (only (hafod interactive) ...).
+    enable-informative-prompt! prompt-git-segment prompt-path-segment prompt-exit-segment
+    prompt-timing-segment prompt-colour-ok? prompt-timing-threshold
     ;; Shell mode re-exports from interactive
     rebuild-path-cache! classify-input
     ;; Feature toggles from interactive
-    shell-mode? history-expansion? batch-mode?
+    shell-mode? history-expansion? batch-mode? auto-cd? interactive-enhancements?
+
+    ;; === (hafod shell default-aliases) ===
+    default-aliases?
 
     ;; === (hafod terminal-caps) ===
     ansi-ok? colour-ok?
@@ -483,6 +493,7 @@
     overlay-clear! overlay-draw
     only-closing-delimiters?
     rainbow-identifiers? rainbow-parens? syntax-highlight?
+    shell-highlight? shell-highlight-paths?
 
     ;; === (hafod editor sqlite3) ===
     sqlite3-open sqlite3-close sqlite3-exec
@@ -507,12 +518,14 @@
     editor-history-entries
     editor-finder-proc
     ;; Feature toggles from editor
-    fuzzy-finder? tab-completions?
+    fuzzy-finder? tab-completions? abbr-expand? history-search-mode
 
     ;; === (hafod config) ===
     xdg-config-home hafod-config-dir hafod-init-file
     load-config-file
     set-prompt!
+    plain-shell!
+    alias unalias abbr unabbr
     bind-key!
     parse-key-description
 
@@ -616,6 +629,7 @@
     (hafod shell jobs)
     (hafod shell completers)
     (hafod shell builtins)
+    (hafod shell default-aliases)
     (hafod fuzzy)
     (hafod finder)
     (hafod editor gap-buffer)

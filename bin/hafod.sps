@@ -29,11 +29,11 @@
 
 ;; Import (hafod) at compile time so compile-whole-program can merge all
 ;; library code into bin/hafod.so, eliminating per-file library loading.
-;; The 57 symbols that conflict between (chezscheme) and (hafod) are excluded
+;; The 58 symbols that conflict between (chezscheme) and (hafod) are excluded
 ;; from (chezscheme); (hafod) provides its own versions of those.
 (import
   (except (chezscheme)
-    ;; 57 original symbols that conflict with (hafod)
+    ;; 58 symbols that conflict with (hafod)
     bitwise-and bitwise-ior bitwise-not bitwise-xor
     call-with-input-file call-with-output-file call-with-string-output-port
     char->integer char-alphabetic? char-lower-case? char-numeric? char-ready?
@@ -52,7 +52,10 @@
     append! reverse! break assoc
     fold-right
     ;; SRFI-13 — (hafod) now provides these with SRFI-13 semantics
-    string-for-each string-copy! string-fill! string-hash)
+    string-for-each string-copy! string-fill! string-hash
+    ;; Command-alias helper -- (hafod) exports `alias` as the config/REPL helper,
+    ;; so Chez's own `alias` form is excluded to keep the import unambiguous.
+    alias)
   ;; Import Chez's command-line/command-line-arguments under prefixed names
   ;; so we can set them as parameters (hafod's versions are read-only).
   (only (rename (chezscheme)
@@ -76,6 +79,12 @@
   ;; NOT re-exported from the (hafod) umbrella, so the umbrella surface is
   ;; unchanged and it introduces no binding that conflicts with (hafod).
   (only (hafod terminal-caps) colour-override)
+  ;; nav-finder-proc is the bare-z/zi picker seam: the launcher binds it to
+  ;; run-finder below so `z`/`zi` open the real finder.  Like editor-finder-proc
+  ;; it is a set-once startup seam, so it is imported directly here as launcher
+  ;; plumbing and deliberately NOT re-exported from the (hafod) umbrella -- the
+  ;; umbrella surface is unchanged and it introduces no conflicting binding.
+  (only (hafod shell builtins) nav-finder-proc)
   (hafod))
 
 ;; Best-effort version guard for the source path.  This is the first body
@@ -128,6 +137,11 @@
 ;; the library is loaded via compile-whole-program, so we do it here at
 ;; program startup where side effects are guaranteed to run.
 (editor-finder-proc run-finder)
+
+;; Wire the same finder into the bare-z/zi navigation picker, for the same
+;; reason: a set-once startup seam is guaranteed to run here.  With this bound,
+;; bare `z`/`zi` present the frecency-ordered candidates through the real finder.
+(nav-finder-proc run-finder)
 
 ;; Set both the Chez command-line parameters AND the hafod command-line state.
 ;; chez:command-line / chez:command-line-arguments are the Chez parameters

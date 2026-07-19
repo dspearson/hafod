@@ -40,6 +40,8 @@
         (hafod shell history-expand)
         (hafod shell jobs)
         (hafod shell completers)
+        (hafod shell visit-db)
+        (hafod shell default-aliases)
         (hafod interactive)
         (hafod fuzzy)
         (hafod))

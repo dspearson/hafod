@@ -24,12 +24,22 @@
           ;; Settings
           rainbow-identifiers?
           rainbow-parens?
-          syntax-highlight?)
+          syntax-highlight?
+          ;; Live shell-line highlighting toggles.  Published to the
+          ;; (hafod) umbrella + (scsh) mirror by a later change; the shell
+          ;; colouriser and the shape gate stay library-internal.
+          shell-highlight? shell-highlight-paths?
+          ;; Pure shell-line lexer + fixed role->colour map.  White-box exports
+          ;; for the isolated span/colour test suite only: both are leaf helpers
+          ;; and stay OFF the (hafod) umbrella and the (scsh) mirror.
+          shell-lex shell-role-colour)
   (import (chezscheme)
           (hafod editor gap-buffer)
           (hafod editor input-decode)
           (hafod editor sexp-tracker)
-          (only (hafod shell classifier) classify-input)
+          (only (hafod shell classifier)
+                classify-input scheme-prefix-chars command-not-found-suppress?)
+          (only (hafod shell completers) strip-terminal-escapes)
           (only (hafod terminal-caps) ansi-ok? colour-ok?))
 
   ;; ======================================================================
@@ -118,6 +128,22 @@
   ;; Set to #f to render everything in default foreground (except rainbow
   ;; parens/identifiers which have their own toggles).
   (define syntax-highlight?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for live shell-line highlighting.  When #t (default) a
+  ;; shell-shaped command line is coloured by role -- the head green when it
+  ;; resolves on PATH / builtin / alias and red when it does not, plus distinct
+  ;; colours for quoted strings, options/flags and redirections.  Set to #f to
+  ;; draw shell lines plain (the pre-change behaviour).
+  (define shell-highlight?
+    (make-parameter #t (lambda (v) (and v #t))))
+
+  ;; Toggle for flagging a non-existent path argument.  When #t (default)
+  ;; a path-shaped argument (one containing `/`) that does not exist on disk is
+  ;; drawn red + underlined.  This is the ONE filesystem touch on the render hot
+  ;; path, so it has its own switch: set to #f to keep highlighting entirely
+  ;; filesystem-free.  A `~`-leading token is never stat'd regardless.
+  (define shell-highlight-paths?
     (make-parameter #t (lambda (v) (and v #t))))
 
   ;; ======================================================================
@@ -317,6 +343,249 @@
                                         i j depth)
                                    acc))
                        (atom (+ j 1))))]))))))
+
+  ;; ======================================================================
+  ;; Shell-line lexer
+  ;; ======================================================================
+
+  ;; A pure, side-effect-free lexer for a single shell command line, the sibling
+  ;; of `tokenize` above.  It mirrors the same single left-to-right integer-offset
+  ;; walk and allocates no substrings while lexing (the renderer clips and draws);
+  ;; unlike `parser.ss tokenise` it performs NO glob/brace/tilde expansion and
+  ;; touches NO filesystem, so it is cheap enough to run on every keystroke.  The
+  ;; colouriser that consumes these spans lives in a later change; this is only
+  ;; the span structure and the fixed role->colour table.
+
+  ;; Scan a quoted run whose opening quote (character `q`) sits at index `open`.
+  ;; Escape-aware, mirroring the string arm of `tokenize`: a backslash escapes the
+  ;; next character, so an escaped quote stays inside the run.  Returns the index
+  ;; one past the matching close quote, or `len` when the run is unterminated.
+  (define (scan-quote text open len q)
+    (let scan ([j (+ open 1)])
+      (cond
+        [(>= j len) len]
+        [(char=? (string-ref text j) #\\) (scan (+ j 2))]   ; skip the escaped char
+        [(char=? (string-ref text j) q) (+ j 1)]
+        [else (scan (+ j 1))])))
+
+  ;; Does a redirection operator begin at index `i`?  Recognises the single-char
+  ;; leads `>` and `<` (which cover `>>`/`<<`/`>&` when scanned) and the two-char
+  ;; IO forms `2>` and `&>` (a digit/ampersand that is a redir ONLY when the very
+  ;; next character is `>`, so a bare `2` or `&` inside a word is not one).
+  (define (redir-lead? text i len)
+    (let ([ch (string-ref text i)])
+      (or (char=? ch #\>)
+          (char=? ch #\<)
+          (and (or (char=? ch #\2) (char=? ch #\&))
+               (< (+ i 1) len)
+               (char=? (string-ref text (+ i 1)) #\>)))))
+
+  ;; Consume the whole redirection operator beginning at `i` (a redir-lead?), and
+  ;; return the index just past it.  Handles `>` `>>` `>&` `<` `<<` `2>` `&>`.
+  (define (scan-redir text i len)
+    (let ([ch (string-ref text i)])
+      (cond
+        [(or (char=? ch #\2) (char=? ch #\&)) (+ i 2)]        ; 2>  &>
+        [(char=? ch #\>)
+         (if (and (< (+ i 1) len)
+                  (let ([n (string-ref text (+ i 1))])
+                    (or (char=? n #\>) (char=? n #\&))))
+             (+ i 2)                                          ; >>  >&
+             (+ i 1))]                                        ; >
+        [(char=? ch #\<)
+         (if (and (< (+ i 1) len) (char=? (string-ref text (+ i 1)) #\<))
+             (+ i 2)                                          ; <<
+             (+ i 1))]                                        ; <
+        [else (+ i 1)])))
+
+  ;; Scan a bare word from `i` up to (but not including) the next unquoted
+  ;; whitespace or the start of a redirection operator.  Purely positional.
+  (define (scan-word text i len)
+    (let scan ([j i])
+      (if (or (>= j len)
+              (char-whitespace? (string-ref text j))
+              (let ([c (string-ref text j)]) (or (char=? c #\>) (char=? c #\<))))
+          j
+          (scan (+ j 1)))))
+
+  ;; Purely SYNTACTIC path test over the word text[start,end): is it path-shaped?
+  ;; True when it contains a `/` anywhere -- which already subsumes the `./`,
+  ;; `../` and `~/` prefixes the roles list names, each of which carries a slash.
+  ;; No filesystem is read; whether such a path EXISTS is the renderer's decision
+  ;; in a later change, never this lexer's.
+  (define (path-shaped? text start end)
+    (let scan ([k start])
+      (cond
+        [(>= k end) #f]
+        [(char=? (string-ref text k) #\/) #t]
+        [else (scan (+ k 1))])))
+
+  ;; shell-lex : string -> (list (role start end)), one span per character range
+  ;; so the spans tile [0, len) exactly (every character is drawn once, as the
+  ;; Scheme colouriser does for whitespace/other).  Roles, left to right:
+  ;;   whitespace  -- a run of whitespace
+  ;;   string      -- a single- or double-quoted, escape-aware run
+  ;;   redir       -- a redirection operator (> >> < << 2> &> >&)
+  ;;   head        -- the FIRST non-whitespace word (POSITIONAL only)
+  ;;   flag        -- a subsequent word beginning `-`
+  ;;   path-arg    -- a subsequent path-shaped word (contains `/`)
+  ;;   arg         -- any other subsequent word
+  ;; The head role marks only WHERE the head is: this lexer never decides colour,
+  ;; never reads the classifier, a parameter, or the disk -- it is a pure function
+  ;; of the string.  Head resolvability is settled by the renderer later and fed
+  ;; to `shell-role-colour`.
+  (define (shell-lex text)
+    (let ([len (string-length text)])
+      (let loop ([i 0] [head-seen? #f] [acc '()])
+        (if (>= i len)
+            (reverse acc)
+            (let ([ch (string-ref text i)])
+              (cond
+                ;; Whitespace run.
+                [(char-whitespace? ch)
+                 (let ws ([j (+ i 1)])
+                   (if (and (< j len) (char-whitespace? (string-ref text j)))
+                       (ws (+ j 1))
+                       (loop j head-seen? (cons (list 'whitespace i j) acc))))]
+                ;; Quoted string (either quote character), escape-aware.
+                [(or (char=? ch #\") (char=? ch #\'))
+                 (let ([end (scan-quote text i len ch)])
+                   (loop end head-seen? (cons (list 'string i end) acc)))]
+                ;; Redirection operator.
+                [(redir-lead? text i len)
+                 (let ([end (scan-redir text i len)])
+                   (loop end head-seen? (cons (list 'redir i end) acc)))]
+                ;; A bare word: head (first only), flag, path-arg, or arg.
+                [else
+                 (let* ([end (scan-word text i len)]
+                        [role (cond [(not head-seen?)          'head]
+                                    [(char=? ch #\-)           'flag]
+                                    [(path-shaped? text i end) 'path-arg]
+                                    [else                      'arg])])
+                   (loop end #t (cons (list role i end) acc)))]))))))
+
+  ;; shell-role-colour : role head-resolvable? -> 256-colour index, or #f for "no
+  ;; colour" (draw the span verbatim).  A pure table: it reads no parameter and no
+  ;; filesystem.  Head resolvability is PASSED IN -- the classifier lookup lives in
+  ;; the renderer, never here.  `path-arg` returns #f: a missing-path style (red +
+  ;; underline) is a filesystem decision the renderer makes, not this map.  Indices
+  ;; follow the codebase palette -- red 1 / green 2 / yellow 3 (the prompt and exit
+  ;; segments), cyan 6 / magenta 5 (the standard ANSI base-16 indices).
+  (define (shell-role-colour role head-resolvable?)
+    (case role
+      [(head)   (if head-resolvable? 2 1)]      ; green resolvable / red unresolved
+      [(string) 3]                              ; yellow
+      [(flag)   6]                              ; cyan
+      [(redir)  5]                              ; magenta
+      [else     #f]))                           ; arg / path-arg / whitespace: verbatim
+
+  ;; ======================================================================
+  ;; Shell-line colouriser (role colouring + unknown-head marking)
+  ;; ======================================================================
+
+  ;; 256-colour foreground SGR (xterm base-16 / 256 index), closed by the [39m
+  ;; reset the Scheme windows already use.  Kept beside fg-colour (truecolour)
+  ;; because the shell role map speaks in indices, not RGB triples.
+  (define (fg-256 port idx)
+    (display "\x1b;[38;5;" port)
+    (display idx port)
+    (display "m" port))
+
+  ;; The head span (the first 'head span) of a shell-lex list, or #f when the line
+  ;; has no word at all (empty or all whitespace).
+  (define (find-head-span spans)
+    (cond
+      [(null? spans) #f]
+      [(eq? (caar spans) 'head) (car spans)]
+      [else (find-head-span (cdr spans))]))
+
+  ;; Does the head look like a command name rather than a Scheme datum?  True when
+  ;; its first character is NOT one of the classifier's Scheme-prefix leads, so
+  ;; `(+ 1 2)`, `'x`, `#t`, `,@e`, `[a]` are left to the Scheme colouriser.  Uses
+  ;; the classifier's own scheme-prefix-chars (imported), so the two never drift.
+  (define (command-headish? text head-start)
+    (and (< head-start (string-length text))
+         (not (memv (string-ref text head-start) scheme-prefix-chars))))
+
+  ;; Is the line shell-SHAPED -- worth highlighting even when the classifier sent
+  ;; it to 'scheme because its head does not resolve?  True when there is command
+  ;; structure past the head: any flag / redirection / path-arg span, OR at least
+  ;; two word tokens (head + another).  A lone bare word is NOT shell-shaped, so a
+  ;; single Scheme symbol typed at the prompt is never reddened.
+  (define (shell-shaped? spans)
+    (let loop ([s spans] [words 0] [structure? #f])
+      (if (null? s)
+          (or structure? (>= words 2))
+          (case (caar s)
+            [(flag redir path-arg) (loop (cdr s) words #t)]
+            [(head arg)            (loop (cdr s) (+ words 1) structure?)]
+            [else                  (loop (cdr s) words structure?)]))))
+
+  ;; Decide whether to shell-highlight `text` (already lexed to `spans`, already
+  ;; classified to `cls`), and with what head resolvability.  Returns
+  ;; (values highlight? head-resolvable?).  Highlight when the classifier already
+  ;; calls it shell/builtin (head resolves), OR it is 'scheme with a genuinely-
+  ;; unknown, command-headish, shell-shaped head -- the unknown-head case the
+  ;; classifier hides by sending every unresolved head to 'scheme.  head-resolvable?
+  ;; is command-not-found-suppress? over the head token in every case, so the head
+  ;; colour and the unknown-head marking are the one resolution predicate.
+  (define (shell-highlight-decision text spans cls)
+    (if (not (shell-highlight?))
+        (values #f #f)
+        (let ([head (find-head-span spans)])
+          (if (not head)
+              (values #f #f)
+              (let* ([hstart (cadr head)]
+                     [head-text (substring text hstart (caddr head))]
+                     [resolvable? (command-not-found-suppress? head-text)])
+                (cond
+                  [(memq cls '(shell builtin)) (values #t resolvable?)]
+                  [(and (not resolvable?)
+                        (command-headish? text hstart)
+                        (shell-shaped? spans))
+                   (values #t #f)]
+                  [else (values #f #f)]))))))
+
+  ;; Does the path-shaped word text[start,end) name something that does NOT exist?
+  ;; The one filesystem read on the render path, confined to path-arg spans.  A
+  ;; `~`-leading word is treated as present (never stat'd) since it needs the home
+  ;; expansion the lexer deliberately omits; any stat error is treated as present
+  ;; too, so a fault never paints the line red.  No globbing, no expansion.
+  (define (path-missing? text start end)
+    (and (< start end)
+         (not (char=? (string-ref text start) #\~))
+         (guard (e (#t #f))
+           (not (file-exists? (substring text start end))))))
+
+  ;; Draw the half-open window [lo,hi) of a shell command line, colouring each
+  ;; lexed span by role via shell-role-colour.  The head's colour is fixed by
+  ;; `head-resolvable?` (passed in from shell-highlight-decision), never re-derived
+  ;; here, so the two draw windows of the ghost renderer agree.  A path-shaped
+  ;; argument that does not exist is drawn red + underlined when shell-highlight-
+  ;; paths? is on.  With colour? #f every branch draws the span verbatim (zero
+  ;; escape bytes), mirroring display-colourised/window's plain arm.
+  (define (display-shell-colourised/window port text spans head-resolvable? colour? lo hi)
+    (for-each
+      (lambda (span)
+        (let ([role (car span)] [start (cadr span)] [end (caddr span)])
+          (unless (or (<= end lo) (>= start hi))
+            (let ([str (substring text (max start lo) (min end hi))])
+              (if (not colour?)
+                  (display str port)
+                  (cond
+                    [(and (eq? role 'path-arg)
+                          (shell-highlight-paths?)
+                          (path-missing? text start end))
+                     (display "\x1b;[38;5;1m\x1b;[4m" port)  ; red + underline
+                     (display str port)
+                     (display "\x1b;[24m\x1b;[39m" port)]
+                    [(shell-role-colour role head-resolvable?)
+                     => (lambda (idx)
+                          (fg-256 port idx)
+                          (display str port)
+                          (display "\x1b;[39m" port))]
+                    [else (display str port)]))))))
+      spans))
 
   ;; ======================================================================
   ;; Colourised display
@@ -541,11 +810,19 @@
            (display "\r\x1b;[J" port))
          ;; Display prompt
          (display prompt port)
-         ;; Display colourised text (Scheme only; shell/builtin inputs render plain)
-         (if (eq? (classify-input text) 'scheme)
-             (let ([tokens (tokenize text)])
-               (display-colourised port text tokens cursor-pos colour?))
-             (display text port))
+         ;; Colourise: a shell-shaped line by role (head, roles, unknown-head
+         ;; marking), else a Scheme line by token, else plain.
+         (let* ([spans (shell-lex text)]
+                [cls (classify-input text)])
+           (let-values ([(hl? head-ok?) (shell-highlight-decision text spans cls)])
+             (cond
+               [hl?
+                (display-shell-colourised/window port text spans head-ok? colour?
+                                                 0 (string-length text))]
+               [(eq? cls 'scheme)
+                (let ([tokens (tokenize text)])
+                  (display-colourised port text tokens cursor-pos colour?))]
+               [else (display text port)])))
          ;; Position cursor
          (when ansi?
            (let ([lines-after-cursor (- total-lines cursor-row)])
@@ -676,9 +953,18 @@
                                  term-cols)
                                total-lines)]
               ;; Tokenise the buffer ONCE; both windows read the same token list,
-              ;; so each is coloured in the context of the whole line.
-              [scheme? (eq? (classify-input text) 'scheme)]
-              [tokens (if scheme? (tokenize text) '())])
+              ;; so each is coloured in the context of the whole line.  Lex it once
+              ;; too and settle the shell-highlight decision here, so both draw
+              ;; windows below agree on whether — and how — to colour the head.
+              [cls (classify-input text)]
+              [scheme? (eq? cls 'scheme)]
+              [tokens (if scheme? (tokenize text) '())]
+              [spans (shell-lex text)]
+              [decision (call-with-values
+                          (lambda () (shell-highlight-decision text spans cls))
+                          cons)]
+              [shell-hl? (car decision)]
+              [head-ok? (cdr decision)])
          (when (and ansi? (> prev-lines 0))
            (display "\x1b;[" port)
            (display prev-lines port)
@@ -687,10 +973,14 @@
            (display "\r\x1b;[J" port))
          (display prompt port)
          ;; The buffer up to the cursor.
-         (if scheme?
-             (display-colourised/window port text tokens cursor-pos colour?
-                                        0 cursor-pos)
-             (display (substring text 0 cursor-pos) port))
+         (cond
+           [shell-hl?
+            (display-shell-colourised/window port text spans head-ok? colour?
+                                             0 cursor-pos)]
+           [scheme?
+            (display-colourised/window port text tokens cursor-pos colour?
+                                       0 cursor-pos)]
+           [else (display (substring text 0 cursor-pos) port)])
          ;; The dim grey ghost, AT the cursor.  Gated exactly as drawn-lines above
          ;; (ghost-shown?), so a plain sink still emits zero escapes and no ghost.
          (when ghost-shown?
@@ -699,10 +989,14 @@
            (display "\x1b;[39m" port))
          ;; The rest of the buffer -- paredit's auto-inserted closers -- in its own
          ;; colour, never in the ghost's grey.  Empty at end-of-buffer.
-         (if scheme?
-             (display-colourised/window port text tokens cursor-pos colour?
-                                        cursor-pos text-len)
-             (display (substring text cursor-pos text-len) port))
+         (cond
+           [shell-hl?
+            (display-shell-colourised/window port text spans head-ok? colour?
+                                             cursor-pos text-len)]
+           [scheme?
+            (display-colourised/window port text tokens cursor-pos colour?
+                                       cursor-pos text-len)]
+           [else (display (substring text cursor-pos text-len) port)])
          ;; Position cursor: climb back over every drawn row (the ghost's rows
          ;; included) to the user's logical typing row, then to the column.  Both
          ;; are measured from `before` alone, which is still drawn first.
@@ -770,10 +1064,17 @@
          ;; given, otherwise the usual colourised (Scheme) / plain path.
          (if (pair? sel-range)
              (display-with-selection port text sel-range colour?)
-             (if (eq? (classify-input text) 'scheme)
-                 (let ([tokens (tokenize text)])
-                   (display-colourised port text tokens cursor-pos colour?))
-                 (display text port)))
+             (let* ([spans (shell-lex text)]
+                    [cls (classify-input text)])
+               (let-values ([(hl? head-ok?) (shell-highlight-decision text spans cls)])
+                 (cond
+                   [hl?
+                    (display-shell-colourised/window port text spans head-ok? colour?
+                                                     0 (string-length text))]
+                   [(eq? cls 'scheme)
+                    (let ([tokens (tokenize text)])
+                      (display-colourised port text tokens cursor-pos colour?))]
+                   [else (display text port)]))))
          ;; Drop to a new row and draw the compact mode indicator, dimmed.
          ;; Gated exactly as drawn-lines above, so a plain sink emits zero
          ;; escapes and no indicator.
@@ -1061,11 +1362,29 @@
           str
           (string-append str (make-string (- target-w w) #\space)))))
 
+  ;; Sanitise one completion entry for DISPLAY: strip terminal escapes and stray
+  ;; control bytes from the candidate name and, on a triple, its description,
+  ;; keeping the entry's (name . positions) or (name positions description) shape.
+  ;; This is the single choke-point at which menu text is sanitised -- the menu is
+  ;; where a crafted name could repaint the screen -- while insertion upstream
+  ;; keeps the original bytes, so a completed filename stays byte-exact.  The match
+  ;; positions ride through unchanged: on the ordinary escape-free name the strip
+  ;; is a no-op and the offsets stay valid; on a control-bearing name the offsets
+  ;; were meaningless already and display-with-highlights is bounds-safe.
+  (define (strip-entry-for-display e)
+    (let ([name (strip-terminal-escapes (car e))])
+      (if (and (pair? (cdr e)) (pair? (cddr e)) (list? (cadr e)))
+          (list name (cadr e)
+                (let ([d (caddr e)])
+                  (if (and d (string? d)) (strip-terminal-escapes d) d)))
+          (cons name (cdr e)))))
+
   ;; Fish-style grid completion renderer.
   ;; entries: list of (candidate positions [description])
   ;; Returns (values menu-lines grid-cols grid-rows scroll-offset)
   (define (render-completion-grid port entries selected-index term-cols max-visible)
-    (let* ([n (length entries)]
+    (let* ([entries (map strip-entry-for-display entries)]
+           [n (length entries)]
            ;; Extract candidate names and check for descriptions
            [names (map car entries)]
            [has-descs? (and (pair? entries)

@@ -3,7 +3,7 @@
 
 (library (hafod internal posix-user)
   (export
-    posix-getpwnam posix-getpwuid posix-getgrnam posix-getgrgid
+    posix-getpwnam posix-getpwuid posix-getpwent-all posix-getgrnam posix-getgrgid
     passwd-info? passwd-info-name passwd-info-passwd passwd-info-uid
     passwd-info-gid passwd-info-gecos passwd-info-dir passwd-info-shell
     group-info? group-info-name group-info-passwd group-info-gid group-info-members)
@@ -46,6 +46,17 @@
   (define c-getpwuid (foreign-procedure "getpwuid" (unsigned-32) void*))
   (define c-getgrnam (foreign-procedure "getgrnam" (string) void*))
   (define c-getgrgid (foreign-procedure "getgrgid" (unsigned-32) void*))
+
+  ;; The passwd-database iterator. Unlike the key-based getpwnam/getpwuid
+  ;; lookups above, these walk the whole database: setpwent rewinds it,
+  ;; getpwent yields the next entry (a struct passwd*, or NULL at the end) and
+  ;; endpwent releases it. getpwent hands back a pointer into a single static
+  ;; buffer that the following call overwrites, so the iterator is not
+  ;; reentrant -- the whole walk must stay inside one setpwent...endpwent
+  ;; bracket, which is safe in the single-threaded REPL.
+  (define c-getpwent (foreign-procedure "getpwent" () void*))
+  (define c-setpwent (foreign-procedure "setpwent" () void))
+  (define c-endpwent (foreign-procedure "endpwent" () void))
 
   ;; passwd-info record type
   (define-record-type passwd-info
@@ -92,6 +103,23 @@
   (define (posix-getpwuid uid)
     (let ([ptr (c-getpwuid uid)])
       (if (= ptr 0) #f (extract-passwd-info ptr))))
+
+  ;; getpwent-all: enumerate the whole passwd database, one passwd-info per
+  ;; entry, in database order. Every non-NULL struct passwd* is decoded with
+  ;; the shared extract-passwd-info, so the same offsets the key-based lookups
+  ;; already trust validate the layout here too. The walk is bracketed by
+  ;; setpwent/endpwent so the static iterator buffer is never left open, and
+  ;; the guard fails quiet -- returning the empty list while still trying to
+  ;; close the iterator -- if a binding or ABI fault should ever raise, so a
+  ;; caller never has to handle an enumeration error.
+  (define (posix-getpwent-all)
+    (guard (e [#t (begin (guard (e2 [#t (void)]) (c-endpwent)) '())])
+      (c-setpwent)
+      (let loop ([acc '()])
+        (let ([ptr (c-getpwent)])
+          (if (= ptr 0)
+              (begin (c-endpwent) (reverse acc))
+              (loop (cons (extract-passwd-info ptr) acc)))))))
 
   ;; getgrnam: look up group by name. Returns group-info or #f.
   (define (posix-getgrnam name)

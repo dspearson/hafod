@@ -64,13 +64,22 @@
   ;; "name：720" into bytes no exec could match. Invalid UTF-8 is replaced, not
   ;; raised, so a stray non-UTF-8 name never aborts a directory read.
   (define (ptr->string ptr)
-    ;; One strlen for the length, one memcpy for the payload, then the same
-    ;; UTF-8 decode. The bytevector is sized to the strlen result first, so the
-    ;; copy reads exactly the terminated string's bytes and no further.
-    (let* ([len (c-strlen ptr)]
-           [bv  (make-bytevector len)])
-      (c-memcpy-in bv ptr len)
-      (utf8->string bv)))
+    ;; A NULL (0) pointer decodes to the empty string BEFORE strlen is reached.
+    ;; Some passwd/group backends -- NSS over LDAP, SSSD, NIS, the systemd userdb
+    ;; -- legitimately hand back a NULL for an absent optional field (a missing
+    ;; gecos, home or shell), and strlen(NULL) is a hardware fault that unwinds the
+    ;; whole process, not a Scheme condition a guard could catch. Guarding at this
+    ;; one marshalling choke-point therefore hardens the whole-database walk and
+    ;; the key-based getpwnam/getpwuid/getgrnam lookups that share it alike.
+    ;; Otherwise: one strlen for the length, one memcpy for the payload, then the
+    ;; same UTF-8 decode. The bytevector is sized to the strlen result first, so
+    ;; the copy reads exactly the terminated string's bytes and no further.
+    (if (= ptr 0)
+        ""
+        (let* ([len (c-strlen ptr)]
+               [bv  (make-bytevector len)])
+          (c-memcpy-in bv ptr len)
+          (utf8->string bv))))
 
   ;; Build a C char** array from a list of Scheme strings.
   ;; The array is null-terminated. Caller must free with free-c-argv.
