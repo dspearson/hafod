@@ -134,4 +134,125 @@
   (test-equal "pre-year-0000 round-trip keeps month 2" 2 (date-month rt))
   (test-equal "pre-year-0000 round-trip keeps year 0" 0 (date-year rt)))
 
+;; ===========================================================================
+;; Section H -- UTC <-> TAI leap-second conversions
+;; ===========================================================================
+;; make-time takes (type nanosecond second).  The embedded historical UTC-TAI
+;; table carries the whole-second offset in force at each instant; a TAI==UTC
+;; stub returns the naive second unchanged and fails every offset below.
+
+(test-equal "time-utc->time-tai adds the +34 offset in force in 2009"
+            1230768034
+            (time-second (time-utc->time-tai (make-time time-utc 0 1230768000))))
+(test-equal "time-tai->time-utc subtracts the +34 offset back to UTC"
+            1230768000
+            (time-second (time-tai->time-utc (make-time time-tai 0 1230768034))))
+(test-equal "one second before the 1999 boundary keeps the old +31 offset"
+            915148799
+            (time-second (time-tai->time-utc (make-time time-tai 0 915148830))))
+(test-assert "time-tai->time-utc inverts time-utc->time-tai"
+             (let ((t (make-time time-utc 0 1230768000)))
+               (time=? t (time-tai->time-utc (time-utc->time-tai t)))))
+(test-equal "the embedded table carries the 2017 +37 row"
+            1483228837
+            (time-second (time-utc->time-tai (make-time time-utc 0 1483228800))))
+(test-equal "time-utc->time-tai! aliases the non-bang conversion"
+            1230768034
+            (time-second (time-utc->time-tai! (make-time time-utc 0 1230768000))))
+(test-assert "time-tai->time-utc! aliases the non-bang conversion"
+             (let ((t (make-time time-utc 0 1230768000)))
+               (time=? t (time-tai->time-utc! (time-utc->time-tai! t)))))
+
+;; read-leap-second-table swaps the whole table.  A fixture whose only row is
+;; the 1972 baseline drops the 2017 instant's offset to +10.  This runs LAST in
+;; Section H: no later section reads the leap-second table, so the swap is inert.
+(let* ((tmpdir (or (getenv "TMPDIR") "/tmp"))
+       (fixture (string-append tmpdir "/hafod-tai-utc-fixture.dat")))
+  (when (file-exists? fixture) (delete-file fixture))
+  (call-with-output-file fixture
+    (lambda (p)
+      (put-string p "1972 JAN 1 =JD 2441317.5 TAI-UTC= 10.0 S + (MJD - 41317.) X 0.0 S\n")))
+  (read-leap-second-table fixture)
+  (test-equal "read-leap-second-table swaps in a fixture whose sole row is 1972 (+10)"
+              1483228810
+              (time-second (time-utc->time-tai (make-time time-utc 0 1483228800))))
+  (delete-file fixture))
+
+;; ===========================================================================
+;; Section I -- Julian-day and modified-Julian-day inverse conversions
+;; ===========================================================================
+;; JD 2451545 is exactly 2000-01-01T12:00:00 UTC, and MJD 51544 is midnight the
+;; same day; feed EXACT integers so the rational arithmetic stays exact.
+
+(test-equal "julian-day->date decodes JD 2451545 to 2000-01-01T12:00:00"
+            '(2000 1 1 12 0 0)
+            (let ((d (julian-day->date 2451545 0)))
+              (list (date-year d) (date-month d) (date-day d)
+                    (date-hour d) (date-minute d) (date-second d))))
+(test-assert "julian-day->date inverts date->julian-day at JD 2451545"
+             (= 2451545 (date->julian-day (julian-day->date 2451545 0))))
+(test-equal "modified-julian-day->date decodes MJD 51544 to 2000-01-01T00:00:00"
+            '(1 2000 0)
+            (let ((d (modified-julian-day->date 51544 0)))
+              (list (date-day d) (date-year d) (date-hour d))))
+
+;; ===========================================================================
+;; Section J -- the remaining date->string output directives
+;; ===========================================================================
+;; The dispatch gains the full SRFI 19 directive set with the ~-/~_ pad
+;; modifiers.  Weekday/month names, year-day and the ISO week oracle are
+;; anchored to facts already pinned by Sections D and E.
+
+(test-equal "ISO ~4 renders the combined date-time with zone"
+            "2006-05-04T03:02:01Z"
+            (date->string (make-date 0 1 2 3 4 5 2006 0) "~4"))
+(test-equal "~I renders midnight as the 12-hour clock's 12"
+            "12"
+            (date->string (make-date 0 0 0 0 1 9 2018 0) "~I"))
+(test-equal "~V gives ISO week 53 for 2020-12-31"
+            "53" (date->string (make-date 0 0 0 0 31 12 2020 0) "~V"))
+(test-equal "~V gives ISO week 01 for 2021-01-04"
+            "01" (date->string (make-date 0 0 0 0 4 1 2021 0) "~V"))
+(test-equal "~V gives ISO week 01 for 2019-12-30 (part of 2020-W01)"
+            "01" (date->string (make-date 0 0 0 0 30 12 2019 0) "~V"))
+(test-equal "~A names the weekday in full" "Saturday"
+            (date->string (make-date 0 0 0 0 1 1 2000 0) "~A"))
+(test-equal "~a abbreviates the weekday" "Sat"
+            (date->string (make-date 0 0 0 0 1 1 2000 0) "~a"))
+(test-equal "~B names the month in full" "January"
+            (date->string (make-date 0 0 0 0 1 1 2000 0) "~B"))
+(test-equal "~b abbreviates the month" "Jan"
+            (date->string (make-date 0 0 0 0 1 1 2000 0) "~b"))
+(test-equal "~j is the zero-padded day of year" "061"
+            (date->string (make-date 0 0 0 0 1 3 2020 0) "~j"))
+(test-equal "~e space-pads the day of month" " 1"
+            (date->string (make-date 0 0 0 0 1 1 2000 0) "~e"))
+(test-equal "~z prints the RFC-822 zone offset" "+0100"
+            (date->string (make-date 0 0 0 0 1 1 2000 3600) "~z"))
+
+;; ===========================================================================
+;; Section K -- string->date parsing and the date->string round-trip
+;; ===========================================================================
+;; A round-trippable template must carry ~d ~m ~Y, since make-date needs
+;; day/month/year; an incomplete template raises rather than fabricating them.
+
+(test-equal "string->date reconstructs every field of an ISO instant"
+            '(2006 5 4 3 2 1 0)
+            (let ((d (string->date "2006-05-04T03:02:01Z" "~Y-~m-~dT~H:~M:~S~z")))
+              (list (date-year d) (date-month d) (date-day d)
+                    (date-hour d) (date-minute d) (date-second d)
+                    (date-zone-offset d))))
+(test-equal "date->string then string->date reproduces the field set"
+            '(2021 3 14 15 9 26 0)
+            (let* ((fmt "~Y-~m-~dT~H:~M:~S~z")
+                   (d0 (make-date 0 26 9 15 14 3 2021 0))
+                   (d (string->date (date->string d0 fmt) fmt)))
+              (list (date-year d) (date-month d) (date-day d)
+                    (date-hour d) (date-minute d) (date-second d)
+                    (date-zone-offset d))))
+(test-equal "string->date reads a named month via ~b" 3
+            (date-month (string->date "14 Mar 2021" "~d ~b ~Y")))
+(test-error "string->date rejects a template missing day/month/year"
+            (string->date "03:02:01" "~H:~M:~S"))
+
 (test-end)

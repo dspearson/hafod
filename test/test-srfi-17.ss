@@ -4,12 +4,9 @@
 ;;; getter's registered setter, and getter-with-setter pairs a getter with its
 ;;; setter. This suite spot-checks the working surface: the built-in
 ;;; getter/setter pairs (car, cdr, vector-ref, unbox), a user getter/setter
-;;; pair, and plain variable set!.
-;;;
-;;; Deferred capability (recorded in Future, NOT asserted here): the
-;;; settable-setter idiom (set! (setter proc) new-setter) -- registering a
-;;; setter THROUGH set! -- is not provided; setter is itself a plain getter.
-;;; The audit dispositioned the working surface conformant with that note.
+;;; pair, plain variable set!, the composed-accessor setters (caar … cddddr),
+;;; and the settable-setter idiom (set! (setter proc) new-setter) -- registering
+;;; a setter THROUGH set! -- so that setter is itself a settable location.
 ;;; Copyright (c) 2026, hafod contributors.
 
 ;; The library redefines set! as the generalised form; take it from the
@@ -58,5 +55,29 @@
 
 (test-equal "plain variable set! is unaffected by the generalisation"
             2 (let ((n 1)) (set! n 2) n))
+
+;; ===========================================================================
+;; Section D -- composed-accessor setters (caar … cddddr)
+;; ===========================================================================
+;; SRFI 17 settable composed accessors: (set! (caXXr x) v) == (set-car! (cXXr x) v)
+;; and (set! (cdXXr x) v) == (set-cdr! (cXXr x) v), for every 2-to-4-deep c[ad]+r.
+
+(test-equal "set! on (cadr p) mutates via the composed setter"
+            '(1 9 3) (let ((p (list 1 2 3))) (set! (cadr p) 9) p))
+(test-equal "set! on (caddr p) mutates the third car"
+            '(1 2 9) (let ((p (list 1 2 3))) (set! (caddr p) 9) p))
+
+;; ===========================================================================
+;; Section E -- the settable-setter idiom (set! (setter g) s)
+;; ===========================================================================
+;; SRFI 17 makes setter itself settable: (set! (setter proc) new) registers
+;; new as proc's setter, so a subsequent (set! (proc …) v) writes through it.
+
+(define store (vector #f))
+(define g (lambda () (vector-ref store 0)))
+(set! (setter g) (lambda (v) (vector-set! store 0 v)))
+(set! (g) 'wired)
+(test-equal "a setter registered through (set! (setter g) s) then writes"
+            'wired (g))
 
 (test-end)

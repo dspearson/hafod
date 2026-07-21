@@ -58,7 +58,7 @@ seasonal shell.
   SRFIs that scsh bundled via Scheme 48 are available as
   `(import (hafod srfi-N))`
 - **Full scsh compatibility** -- 1:1 coverage of the scsh public API
-  (1,369 exported symbols); `(import (scsh))` works as an alias for
+  (1,370 exported symbols); `(import (scsh))` works as an alias for
   `(import (hafod))`; all scsh accessor names, predicates, char-sets,
   file-options, RE ADT layer, and version aliases
 
@@ -756,7 +756,7 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,369 scsh-compatible symbols are
+5. Most scripts work unchanged -- 1,370 scsh-compatible symbols are
    exported, including SRFI-1 and SRFI-13 at the top level
 
 ## Performance

@@ -85,18 +85,56 @@
       (sre-form? sym)))
   '(any nonl bos eos bol eol digit alpha alnum space hex-digit ascii))
 
-;; --- DELIBERATE DIVERGENCE ---
+;; --- unquote-splicing: predicate and compiler now agree ---
 ;;
-;; The shallow syntactic predicate accepts an unquote-splicing form, but the
-;; regexp compiler has no arm for it and raises. Recognising the form in the
-;; predicate matches scsh, whose syntactic check is likewise shallow; supplying
-;; the matching compiler arm is a genuinely new capability, deferred to a later
-;; release rather than added in this behaviour-preserving one. Both sides are
-;; pinned here so the split cannot drift silently: the predicate accepts the
-;; form, and the compiler rejects it.
+;; The shallow syntactic predicate accepts an unquote-splicing form, and the
+;; regexp compiler now implements it: a ,@ operand splices the elements of its
+;; list into the enclosing seq/or, matching the scsh manual. Recognising the
+;; form in the predicate matches scsh, whose syntactic check is likewise shallow;
+;; the matching compiler arm is supplied here. Both sides stay pinned so the
+;; predicate<->compiler agreement cannot drift silently: the predicate accepts
+;; the form, and the compiler compiles and matches it.
+;;
+;; The splice operand is built as a GENUINE list -- (list 'unquote-splicing
+;; (list "a" "b")) -- so its cadr is the real list ("a" "b"). A fully-quoted
+;; '(seq (unquote-splicing (list "a" "b"))) datum would instead have the SYMBOL
+;; `list` as the operand's head, which is not a list to splice.
 (test-assert "the shallow predicate accepts an unquote-splicing form"
   (sre-form? '(unquote-splicing x)))
-(test-error "the compiler has no unquote-splicing arm and raises"
-  (sre->regexp '(seq (unquote-splicing (list "a" "b")))))
+(test-assert "sre->regexp splices ,@ into the sequence and matches"
+  (regexp-search? (sre->regexp (list 'seq "x" (list 'unquote-splicing (list "a" "b")) "y"))
+                  "xaby"))
+(test-assert "sre->regexp: empty ,@ splice is identity"
+  (regexp-search? (sre->regexp (list 'seq "x" (list 'unquote-splicing '()) "y")) "xy"))
+(test-error "sre->regexp: a non-list ,@ operand raises a clear error"
+  (sre->regexp (list 'seq (list 'unquote-splicing "notalist"))))
+;; A hand-built ,@ with NO operand -- (unquote-splicing) -- must raise the clear
+;; sre->regexp error, not a raw Chez cadr fault from reading a missing operand.
+(test-error "sre->regexp: a no-operand ,@ raises a clear error, not a raw cadr"
+  (sre->regexp (list 'seq (list 'unquote-splicing))))
+(test-assert "sre->regexp: a sole ,@ submatch body splices through parse-seq"
+  (regexp-search? (sre->regexp (list 'submatch (list 'unquote-splicing (list "a" "b"))))
+                  "ab"))
+;; The or-splice discriminator -- the phase's primary SRE property on the runtime
+;; side.  Each spliced element becomes its OWN alternation arm, so
+;; (or "x" ,@("a" "b")) matches "a", "b", and "x" each on its own.  Were ,@
+;; mis-handled as a single concatenated arm it would collapse to "ab", and
+;; searching the one-char "a"/"b" would then fail -- so these single-char
+;; searches are exactly what tells branching apart from concatenation.  This
+;; mirrors the macro-side pin (scsh-re-procs.ss) for the runtime compiler; the
+;; seq splice tests above share expand-elts but cannot distinguish the two.
+(test-assert "sre->regexp: ,@ in an or adds each element as its own arm"
+  (let ((re (sre->regexp (list 'or "x" (list 'unquote-splicing (list "a" "b"))))))
+    (and (regexp-search? re "a")
+         (regexp-search? re "b")
+         (regexp-search? re "x"))))
+;; An empty (or ,@()) collapses to (re-choice '()) = re-empty, the runtime's
+;; canonical never-match; searching it raises "RE can never match" exactly as a
+;; bare (or) does -- so ,@() contributes no arm.  (The rx macro reaches the same
+;; never-match semantics via never-match-pattern, which yields #f from search;
+;; the two compilers' never-match idioms differ mechanically but agree that an
+;; empty alternation never matches -- the runtime<->macro parity Task 2 closes.)
+(test-error "sre->regexp: empty (or ,@()) is never-match (empty re-choice)"
+  (regexp-search? (sre->regexp (list 'or (list 'unquote-splicing '()))) "x"))
 
 (test-end)

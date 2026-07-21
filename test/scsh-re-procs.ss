@@ -61,6 +61,41 @@
   (and (regexp-search (rx (: (* numeric) eos)) "123") #t))
 
 ;; ======================================================================
+;; rx macro: literal ,@ (unquote-splicing) splicing
+;; ======================================================================
+;; A literal ,@("a" "b") reads as (unquote-splicing ("a" "b")), so its cadr is
+;; already the real list ("a" "b") -- no quoting trap.  splice-forms folds it
+;; into the enclosing seq/or at expand time.  (Dynamic ,@ over a runtime-built
+;; list -- ,@(list a b) -- stays unsupported: rx is a static macro; see the
+;; note on the ADT transformation tests below.)
+
+(test-assert "rx splices a literal ,@ list into the sequence"
+  (regexp-search? (rx (seq "x" ,@("a" "b") "y")) "xaby"))
+
+;; The or-splice discriminator: each spliced element becomes its OWN alternation
+;; arm, so (or "x" ,@("a" "b")) matches "a", "b", AND "x".  Were ,@ mis-handled
+;; as a standalone seq it would collapse to the single arm "ab", and searching
+;; the one-char string "a" would then fail.
+(test-assert "rx ,@ in an alternation adds each element as its own arm"
+  (and (regexp-search? (rx (or "x" ,@("a" "b"))) "a")
+       (regexp-search? (rx (or "x" ,@("a" "b"))) "b")
+       (regexp-search? (rx (or "x" ,@("a" "b"))) "x")))
+
+;; A ,@ that is the SOLE body of a submatch or a repetition splices through the
+;; seq machinery (seq-body) instead of hitting the "unknown SRE form" else-arm.
+(test-assert "rx ,@ as the sole submatch body compiles and matches"
+  (regexp-search? (rx (submatch ,@("a" "b"))) "ab"))
+(test-assert "rx ,@ as the sole repetition body compiles and matches"
+  (regexp-search? (rx (* ,@("a" "b"))) "abab"))
+
+;; An empty (or ,@()) with no other arms is never-match: the macro emits
+;; never-match-pattern (yielding #f from search), matching the runtime's empty
+;; (re-choice '()) never-match rather than the empty-match "" the or loop would
+;; otherwise emit.
+(test-assert "rx empty (or ,@()) is never-match"
+  (not (regexp-search? (rx (or ,@())) "x")))
+
+;; ======================================================================
 ;; Match accessors
 ;; ======================================================================
 

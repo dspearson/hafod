@@ -67,4 +67,58 @@
 (test-equal "if3 selects the equal branch on 0"
             'equal (if3 (integer-compare 2 2) 'less 'equal 'greater))
 
+;; ===========================================================================
+;; Section H -- default-compare (cross-type total order) and symbol-compare
+;; ===========================================================================
+;; The type order is null < pair < boolean < char < string < symbol < number
+;; < vector; within a type it compares recursively.
+
+(test-equal "default-compare orders null before a pair" -1 (default-compare '() '(1)))
+(test-equal "default-compare orders a boolean before a char" -1 (default-compare #t #\a))
+(test-equal "default-compare orders a string before a symbol" -1 (default-compare "z" 'a))
+(test-equal "default-compare orders a number before a vector" -1 (default-compare 1 '#(0)))
+(test-equal "default-compare recurses into pairs"
+            -1 (default-compare '(1 2) '(1 3)))
+(test-equal "default-compare reports equal for equal values" 0 (default-compare '(1 2) '(1 2)))
+(test-equal "symbol-compare orders by symbol name" -1 (symbol-compare 'abc 'abd))
+
+;; ===========================================================================
+;; Section I -- 2-arg optional-compare arity + compare-by< constructor
+;; ===========================================================================
+;; =?/<?/… gain a 2-arg arity defaulting the compare to default-compare, while
+;; the existing 3-arg (explicit-compare) arity is unchanged. compare-by< gains a
+;; no-x-y constructor arity returning a compare procedure.
+
+(test-assert "=? with two arguments uses default-compare" (=? 2 2))
+(test-assert "<? with two arguments uses default-compare" (<? 1 2))
+(test-assert ">? with two arguments uses default-compare" (>? 3 2))
+(test-assert "the explicit-compare arity of =? still works" (=? integer-compare 2 2))
+(test-equal "compare-by< with one argument returns a compare procedure"
+            -1 ((compare-by< <) 1 2))
+(test-equal "compare-by< with three arguments still computes directly"
+            1 (compare-by< < 2 1))
+
+;; ===========================================================================
+;; Section J -- min/max-compare and the chain comparison family
+;; ===========================================================================
+
+(test-equal "min-compare returns the minimum per the compare"
+            1 (min-compare integer-compare 3 1 2))
+(test-equal "max-compare returns the maximum per the compare"
+            3 (max-compare integer-compare 3 1 2))
+(test-assert "chain<? is #t for a strictly increasing chain"
+             (chain<? integer-compare 1 2 3))
+(test-assert "chain<? is #f when not strictly increasing"
+             (not (chain<? integer-compare 1 3 2)))
+(test-assert "chain<=? allows equal adjacent elements"
+             (chain<=? integer-compare 1 1 2))
+(test-assert "chain>? is #t for a strictly decreasing chain"
+             (chain>? integer-compare 3 2 1))
+(test-assert "chain>=? allows equal adjacent elements"
+             (chain>=? integer-compare 3 3 1))
+(test-assert "chain=? is #t when all elements are equal"
+             (chain=? integer-compare 2 2 2))
+(test-assert "chain=? is #f when an element differs"
+             (not (chain=? integer-compare 2 2 3)))
+
 (test-end)

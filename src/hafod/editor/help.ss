@@ -2,9 +2,22 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod editor help)
-  (export show-keybindings run-tutorial)
+  (export show-keybindings run-tutorial
+          ;; Exposed for the PTY-free navigation tests (white-box): the lesson
+          ;; count, the pure index step, the two input classifiers, and the
+          ;; render loop with its key read injected.
+          tutorial-lesson-count tutorial-next-index
+          key->tutorial-command line->tutorial-command
+          run-tutorial/reader)
   (import (chezscheme)
-          (only (hafod terminal-caps) ansi-ok? colour-ok?))
+          (only (hafod terminal-caps) ansi-ok? colour-ok?)
+          ;; The single owner of raw-mode entry/exit, and the decoder every
+          ;; editor keystroke already passes through. Both are leaf libraries:
+          ;; importing (hafod editor editor) instead would close a cycle, since
+          ;; that library imports this one.
+          (only (hafod tty) with-raw-mode*)
+          (only (hafod editor input-decode)
+                read-key-event key-event-type key-event-value))
 
   ;; ======================================================================
   ;; ANSI formatting helpers
@@ -231,8 +244,71 @@
         "")
        ))
 
-  (define (run-tutorial)
-    (let ([n (vector-length tutorial-lessons)])
+  ;; How many lessons there are, published so a caller need not re-derive it
+  ;; from the vector or hard-code today's count.
+  (define tutorial-lesson-count (vector-length tutorial-lessons))
+
+  ;; The one command table, shared by the keypress and the whole-line readers so
+  ;; the two paths cannot drift apart: q leaves, p goes back, and everything else
+  ;; advances -- which is what makes the legend's [Enter] true of Space, of a
+  ;; stray letter, and of an arrow key alike.
+  (define (char->tutorial-command ch)
+    (case ch
+      [(#\q) 'quit]
+      [(#\p) 'prev]
+      [else 'next]))
+
+  ;; Where a command moves the reader, kept pure so the movement rule is
+  ;; provable on its own. Going back clamps at the first lesson rather than
+  ;; running negative; going forward stops at N, one past the last lesson, which
+  ;; is how the loop terminates; quitting answers #f, which it reads as "stop
+  ;; now, and say so".
+  (define (tutorial-next-index i n cmd)
+    (case cmd
+      [(prev) (max 0 (- i 1))]
+      [(quit) #f]
+      [else (min n (+ i 1))]))
+
+  ;; Classify one decoded key event.
+  ;;
+  ;; Ctrl-D earns an arm of its own because raw mode has switched off the
+  ;; terminal's own end-of-file processing: with ICANON clear the key arrives as
+  ;; an ordinary control byte rather than as an end-of-file object, and a reader
+  ;; who presses it plainly means to leave. Genuine end of input means the same.
+  (define (key->tutorial-command ke)
+    (cond
+      [(eof-object? ke) 'quit]
+      [(and (eq? (key-event-type ke) 'ctrl)
+            (eqv? (key-event-value ke) #\d))
+       'quit]
+      [(eq? (key-event-type ke) 'char)
+       (char->tutorial-command (key-event-value ke))]
+      [else 'next]))
+
+  ;; Classify one whole line, for the runs where the reader is a script rather
+  ;; than a terminal. Consuming the WHOLE line is the entire point: the newline
+  ;; that ends it is retired here instead of being left in the port to be read
+  ;; back as a second, phantom command, and a reader who types a word spends one
+  ;; lesson on it rather than one lesson per character. The first non-blank
+  ;; character decides, so "  p  " still goes back, and an empty or blank line
+  ;; is the Enter the legend advertises.
+  (define (line->tutorial-command line)
+    (if (eof-object? line)
+        'quit
+        (let ([len (string-length line)])
+          (let lp ([i 0])
+            (cond
+              [(>= i len) 'next]
+              [(char-whitespace? (string-ref line i)) (lp (+ i 1))]
+              [else (char->tutorial-command (string-ref line i))])))))
+
+  ;; The tutorial's render-and-navigate loop, with the key read injected as
+  ;; READ-COMMAND -- a thunk answering one of the three navigation commands.
+  ;; Holding the terminal at arm's length this way lets the whole loop be driven
+  ;; over string ports, and lets run-tutorial choose between a keypress and a
+  ;; line without duplicating a line of the rendering below.
+  (define (run-tutorial/reader read-command)
+    (let ([n tutorial-lesson-count])
       (let lp ([i 0])
         (when (< i n)
           (let* ([lesson (vector-ref tutorial-lessons i)]
@@ -265,17 +341,49 @@
             (newline)
             (display (dim "  [Enter] next   [q] quit   [p] previous"))
             (newline) (newline)
-            ;; Wait for keypress (simple blocking read)
-            (let ([ch (read-char)])
-              (cond
-                [(or (eof-object? ch) (char=? ch #\q))
-                 (when (ansi-ok? (current-output-port))
-                   (display "\x1b;[2J\x1b;[H"))
-                 (display "  Tutorial ended.\n\n")]
-                [(char=? ch #\p)
-                 (lp (max 0 (- i 1)))]
-                [else
-                 (lp (+ i 1))])))))))
+            (let ([next-i (tutorial-next-index i n (read-command))])
+              (if next-i
+                  (lp next-i)
+                  (begin
+                    (when (ansi-ok? (current-output-port))
+                      (display "\x1b;[2J\x1b;[H"))
+                    (display "  Tutorial ended.\n\n")))))))))
+
+  ;; The tutorial proper, gating on whether standard input is a terminal.
+  ;;
+  ;; On a terminal the legend is taken literally -- one keystroke, one command,
+  ;; no Enter needed. The raw-mode extent is exactly one key read wide rather
+  ;; than wrapping the loop, so every screen above is still painted in cooked
+  ;; mode, where the output flags translate the newlines the display code emits;
+  ;; not a byte of that rendering had to change, and echo is never live while a
+  ;; screen is being drawn. Two attribute changes per lesson at reading pace cost
+  ;; nothing. with-raw-mode* is the single owner of that transition: it winds the
+  ;; cooked baseline back on a normal return, on a raised condition and across a
+  ;; suspend, and it leaves the signal-generating characters enabled, so Ctrl-C
+  ;; keeps its usual disposition and unwinds through that same restore.
+  ;;
+  ;; Off a terminal -- piped, redirected, or a dumb TERM -- there are no
+  ;; attributes to set and with-raw-mode* would raise, so a scripted run reads
+  ;; whole lines instead: one line, one lesson, a blank line meaning next.
+  ;; Degrading beats erroring.
+  ;;
+  ;; The gate asks about descriptor 0 by number rather than about a port object,
+  ;; because the question is whether this process's standard input is a terminal
+  ;; and the shared console port aliases elsewhere.
+  (define (run-tutorial)
+    (run-tutorial/reader
+      (if (ansi-ok? 0)
+          (lambda ()
+            ;; Push the prompt out before blocking: the read below waits on a
+            ;; person, so anything still buffered would leave them staring at a
+            ;; half-drawn lesson.
+            (flush-output-port (current-output-port))
+            (key->tutorial-command
+              (with-raw-mode* 0
+                (lambda () (read-key-event (console-input-port))))))
+          (lambda ()
+            (flush-output-port (current-output-port))
+            (line->tutorial-command (get-line (console-input-port)))))))
 
   ;; Helper: split string on delimiter char
   (define (string-split str delim)

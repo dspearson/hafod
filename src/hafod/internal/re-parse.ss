@@ -23,10 +23,42 @@
   ;; case-sensitive?: lexical case-sensitivity context.
   (define (parse-sre-runtime sre case-sensitive?)
     (let recur ((sre sre) (case-sensitive? case-sensitive?))
+      ;; Coerce one already-evaluated value to an re-adt.  Shared by the bare
+      ;; unquote (,) arm and the unquote-splicing (,@) element expander so the
+      ;; two dynamic forms coerce identically.
+      (define (coerce-runtime-value val)
+        (cond
+          ((string? val) (flush-submatches (make-re-string val)))
+          ((char? val)   (flush-submatches (make-re-string (string val))))
+          ((re-adt? val) (flush-submatches val))
+          (else (error 'sre->regexp "cannot coerce unquote value to regexp" val))))
+      ;; Map recur over an element list, expanding a (unquote-splicing LIST)
+      ;; element inline: each spliced VALUE is coerced to an re-adt, an empty
+      ;; list contributes nothing (identity in seq), and a non-list operand
+      ;; raises a clear error rather than falling through to "unknown SRE form".
+      ;; Splicing lives here -- shared by seq and or -- so an or-splice adds
+      ;; each element as its own alternative instead of concatenating them.
+      (define (expand-elts elts cs?)
+        (let loop ((elts elts) (acc '()))
+          (cond
+            ((null? elts) (reverse acc))
+            ((and (pair? (car elts)) (eq? (caar elts) 'unquote-splicing))
+             (let ((elt (car elts)))
+               ;; Guard the operand's presence before cadr: a hand-built
+               ;; (unquote-splicing) with no operand would otherwise surface a
+               ;; raw Chez "cadr: incorrect list structure" instead of the clear
+               ;; sre->regexp error used just below for a non-list operand.
+               (unless (pair? (cdr elt))
+                 (error 'sre->regexp "unquote-splicing needs a list operand" elt))
+               (let ((val (cadr elt)))
+                 (unless (list? val)
+                   (error 'sre->regexp "unquote-splicing value is not a list" val))
+                 (loop (cdr elts) (append (reverse (map coerce-runtime-value val)) acc)))))
+            (else (loop (cdr elts) (cons (recur (car elts) cs?) acc))))))
       (define (parse-seq elts)
-        (re-seq (map (lambda (s) (recur s case-sensitive?)) elts)))
+        (re-seq (expand-elts elts case-sensitive?)))
       (define (parse-seq/cs elts cs?)
-        (re-seq (map (lambda (s) (recur s cs?)) elts)))
+        (re-seq (expand-elts elts cs?)))
       (cond
         ;; String literal
         ((string? sre)
@@ -85,7 +117,7 @@
 
                 ;; Alternation
                 ((or)
-                 (re-choice (map (lambda (s) (recur s case-sensitive?)) rest)))
+                 (re-choice (expand-elts rest case-sensitive?)))
 
                 ;; Repetition
                 ((*) (re-repeat 0 #f (parse-seq rest)))
@@ -149,14 +181,12 @@
                 ((posix-string)
                  (posix-string->regexp (car rest)))
 
-                ;; Dynamic forms: for runtime, evaluate the contained value
+                ;; Dynamic forms: for runtime, evaluate the contained value.
+                ;; A bare , coerces exactly one value; ,@ (unquote-splicing) is
+                ;; handled element-wise by expand-elts inside seq/or, so it never
+                ;; reaches this arm.
                 ((unquote)
-                 (let ((val (cadr sre)))
-                   (cond
-                     ((string? val)   (flush-submatches (make-re-string val)))
-                     ((char? val)     (flush-submatches (make-re-string (string val))))
-                     ((re-adt? val)   (flush-submatches val))
-                     (else (error 'sre->regexp "cannot coerce unquote value to regexp" val)))))
+                 (coerce-runtime-value (cadr sre)))
 
                 (else (error 'sre->regexp "unknown SRE form" sre))))
 

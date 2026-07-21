@@ -301,10 +301,42 @@
       (let-values (((s np f smap) (compile-sre/base sre fold? 0 line-aware?)))
         (values s np f smap))))
 
+  ;; Expand a LEADING (unquote-splicing LIST) form one level: splice the list's
+  ;; elements into the forms list so they flow through the normal seq/or path.
+  ;; An empty list contributes nothing; a non-list operand raises a clear error
+  ;; rather than falling through to "unknown SRE form".  Splicing lives in the
+  ;; seq/or iterators (not a standalone case arm) so an or-splice adds each
+  ;; element as its own alternative instead of concatenating them.
+  (define (splice-forms forms)
+    (if (and (pair? forms)
+             (pair? (car forms))
+             (eq? (caar forms) 'unquote-splicing))
+        (let ((elt (car forms)))
+          ;; Guard the operand's presence before cadr, mirroring the runtime
+          ;; parser: a hand-built (unquote-splicing) with no operand would
+          ;; otherwise surface a raw Chez cadr error instead of the clear
+          ;; compile-sre error used just below for a non-list operand.
+          (unless (pair? (cdr elt))
+            (error 'compile-sre "unquote-splicing needs a list operand" elt))
+          (let ((lst (cadr elt)))
+            (unless (list? lst)
+              (error 'compile-sre "unquote-splicing value is not a list" lst))
+            (append lst (cdr forms))))
+        forms))
+
+  ;; Body of a single-body form (submatch, repetition, case-folding, dsm):
+  ;; splice a leading ,@ first, then unwrap a lone element or wrap several in a
+  ;; seq.  A SOLE ,@ body thus splices through the seq machinery -- matching the
+  ;; runtime, which routes every body through parse-seq -> expand-elts -- instead
+  ;; of hitting the "unknown SRE form" else-arm.
+  (define (seq-body forms)
+    (let ((fs (splice-forms forms)))
+      (if (= (length fs) 1) (car fs) (cons 'seq fs))))
+
   ;; Compile repetition body and append quantifier
   (define (compile-repetition/base body quantifier fold? base line-aware?)
     (let-values (((s p f smap) (compile-sre/base
-                                 (if (= (length body) 1) (car body) (cons 'seq body))
+                                 (seq-body body)
                                  fold? base line-aware?)))
       (let-values (((s2 p2) (ensure-piece s p)))
         ;; If ensure-piece added a grouping paren, adjust base offsets of all smap entries
@@ -367,17 +399,18 @@
                 (if (null? rest)
                     (values "" 0 fold? '())
                     (let loop ((forms rest) (acc "") (np 0) (smap '()))
-                      (if (null? forms)
-                          (values acc np fold? (reverse smap))
-                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
-                            (let-values (((s2 p2) (ensure-piece-for-seq s p)))
-                              ;; If ensure-piece-for-seq added a grouping paren,
-                              ;; adjust inner submatch indices
-                              (let ((adj-smap (if (> p2 p)
-                                                  (map (lambda (idx) (+ idx 1)) inner-smap)
-                                                  inner-smap)))
-                                (loop (cdr forms) (string-append acc s2) (+ np p2)
-                                      (append (reverse adj-smap) smap)))))))))
+                      (let ((forms (splice-forms forms)))
+                        (if (null? forms)
+                            (values acc np fold? (reverse smap))
+                            (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
+                              (let-values (((s2 p2) (ensure-piece-for-seq s p)))
+                                ;; If ensure-piece-for-seq added a grouping paren,
+                                ;; adjust inner submatch indices
+                                (let ((adj-smap (if (> p2 p)
+                                                    (map (lambda (idx) (+ idx 1)) inner-smap)
+                                                    inner-smap)))
+                                  (loop (cdr forms) (string-append acc s2) (+ np p2)
+                                        (append (reverse adj-smap) smap))))))))))
 
                ;; Alternation
                ((or)
@@ -385,16 +418,22 @@
                     ;; Empty alternation: unmatchable
                     (values never-match-pattern 0 fold? '())
                     (let loop ((forms rest) (acc '()) (np 0) (first? #t) (smap '()))
-                      (if (null? forms)
-                          (values (apply string-append (reverse acc)) np fold? (reverse smap))
-                          (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
-                            (loop (cdr forms)
-                                  (if first?
-                                      (cons s acc)
-                                      (cons s (cons "|" acc)))
-                                  (+ np p)
-                                  #f
-                                  (append (reverse inner-smap) smap)))))))
+                      (let ((forms (splice-forms forms)))
+                        (if (null? forms)
+                            (if first?
+                                ;; Every arm spliced away (e.g. (or ,@())): no arm
+                                ;; survived, so this alternation never matches, like
+                                ;; a bare (or) -- emit never-match-pattern, not "".
+                                (values never-match-pattern 0 fold? '())
+                                (values (apply string-append (reverse acc)) np fold? (reverse smap)))
+                            (let-values (((s p f inner-smap) (compile-sre/base (car forms) fold? (+ base np) line-aware?)))
+                              (loop (cdr forms)
+                                    (if first?
+                                        (cons s acc)
+                                        (cons s (cons "|" acc)))
+                                    (+ np p)
+                                    #f
+                                    (append (reverse inner-smap) smap))))))))
 
                ;; Repetition: (* re ...)
                ((*) (compile-repetition/base rest "*" fold? base line-aware?))
@@ -407,7 +446,7 @@
                       (n (cadr rest))
                       (body (cddr rest)))
                   (let-values (((s p f smap) (compile-sre/base
-                                               (if (= (length body) 1) (car body) (cons 'seq body))
+                                               (seq-body body)
                                                fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
@@ -419,7 +458,7 @@
                 (let ((n (car rest))
                       (body (cdr rest)))
                   (let-values (((s p f smap) (compile-sre/base
-                                               (if (= (length body) 1) (car body) (cons 'seq body))
+                                               (seq-body body)
                                                fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
@@ -431,7 +470,7 @@
                 (let ((n (car rest))
                       (body (cdr rest)))
                   (let-values (((s p f smap) (compile-sre/base
-                                               (if (= (length body) 1) (car body) (cons 'seq body))
+                                               (seq-body body)
                                                fold? base line-aware?)))
                     (let-values (((s2 p2) (ensure-piece s p)))
                       (let ((new-smap (if (> p2 p) (map (lambda (idx) (+ idx 1)) smap) smap)))
@@ -443,7 +482,7 @@
                 ;; This paren is at absolute index (base + 1)
                 (let ((this-paren-idx (+ base 1)))
                   (let-values (((s p f inner-smap) (compile-sre/base
-                                                     (if (= (length rest) 1) (car rest) (cons 'seq rest))
+                                                     (seq-body rest)
                                                      fold? (+ base 1) line-aware?)))
                     ;; The inner submatches are already correct (they were compiled with base+1).
                     ;; Our user submatch is at this-paren-idx, followed by any inner user submatches.
@@ -454,24 +493,24 @@
                ;; Dead submatch (ignore pre/post counts)
                ((dsm)
                 (let ((body (cddr rest)))
-                  (compile-sre/base (if (= (length body) 1) (car body) (cons 'seq body)) fold? base line-aware?)))
+                  (compile-sre/base (seq-body body) fold? base line-aware?)))
 
                ;; Case folding
                ((w/nocase)
                 (let-values (((s p f smap) (compile-sre/base
-                                             (if (= (length rest) 1) (car rest) (cons 'seq rest))
+                                             (seq-body rest)
                                              #t base line-aware?)))
                   (values s p #t smap)))
 
                ((w/case)
                 (let-values (((s p f smap) (compile-sre/base
-                                             (if (= (length rest) 1) (car rest) (cons 'seq rest))
+                                             (seq-body rest)
                                              #f base line-aware?)))
                   (values s p #f smap)))
 
                ((uncase)
                 (let-values (((s p f smap) (compile-sre/base
-                                             (if (= (length rest) 1) (car rest) (cons 'seq rest))
+                                             (seq-body rest)
                                              #t base line-aware?)))
                   (values s p #t smap)))
 

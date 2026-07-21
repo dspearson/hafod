@@ -129,12 +129,30 @@
 (test-assert "pid and parent-pid differ"
   (not (= (pid) (parent-pid))))
 
-;; process-group is nullary here: it reports the calling process's own group.
+;; process-group reports the calling process's own group in its nullary form.
 ;; scsh also accepts an optional process or pid to query another process's
-;; group; hafod does not yet provide that target form (it would need a distinct
-;; group-of-pid lookup), so only the self case is exercised -- the target form
-;; is a deferred capability, not a covered one.
+;; group; hafod now implements that target form via a getpgid group-of-pid
+;; lookup. Because getpgid(0) and getpgid(getpid()) both equal getpgrp(), the
+;; nullary self case and the one-arg pid/0 forms agree; a definitely-absent pid
+;; is surfaced as a posix error rather than undefined behaviour.
 (test-assert "process-group of the current process is positive"
   (> (process-group) 0))
+
+;; The nullary self case equals querying the calling process by its own pid.
+(test-equal "process-group nullary equals process-group of own pid"
+  (process-group) (process-group (pid)))
+
+;; getpgid(0) names the calling process's group, so (process-group 0) agrees.
+(test-equal "process-group of pid 0 equals the nullary self case"
+  (process-group) (process-group 0))
+
+;; The group is a non-negative integer whichever form produced it.
+(test-assert "process-group returns a non-negative integer"
+  (let ((g (process-group))) (and (integer? g) (>= g 0))))
+
+;; A definitely-absent pid: getpgid fails with ESRCH, surfaced through
+;; posix-call as a raised posix error rather than undefined behaviour.
+(test-error "process-group of a definitely-absent pid raises"
+  (process-group 2147483646))
 
 (test-end)

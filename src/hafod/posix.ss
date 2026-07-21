@@ -69,7 +69,7 @@
     posix-chdir posix-getcwd posix-getenv posix-setenv posix-unsetenv
 
     ;; Identity
-    posix-getpid posix-getppid posix-getpgrp posix-setpgid posix-setsid
+    posix-getpid posix-getppid posix-getpgrp posix-getpgid posix-setpgid posix-setsid
     posix-getuid posix-getgid posix-geteuid posix-getegid
     posix-setuid posix-setgid posix-seteuid posix-setegid
 

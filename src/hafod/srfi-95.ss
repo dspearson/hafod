@@ -5,10 +5,13 @@
 ;;; Wraps Chez sort/merge with SRFI-95 argument order.
 
 (library (hafod srfi-95)
-  (export sorted? merge sort)
+  (export sorted? merge sort sort! merge!)
   (import (rename (chezscheme)
             (sort chez:sort)
-            (merge chez:merge)))
+            (merge chez:merge)
+            (sort! chez:sort!)
+            (vector-sort! chez:vector-sort!)
+            (merge! chez:merge!)))
 
   ;; SRFI-95: (sort sequence less? [key])
   ;; Chez:    (sort less? list)
@@ -34,6 +37,30 @@
        (chez:merge less? lst1 lst2)]
       [(lst1 lst2 less? key)
        (chez:merge (lambda (a b) (less? (key a) (key b))) lst1 lst2)]))
+
+  ;; SRFI-95: (sort! sequence less? [key]) -- destructive, returns the sequence.
+  ;; Chez vector-sort! mutates in place but does NOT return the vector, so the
+  ;; wrapper returns the sequence argument explicitly.
+  (define sort!
+    (case-lambda
+      [(seq less?)
+       (if (vector? seq)
+           (begin (chez:vector-sort! less? seq) seq)
+           (chez:sort! less? seq))]
+      [(seq less? key)
+       (let ([lt (lambda (a b) (less? (key a) (key b)))])
+         (if (vector? seq)
+             (begin (chez:vector-sort! lt seq) seq)
+             (chez:sort! lt seq)))]))
+
+  ;; SRFI-95: (merge! list1 list2 less? [key]) -- destructive merge.
+  ;; Chez:    (merge! less? list1 list2)
+  (define merge!
+    (case-lambda
+      [(lst1 lst2 less?)
+       (chez:merge! less? lst1 lst2)]
+      [(lst1 lst2 less? key)
+       (chez:merge! (lambda (a b) (less? (key a) (key b))) lst1 lst2)]))
 
   (define (sorted? seq less? . opt-key)
     (let ((key (if (pair? opt-key) (car opt-key) values)))

@@ -29,7 +29,10 @@
 
   (import (hafod internal base)
           (hafod posix) (hafod compat) (hafod fname)
-          (hafod user-group) (hafod environment))
+          (hafod user-group) (hafod environment)
+          ;; Narrow import for the process-group target coercion; acyclic --
+          ;; procobj imports only base/posix/compat, never process-state.
+          (only (hafod procobj) proc? proc:pid))
 
   ;; ======================================================================
   ;; Resource record type
@@ -155,7 +158,22 @@
   ;; Process groups and session
   ;; ======================================================================
 
-  (define (process-group) (posix-getpgrp))
+  ;; (process-group)          -- the calling process's own group (getpgrp()).
+  ;; (process-group proc-or-pid) -- that process's group via getpgid. A proc
+  ;; object or an integer pid is accepted (the guard is integer?, exactly as
+  ;; signal-process's), coerced to a pid; any other argument raises a clear
+  ;; error.  A negative pid is not rejected up front -- it reaches getpgid and
+  ;; fails safely with ESRCH via posix-call.
+  (define (process-group . maybe-proc-or-pid)
+    (if (null? maybe-proc-or-pid)
+        (posix-getpgrp)
+        (posix-getpgid
+          (let ([x (car maybe-proc-or-pid)])
+            (cond
+              [(integer? x) x]
+              [(proc? x) (proc:pid x)]
+              [else (error 'process-group
+                           "argument must be an integer pid or proc object" x)])))))
 
   ;; set-process-group: one or two arguments.
   ;; (set-process-group pgrp) -- set current process to pgrp

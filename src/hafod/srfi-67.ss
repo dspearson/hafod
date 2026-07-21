@@ -13,6 +13,7 @@
     string-compare string-compare-ci
     number-compare integer-compare rational-compare real-compare complex-compare
     pair-compare list-compare vector-compare
+    default-compare symbol-compare
     ;; Combining
     refine-compare select-compare cond-compare
     ;; Using
@@ -20,7 +21,9 @@
     ;; Min/max
     pairwise-not=?
     compare-by< compare-by> compare-by<= compare-by>=
-    compare-by=)
+    compare-by=
+    min-compare max-compare
+    chain=? chain<? chain>? chain<=? chain>=?)
   (import (chezscheme))
 
   ;; Three-way dispatch
@@ -45,13 +48,32 @@
       ((_ c then) (if>? c then (void)))
       ((_ c then else) (if (> c 0) then else))))
 
-  ;; Compare predicates
-  (define (=? compare a b) (zero? (compare a b)))
-  (define (<? compare a b) (negative? (compare a b)))
-  (define (>? compare a b) (positive? (compare a b)))
-  (define (<=? compare a b) (not (positive? (compare a b))))
-  (define (>=? compare a b) (not (negative? (compare a b))))
-  (define (not=? compare a b) (not (zero? (compare a b))))
+  ;; Compare predicates. Each has an optional-compare (2-arg) arity that defaults
+  ;; the compare to default-compare, plus the explicit (compare a b) arity.
+  (define =?
+    (case-lambda
+      ((a b) (zero? (default-compare a b)))
+      ((compare a b) (zero? (compare a b)))))
+  (define <?
+    (case-lambda
+      ((a b) (negative? (default-compare a b)))
+      ((compare a b) (negative? (compare a b)))))
+  (define >?
+    (case-lambda
+      ((a b) (positive? (default-compare a b)))
+      ((compare a b) (positive? (compare a b)))))
+  (define <=?
+    (case-lambda
+      ((a b) (not (positive? (default-compare a b))))
+      ((compare a b) (not (positive? (compare a b))))))
+  (define >=?
+    (case-lambda
+      ((a b) (not (negative? (default-compare a b))))
+      ((compare a b) (not (negative? (compare a b))))))
+  (define not=?
+    (case-lambda
+      ((a b) (not (zero? (default-compare a b))))
+      ((compare a b) (not (zero? (compare a b))))))
 
   (define (</<=? compare a b c)
     (and (<? compare a b) (<=? compare b c)))
@@ -149,6 +171,34 @@
              (let ((c (cmp (vector-ref a i) (vector-ref b i))))
                (if (zero? c) (loop (+ i 1)) c))))))))
 
+  (define (symbol-compare x y)
+    (string-compare (symbol->string x) (symbol->string y)))
+
+  ;; default-compare -- the recursive cross-type total order. Type order:
+  ;; null < pair < boolean < char < string < symbol < number < vector.
+  (define (default-compare x y)
+    (cond
+      ((null? x)    (if (null? y) 0 -1))
+      ((null? y)    1)
+      ((pair? x)    (if (pair? y)
+                        (refine-compare (default-compare (car x) (car y))
+                                        (default-compare (cdr x) (cdr y)))
+                        -1))
+      ((pair? y)    1)
+      ((boolean? x) (if (boolean? y) (boolean-compare x y) -1))
+      ((boolean? y) 1)
+      ((char? x)    (if (char? y) (char-compare x y) -1))
+      ((char? y)    1)
+      ((string? x)  (if (string? y) (string-compare x y) -1))
+      ((string? y)  1)
+      ((symbol? x)  (if (symbol? y) (symbol-compare x y) -1))
+      ((symbol? y)  1)
+      ((number? x)  (if (number? y) (number-compare x y) -1))
+      ((number? y)  1)
+      ((vector? x)  (if (vector? y) (vector-compare default-compare x y) -1))
+      ((vector? y)  1)
+      (else (error 'default-compare "unrecognised type" x y))))
+
   (define (pairwise-not=? compare . vals)
     (let loop ((vs vals))
       (or (null? vs)
@@ -159,13 +209,61 @@
                           (inner (cdr rest)))))
                (loop (cdr vs))))))
 
-  (define (compare-by< lt a b)
-    (cond ((lt a b) -1) ((lt b a) 1) (else 0)))
-  (define (compare-by> gt a b)
-    (cond ((gt a b) 1) ((gt b a) -1) (else 0)))
-  (define (compare-by<= le a b)
-    (cond ((le a b) (if (le b a) 0 -1)) (else 1)))
-  (define (compare-by>= ge a b)
-    (cond ((ge a b) (if (ge b a) 0 1)) (else -1)))
-  (define (compare-by= eq a b)
-    (if (eq a b) 0 -1)))
+  ;; Each compare-by* has a no-x-y constructor arity (returns a compare
+  ;; procedure) and the direct (proc a b) arity.
+  (define compare-by<
+    (case-lambda
+      ((lt) (lambda (a b) (cond ((lt a b) -1) ((lt b a) 1) (else 0))))
+      ((lt a b) (cond ((lt a b) -1) ((lt b a) 1) (else 0)))))
+  (define compare-by>
+    (case-lambda
+      ((gt) (lambda (a b) (cond ((gt a b) 1) ((gt b a) -1) (else 0))))
+      ((gt a b) (cond ((gt a b) 1) ((gt b a) -1) (else 0)))))
+  (define compare-by<=
+    (case-lambda
+      ((le) (lambda (a b) (cond ((le a b) (if (le b a) 0 -1)) (else 1))))
+      ((le a b) (cond ((le a b) (if (le b a) 0 -1)) (else 1)))))
+  (define compare-by>=
+    (case-lambda
+      ((ge) (lambda (a b) (cond ((ge a b) (if (ge b a) 0 1)) (else -1))))
+      ((ge a b) (cond ((ge a b) (if (ge b a) 0 1)) (else -1)))))
+  (define compare-by=
+    (case-lambda
+      ((eq) (lambda (a b) (if (eq a b) 0 -1)))
+      ((eq a b) (if (eq a b) 0 -1))))
+
+  ;; min-compare / max-compare -- return the minimal / maximal element per the
+  ;; compare (compare is the required first argument; ties keep the first).
+  (define min-compare
+    (case-lambda
+      ((compare x1) x1)
+      ((compare x1 x2) (if (<=? compare x1 x2) x1 x2))
+      ((compare x1 x2 . rest)
+       (let loop ((m (if (<=? compare x1 x2) x1 x2)) (xs rest))
+         (if (null? xs) m
+             (loop (if (<=? compare m (car xs)) m (car xs)) (cdr xs)))))))
+  (define max-compare
+    (case-lambda
+      ((compare x1) x1)
+      ((compare x1 x2) (if (>=? compare x1 x2) x1 x2))
+      ((compare x1 x2 . rest)
+       (let loop ((m (if (>=? compare x1 x2) x1 x2)) (xs rest))
+         (if (null? xs) m
+             (loop (if (>=? compare m (car xs)) m (car xs)) (cdr xs)))))))
+
+  ;; chain*? -- the n-ary chain predicates: adjacent pairs must all satisfy the
+  ;; underlying binary predicate (compare is the required first argument).
+  (define (make-chain pred?)
+    (case-lambda
+      ((compare) #t)
+      ((compare x1) #t)
+      ((compare x1 x2 . rest)
+       (let loop ((a x1) (b x2) (more rest))
+         (and (pred? compare a b)
+              (or (null? more) (loop b (car more) (cdr more))))))))
+  (define chain=?  (make-chain =?))
+  (define chain<?  (make-chain <?))
+  (define chain>?  (make-chain >?))
+  (define chain<=? (make-chain <=?))
+  (define chain>=? (make-chain >=?))
+)

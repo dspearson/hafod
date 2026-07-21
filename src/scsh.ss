@@ -1,7 +1,7 @@
 #!chezscheme
 ;;; (scsh) -- Compatibility alias for (hafod)
 ;;; Allows (import (scsh)) as an alternative to (import (hafod)).
-;;; AUTO-GENERATED -- 1045 symbols re-exported from (hafod).
+;;; AUTO-GENERATED -- 1046 symbols re-exported from (hafod).
 
 (library (scsh)
   (export  %exec %exit %fork %fork/pipe %fork/pipe+ %homedir %read-delimited! %set-cloexec & 
@@ -91,7 +91,7 @@
     posix-dup posix-dup2 posix-errno posix-error? posix-exec posix-execve posix-fchmod 
     posix-fchown posix-fcntl posix-fnmatch posix-fork posix-fstat posix-fsync posix-ftruncate 
     posix-getcwd posix-getegid posix-getenv posix-geteuid posix-getgid posix-getgrgid 
-    posix-getgrnam posix-getgroups posix-getlogin posix-getpgrp posix-getpid posix-getppid 
+    posix-getgrnam posix-getgroups posix-getlogin posix-getpgid posix-getpgrp posix-getpid posix-getppid
     posix-getpwent-all posix-getpwnam posix-getpwuid posix-gettimeofday posix-getuid posix-gmtime posix-isatty 
     posix-kill posix-link posix-localtime posix-lseek posix-lstat posix-mkdir posix-mkfifo 
     posix-mkstemp posix-mktime posix-open posix-opendir posix-pause posix-pipe posix-read 

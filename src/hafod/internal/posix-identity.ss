@@ -4,7 +4,7 @@
 (library (hafod internal posix-identity)
   (export
     posix-chdir posix-getcwd posix-getenv posix-setenv posix-unsetenv
-    posix-getpid posix-getppid posix-getpgrp posix-setpgid posix-setsid
+    posix-getpid posix-getppid posix-getpgrp posix-getpgid posix-setpgid posix-setsid
     posix-getuid posix-getgid posix-geteuid posix-getegid
     posix-setuid posix-setgid posix-seteuid posix-setegid)
 
@@ -49,6 +49,7 @@
   (define c-getpid (foreign-procedure "getpid" () int))
   (define c-getppid (foreign-procedure "getppid" () int))
   (define c-getpgrp (foreign-procedure "getpgrp" () int))
+  (define c-getpgid (foreign-procedure "getpgid" (int) int))
   (define c-setpgid (foreign-procedure "setpgid" (int int) int))
   (define c-setsid (foreign-procedure "setsid" () int))
   (define c-getuid (foreign-procedure "getuid" () unsigned-32))
@@ -63,6 +64,8 @@
   (define (posix-getpid) (c-getpid))
   (define (posix-getppid) (c-getppid))
   (define (posix-getpgrp) (c-getpgrp))
+  ;; getpgid can fail (ESRCH/EPERM), unlike the bare getpgrp, so raise via posix-call.
+  (define (posix-getpgid pid) (posix-call getpgid (c-getpgid pid)))
   (define (posix-setpgid pid pgid) (posix-call setpgid (c-setpgid pid pgid)))
   (define (posix-setsid) (posix-call setsid (c-setsid)))
   (define (posix-getuid) (c-getuid))

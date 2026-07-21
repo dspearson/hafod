@@ -145,7 +145,7 @@
     posix-unlink posix-rename posix-mkdir posix-rmdir posix-access
     posix-lseek posix-umask posix-chdir posix-getcwd
     posix-getenv posix-setenv posix-unsetenv
-    posix-getpid posix-getppid posix-getpgrp posix-setpgid posix-setsid
+    posix-getpid posix-getppid posix-getpgrp posix-getpgid posix-setpgid posix-setsid
     posix-getuid posix-getgid posix-geteuid posix-getegid
     posix-setuid posix-setgid posix-seteuid posix-setegid
     posix-getpwnam posix-getpwuid posix-getpwent-all posix-getgrnam posix-getgrgid
