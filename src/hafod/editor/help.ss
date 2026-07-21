@@ -8,7 +8,20 @@
           ;; render loop with its key read injected.
           tutorial-lesson-count tutorial-next-index
           key->tutorial-command line->tutorial-command
-          run-tutorial/reader)
+          run-tutorial/reader
+          ;; The practice seam the editor fills at load (see below), the channel
+          ;; that carries a live session to the reader, and the practice
+          ;; lesson's classifier, verdict and pane -- all white-box, exposed so
+          ;; the practice suite can drive each of them directly.
+          tutorial-practice-open tutorial-practice-feed! tutorial-practice-view
+          tutorial-practice-session
+          key->practice-command tutorial-handle-key
+          practice-verdict render-practice-pane
+          ;; Per-lesson practice roster (white-box): what a lesson seeds its
+          ;; buffer with, where the caret starts, what counts as done, and the
+          ;; keystrokes it teaches.
+          tutorial-lesson-seed tutorial-lesson-cursor
+          tutorial-lesson-target tutorial-lesson-solution)
   (import (chezscheme)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
           ;; The single owner of raw-mode entry/exit, and the decoder every
@@ -17,7 +30,8 @@
           ;; that library imports this one.
           (only (hafod tty) with-raw-mode*)
           (only (hafod editor input-decode)
-                read-key-event key-event-type key-event-value))
+                read-key-event key-event-type key-event-value key-event-mods
+                current-key-recording))
 
   ;; ======================================================================
   ;; ANSI formatting helpers
@@ -171,82 +185,167 @@
   ;; Interactive tutorial
   ;; ======================================================================
 
+  ;; Each entry: (title instruction example hint cursor target solution)
+  ;;
+  ;; The first four are what a lesson has always carried.  The last three are
+  ;; what makes a lesson practisable:
+  ;;
+  ;;   CURSOR    the index the caret starts at in the live buffer, or #f for a
+  ;;             lesson that stays prose.  The field doubles as the roster's one
+  ;;             statement of which lessons host a buffer at all -- a lesson
+  ;;             names where the caret goes, or it does not host one.
+  ;;   TARGET    the buffer text that counts as done, or #f for a lesson with
+  ;;             nothing checkable to reach.
+  ;;   SOLUTION  the keystrokes the instruction teaches.
+  ;;
+  ;; SOLUTION is read by nothing at run time except the on-screen hint.  Success
+  ;; is decided by the final buffer text alone, so reaching a target by any other
+  ;; route counts just as much -- deleting a word with four x presses passes the
+  ;; lesson that teaches dw.  The two travel together: a lesson has both or
+  ;; neither, since keystrokes worth showing are the ones that reach a target and
+  ;; a target is only reachable if some keystrokes reach it.
+  ;;
+  ;; Every target here was derived by running its solution through the editor's
+  ;; own dispatch rather than worked out on paper, and the practice suite pins
+  ;; each of them by doing it again -- so a target that drifts from what the keys
+  ;; actually do fails a test rather than reaching a reader.
+  ;;
+  ;; The roster falls into three kinds:
+  ;;
+  ;;   PROSE          no cursor, so no buffer.  Either the lesson has no example
+  ;;                  text to put in one, or it cannot host one at all.
+  ;;   OPEN PRACTICE  a buffer to move around in, and no target.  These lessons
+  ;;                  teach MOTION, and a motion leaves the text exactly as it
+  ;;                  found it -- so a verdict read off the final text could only
+  ;;                  ever be a lie.  The caret moving under the framed text is
+  ;;                  the feedback, and for a motion it is the right feedback.
+  ;;   CHECKED        a buffer, a target, and the keystrokes that reach it.
   (define tutorial-lessons
     '#(
-       ;; Each entry: (title instruction example-command expected-hint)
+       ;; Prose: no example text to seed a buffer with.
        ("Welcome"
         "Welcome to the hafod interactive tutorial!\nThis will walk you through the key features of the editor.\nPress Enter to continue to the next lesson."
         ""
-        "")
+        ""
+        #f #f "")
+       ;; Open practice: h and l move the caret and leave the text alone.
        ("Basic movement"
         "In normal mode (press Esc first), use h/l to move left/right.\nTry: type some text, press Esc, then h and l to move around.\nPress Enter when done."
         "(define hello 42)"
-        "Use h to move left, l to move right")
+        "Use h to move left, l to move right"
+        8 #f "")
        ("Word movement"
         "w moves to the start of the next word, b moves back.\ne moves to the end of the current word.\nTry w, b, and e in normal mode."
         "(string-append foo bar)"
-        "w=next word, b=prev word, e=end of word")
+        "w=next word, b=prev word, e=end of word"
+        1 #f "")
+       ;; Prose: no example text to seed a buffer with.
        ("Insert mode"
         "Press i to insert at cursor, a to insert after cursor.\nI inserts at line start, A at line end.\no opens a new line below, O above."
         ""
-        "i/a/I/A/o/O enter insert mode at different positions")
+        "i/a/I/A/o/O enter insert mode at different positions"
+        #f #f "")
        ("Deleting"
-        "In normal mode:\n  x  = delete char under cursor\n  dw = delete to next word\n  dd = delete whole line\n  D  = delete to end of line\nTry each one."
+        "In normal mode:\n  x  = delete char under cursor\n  dw = delete to next word\n  dd = delete whole line\n  D  = delete to end of line\n\nThe caret is on remove-me. Press dw to take the word out."
         "(remove-me keep-this)"
-        "x, dw, dd, D are the delete commands")
+        "x, dw, dd, D are the delete commands"
+        1 "(keep-this)" "dw")
        ("Changing"
-        "c is like d but enters insert mode after:\n  cw = change word\n  cc = change whole line\n  C  = change to end of line"
+        "c is like d but enters insert mode after:\n  cw = change word\n  cc = change whole line\n  C  = change to end of line\n\nThe caret is on old-value. Press cw, type new, then Esc."
         "(old-value)"
-        "c{motion} deletes and enters insert mode")
+        "c{motion} deletes and enters insert mode"
+        1 "(new)" "cwnew")
        ("Yank and paste"
-        "y yanks (copies) text:\n  yw = yank word\n  yy = yank line\np pastes after cursor, P pastes before."
+        "y yanks (copies) text:\n  yw = yank word\n  yy = yank line\np pastes after cursor, P pastes before.\n\nPress yy to yank the line, $ to reach its end, then p."
         "(copy this text)"
-        "yy to yank line, p to paste")
+        "yy to yank line, p to paste"
+        1 "(copy this text)(copy this text)" "yy$p")
+       ;; Open practice: f, t, ; and , are all motions.
        ("Find char"
         "f{char} jumps to the next occurrence of {char}.\nF{char} jumps backward. t/T stop one char before.\n; repeats the last find, , reverses it."
         "(define (factorial n) (* n (factorial (- n 1))))"
-        "Try fa to jump to next 'a', then ; to repeat")
+        "Try fa to jump to next 'a', then ; to repeat"
+        1 #f "")
        ("Search"
         "/{pattern} searches forward, ?{pattern} backward.\nn goes to next match, N to previous.\n* searches for the word under cursor."
         "(let ([x 10] [y 20]) (+ x y))"
-        "Type /let then Enter, then n for next match")
+        "Type /let then Enter, then n for next match"
+        1 #f "")
        ("Text objects"
-        "In operator-pending mode (after d/c/y):\n  iw = inner word    aw = around word\n  i( = inside parens  a( = around parens\n  i\" = inside quotes   a\" = around quotes"
+        "In operator-pending mode (after d/c/y):\n  iw = inner word    aw = around word\n  i( = inside parens  a( = around parens\n  i\" = inside quotes   a\" = around quotes\n\nThe caret is inside the inner list. Press di( to empty it."
         "(delete (inner \"content\") here)"
-        "Try di( to delete inside parens, or ci\" to change quoted text")
+        "Try di( to delete inside parens, or ci\" to change quoted text"
+        9 "(delete () here)" "di(")
        ("Visual mode"
-        "v enters visual mode (character selection).\nV enters visual line mode.\nMove with any motion, then d/c/y to operate."
+        "v enters visual mode (character selection).\nV enters visual line mode.\nMove with any motion, then d/c/y to operate.\n\nPress v, then e to reach the end of some, then d."
         "(select some of this text)"
-        "v then motion then d to delete selection")
+        "v then motion then d to delete selection"
+        7 "(select of this text)" "ved")
        ("Paredit"
-        "Structural editing preserves balanced parens:\n  Alt+Ctrl+F/B = navigate sexps\n  Alt+( = wrap in parens\n  Alt+S = splice (remove outer parens)\n  > = slurp (pull next sexp in)\n  < = barf (push last sexp out)"
+        "Structural editing preserves balanced parens:\n  Alt+Ctrl+F/B = navigate sexps\n  Alt+( = wrap in parens\n  Alt+S = splice (remove outer parens)\n  > = slurp (pull next sexp in)\n  < = barf (push last sexp out)\n\nThe caret is inside (bar baz). Press > to slurp quux in."
         "(foo (bar baz) quux)"
-        "Try Alt+( to wrap, > to slurp in normal mode")
+        "Try Alt+( to wrap, > to slurp in normal mode"
+        6 "(foo (bar baz quux))" ">")
+       ;; 3w and 4l are motions, so the checked solution is the editing form.
        ("Count prefix"
-        "Most commands accept a count prefix:\n  3w = move 3 words forward\n  5x = delete 5 chars\n  2dd = delete 2 lines (whole buffer, here)\n  4l = move 4 chars right"
-        "(one two three four five six)"
-        "Try 3w to jump 3 words forward")
+        "Most commands accept a count prefix:\n  5x = delete 5 chars\n  3w = move 3 words forward\n  2dd = delete 2 lines (whole buffer, here)\n  4l = move 4 chars right\n\nThe caret is on five. Press 5x to take five characters out."
+        "(five four three two one)"
+        "Try 5x to delete five characters"
+        1 "(four three two one)" "5x")
+       ;; Prose: no example text to seed a buffer with.
        ("Emacs shortcuts"
         "These work in both modes:\n  Ctrl+A/E = start/end of line\n  Ctrl+K = kill to end\n  Ctrl+W = backward kill word\n  Ctrl+Y = yank\n  Ctrl+R = fuzzy history search"
         ""
-        "These are readline/emacs compatible bindings")
+        "These are readline/emacs compatible bindings"
+        #f #f "")
+       ;; Prose: this lesson is about what Enter does in the buffer, and Enter is
+       ;; the reader's way out of every lesson -- so it is the one lesson that
+       ;; cannot host the buffer it describes.  (Its example spans two lines
+       ;; besides, and the pane frames one.)
        ("Smart return"
         "In insert mode, Enter is context-aware:\n  - If the expression is unbalanced, it inserts a newline\n    with auto-indentation\n  - If balanced and cursor is at the end, it evaluates\n  - In normal mode, Enter always evaluates"
         "(define (multi-line\n  expression)"
-        "Type an open paren, press Enter to get auto-indented newline")
+        "Type an open paren, press Enter to get auto-indented newline"
+        #f #f "")
+       ;; Open practice: setting a mark and jumping to it are both motions.
        ("Marks and registers"
         "m{a-z} sets a named mark at the cursor.\n'{a-z} jumps to that mark.\n\"{a-z} selects a register for the next d/c/y/p."
         "(mark this position and return later)"
-        "ma to set mark 'a', then 'a to jump back")
+        "ma to set mark 'a', then 'a to jump back"
+        1 #f "")
+       ;; Prose: no example text to seed a buffer with.
        ("Congratulations!"
         "You've completed the hafod tutorial!\n\nType (show-keybindings) at any time for a quick reference.\n\nHappy hacking!"
         ""
-        "")
+        ""
+        #f #f "")
        ))
 
   ;; How many lessons there are, published so a caller need not re-derive it
   ;; from the vector or hard-code today's count.
   (define tutorial-lesson-count (vector-length tutorial-lessons))
+
+  ;; Where lesson I's caret starts, or #f when the lesson stays prose.
+  (define (tutorial-lesson-cursor i)
+    (list-ref (vector-ref tutorial-lessons i) 4))
+
+  ;; The text lesson I seeds its practice buffer with: its example, but only for
+  ;; a lesson that names a starting caret and carries an example to put under it.
+  ;; A prose lesson answers #f and goes on printing its example as a plain line,
+  ;; exactly as it always has.
+  (define (tutorial-lesson-seed i)
+    (and (tutorial-lesson-cursor i)
+         (let ([example (list-ref (vector-ref tutorial-lessons i) 2)])
+           (and (> (string-length example) 0) example))))
+
+  ;; The buffer text that counts as done, or #f for a lesson with no verdict.
+  (define (tutorial-lesson-target i)
+    (list-ref (vector-ref tutorial-lessons i) 5))
+
+  ;; The keystrokes lesson I teaches, shown as a hint and never consulted to
+  ;; decide anything.
+  (define (tutorial-lesson-solution i)
+    (list-ref (vector-ref tutorial-lessons i) 6))
 
   ;; The one command table, shared by the keypress and the whole-line readers so
   ;; the two paths cannot drift apart: q leaves, p goes back, and everything else
@@ -263,10 +362,17 @@
   ;; running negative; going forward stops at N, one past the last lesson, which
   ;; is how the loop terminates; quitting answers #f, which it reads as "stop
   ;; now, and say so".
+  ;;
+  ;; A keystroke spent on the practice buffer, and a re-seed of it, both leave
+  ;; the reader where they are. The lesson loop settles those two itself and they
+  ;; never reach here, but they are named ahead of the default arm rather than
+  ;; left to fall into it: the default advances, and silently advancing a lesson
+  ;; on every key typed into its buffer is precisely the wrong answer.
   (define (tutorial-next-index i n cmd)
     (case cmd
       [(prev) (max 0 (- i 1))]
       [(quit) #f]
+      [(stay reset) i]
       [else (min n (+ i 1))]))
 
   ;; Classify one decoded key event.
@@ -302,88 +408,396 @@
               [(char-whitespace? (string-ref line i)) (lp (+ i 1))]
               [else (char->tutorial-command (string-ref line i))])))))
 
+  ;; ======================================================================
+  ;; The practice seam
+  ;; ======================================================================
+
+  ;; A practice lesson wants a REAL editor buffer -- the actual editor-state, the
+  ;; actual keymaps, the actual per-key dispatch -- because the whole point is
+  ;; that the reader practises on the editor they are about to use, not on a
+  ;; second one written to look like it. But the edge runs the other way: (hafod
+  ;; editor editor) imports this library, so importing it back would close a
+  ;; cycle, and a tutorial-local re-implementation would teach a buffer nobody
+  ;; else has.
+  ;;
+  ;; The same problem is already solved once, on this same edge. vi.ss is
+  ;; imported BY editor.ss and needs its snapshot, undo and insert procedures; it
+  ;; declares #f-defaulted parameters and editor.ss fills them at load. This
+  ;; library sits in exactly that position, so it declares the same shape: three
+  ;; procedures the editor hands over, and no import at all in the other
+  ;; direction.
+  ;;
+  ;;   tutorial-practice-open   (seed cursor)         -> session
+  ;;   tutorial-practice-feed!  (session evt in-port) -> void, one real keystroke
+  ;;   tutorial-practice-view   (session)             -> text, cursor, mode label
+  ;;
+  ;; A session is opaque here. It is an editor-state on the far side of the seam
+  ;; and a token on this one, and nothing below inspects it.
+  ;;
+  ;; With the seam unset -- this library imported on its own, without the editor
+  ;; ever being loaded -- every lesson renders as prose and the tutorial behaves
+  ;; exactly as it did before there were practice buffers. That is the honest
+  ;; degradation for a build that has no editor to practise on.
+  (define tutorial-practice-open  (make-parameter #f))
+  (define tutorial-practice-feed! (make-parameter #f))
+  (define tutorial-practice-view  (make-parameter #f))
+
+  ;; The lesson's live session, for the extent of one render-and-read.
+  ;;
+  ;; A parameter rather than a fourth argument to the reader, because the
+  ;; reader's zero-argument contract is what lets the entire loop be driven over
+  ;; string ports -- which is how the navigation suite asserts anything at all --
+  ;; and that contract is already relied upon. Reaching the session through a
+  ;; dynamic extent instead is the same channel the codebase already uses for the
+  ;; fuzzy precompute cache and the keystroke-recording tee.
+  (define tutorial-practice-session (make-parameter #f))
+
+  ;; Does EV match this type, character and modifier set exactly?
+  (define (key-event-is? ev type value mods)
+    (and (eq? (key-event-type ev) type)
+         (eqv? (key-event-value ev) value)
+         (eqv? (key-event-mods ev) mods)))
+
+  ;; Classify one decoded key event during a lesson that has a live buffer.
+  ;;
+  ;; Deliberately a SEPARATE table from key->tutorial-command, which is unchanged:
+  ;; in a practice lesson only Enter and a named set of control keys are
+  ;; reserved, and every printable key belongs to the buffer. That rule is what
+  ;; makes r, q and p mean in the pane what vi means by them, rather than
+  ;; quietly ending the lesson.
+  ;;
+  ;; Every arm matches the WHOLE key event, modifiers included. Ctrl-T with no
+  ;; modifier is the file picker, absorbed below; C-M-t is the s-expression
+  ;; transpose the Paredit lesson teaches -- the same type and character with
+  ;; MOD_ALT set. A table testing only the type and the character would swallow
+  ;; both, and the Paredit lesson would stop working without anything failing.
+  (define (key->practice-command ev)
+    (cond
+      ;; Ctrl-D earns its own arm here for the reason it does above: raw mode has
+      ;; cleared ICANON, so it arrives as an ordinary control byte and never as
+      ;; an end-of-file object. Genuine end of input means the same thing.
+      [(eof-object? ev) 'quit]
+      [(key-event-is? ev 'ctrl #\d 0) 'quit]
+      ;; Enter is the promise that a reader is never trapped in a lesson, so it
+      ;; is classified here, ahead of the buffer -- which in insert mode would
+      ;; otherwise swallow it as a newline.
+      [(key-event-is? ev 'special 'return 0) 'next]
+      [(key-event-is? ev 'ctrl #\p 0) 'prev]
+      ;; Ctrl-R re-seeds the lesson. It is the editor's redo, and its fuzzy
+      ;; history search, so both are out of reach while practising: no lesson
+      ;; teaches either, and being able to start the exercise again is worth more
+      ;; here than a redo stack that begins empty anyway.
+      [(key-event-is? ev 'ctrl #\r 0) 'reset]
+      ;; Absorbed rather than fed to the buffer, in two groups.
+      ;;
+      ;; Up, Down, Ctrl-P and Ctrl-N reach the editor's history commands, which
+      ;; on the first line of a buffer navigate HISTORY -- and the history handle
+      ;; is opened lazily on first touch, so one of these in a one-line practice
+      ;; buffer would open the reader's real history database and swap the seeded
+      ;; lesson text for their last REPL line. (Ctrl-P is claimed above, as the
+      ;; way back a lesson.)
+      ;;
+      ;; Ctrl-T and Alt-C -- and Ctrl-R, claimed above -- reach the three fuzzy
+      ;; pickers. Those paint a full-screen finder over the tutorial's own screen
+      ;; from inside its raw-mode extent, and no guard would catch it: the finder
+      ;; does not raise, it runs. One of them shells out to git ls-files on the
+      ;; way, and one replaces the practice buffer outright with a cd line.
+      ;;
+      ;; Tab opens a completion menu sized to a terminal this pane does not own.
+      ;; Ctrl-L is deliberately NOT absorbed: it is self-healing, since the next
+      ;; keystroke clears and repaints the whole screen anyway.
+      [(or (key-event-is? ev 'special 'up 0)
+           (key-event-is? ev 'special 'down 0)
+           (key-event-is? ev 'ctrl #\n 0)
+           (key-event-is? ev 'special 'tab 0)
+           (key-event-is? ev 'ctrl #\t 0)
+           (key-event-is? ev 'meta #\c 0))
+       'ignore]
+      [else 'edit]))
+
+  ;; The whole of the checking rule, and it reads nothing but the text: no target
+  ;; means there is nothing to be right about, matching text means done, and
+  ;; anything else means not yet. The route taken is never looked at, so four x
+  ;; presses pass the lesson that teaches dw.
+  (define (practice-verdict text target)
+    (cond
+      [(not target) 'open]
+      [(string=? text target) 'met]
+      [else 'unmet]))
+
+  ;; ======================================================================
+  ;; The practice pane
+  ;; ======================================================================
+
+  ;; Glyphs by code point rather than as literal characters, matching finder.ss:
+  ;; the source stays ASCII, so nothing between here and a terminal can mangle
+  ;; them.
+  (define box-top-left     #\x250c)
+  (define box-top-right    #\x2510)
+  (define box-bottom-left  #\x2514)
+  (define box-bottom-right #\x2518)
+  (define box-horizontal   #\x2500)
+  (define box-vertical     #\x2502)
+  (define verdict-tick     #\x2713)
+
+  ;; Columns between the two vertical rules. Fixed rather than sized to the
+  ;; terminal, which is what lets the pane be drawn without a size query at all:
+  ;; 52 holds the longest example in the roster, and the whole frame is 56
+  ;; columns with its indent -- comfortably inside the 80 a terminal is assumed
+  ;; to have.
+  (define practice-pane-width 52)
+
+  ;; The top or bottom rule of the frame.
+  (define (practice-pane-rule left right)
+    (string-append "  " (dim (string-append (string left)
+                                            (make-string practice-pane-width box-horizontal)
+                                            (string right)))))
+
+  ;; One framed row: the vertical rules with CONTENT padded out between them.
+  (define (practice-pane-row content)
+    (string-append "  " (dim (string box-vertical))
+                   (pad-right content practice-pane-width)
+                   (dim (string box-vertical))))
+
+  ;; Clip S to the frame's width, so a verdict line can never outgrow the box
+  ;; above it however long a future lesson's target becomes.
+  (define (clip-to-pane s)
+    (if (> (string-length s) practice-pane-width)
+        (substring s 0 practice-pane-width)
+        s))
+
+  ;; What the buffer's current text amounts to, said in one line.
+  ;;
+  ;; A nudge only ever describes. The reader can already see what the buffer
+  ;; holds -- it is framed directly above -- so naming the target in full puts
+  ;; both ends of the gap on the screen at once. Nothing is withheld to make the
+  ;; lesson harder, and nothing here blocks: whatever this line says, Enter
+  ;; carries on to the next lesson.
+  (define (practice-verdict-line text target)
+    (case (practice-verdict text target)
+      [(met)
+       (green (string-append "  " (string verdict-tick)
+                             " Nice -- buffer is now " (clip-to-pane target)))]
+      [(unmet)
+       (dim (string-append "  Aiming for: " (clip-to-pane target)))]
+      [else
+       (dim "  Practise freely -- press Enter when you are done.")]))
+
+  ;; Draw the live buffer: a framed row of text, a caret row marking the cursor,
+  ;; a status row carrying the editor's own mode label beside the keystrokes this
+  ;; lesson teaches, and the verdict.
+  (define (render-practice-pane text cursor mode-label target solution)
+    (let* ([room (- practice-pane-width 1)]   ;; one leading space inside the frame
+           [shown (if (> (string-length text) room) (substring text 0 room) text)]
+           [before (substring text 0 (min (max cursor 0) (string-length text)))]
+           [caret-col (min room (display-width before))])
+      (display (practice-pane-rule box-top-left box-top-right))
+      (newline)
+      (display (practice-pane-row (string-append " " shown)))
+      (newline)
+      (display (practice-pane-row (string-append (make-string (+ caret-col 1) #\space)
+                                                 (yellow "^"))))
+      (newline)
+      (display (practice-pane-rule box-bottom-left box-bottom-right))
+      (newline)
+      (display (string-append "    " (yellow mode-label)
+                              (if (> (string-length solution) 0)
+                                  (dim (string-append "   try: " solution))
+                                  "")))
+      (newline)
+      (newline)
+      (display (practice-verdict-line text target))
+      (newline)))
+
+  ;; ======================================================================
+  ;; Handling one keystroke
+  ;; ======================================================================
+
+  ;; Everything the keypress reader does once it holds an event, lifted clear of
+  ;; the raw-mode wrapper so a suite can drive it with no terminal in sight. IN
+  ;; is the port the editor's own inline reads pull their remaining bytes from.
+  ;;
+  ;; With no live session this is the prose tutorial's classifier, unchanged.
+  ;;
+  ;; With one, the event is CLASSIFIED FIRST and fed to the buffer only on the
+  ;; edit arm. That ordering is the whole of the never-trapped guarantee: it is
+  ;; why Enter still advances when the buffer is mid-insert, mid-operator or
+  ;; holding a visual selection, any of which would have consumed the key had it
+  ;; reached the dispatch. The ordering is asserted rather than assumed -- a
+  ;; suite feeds Enter to a buffer in each of those states and checks both that
+  ;; the answer is 'next AND that the text did not move.
+  ;;
+  ;; The feed is guarded: an editor command that objects to a buffer with no
+  ;; history and no prompt behind it should cost the reader one inert keystroke,
+  ;; not the tutorial.
+  (define (tutorial-handle-key ev in session)
+    (if (not session)
+        (key->tutorial-command ev)
+        ;; Classified here, before a single arm below can touch the buffer.
+        (let ([cmd (key->practice-command ev)])
+          (case cmd
+            [(edit)
+             (guard (e [#t (void)])
+               (let ([feed (tutorial-practice-feed!)])
+                 (when feed (feed session ev in))))
+             'stay]
+            [(ignore) 'stay]
+            [else cmd]))))
+
+  ;; Open lesson I's practice buffer, or answer #f when it has none to open --
+  ;; because the lesson carries no seed, or because the seam was never filled.
+  (define (open-practice-session i)
+    (let ([seed (tutorial-lesson-seed i)]
+          [open (tutorial-practice-open)])
+      (and seed open (tutorial-practice-feed!) (tutorial-practice-view)
+           (open seed (tutorial-lesson-cursor i)))))
+
+  ;; The two legends. A prose lesson keeps the one it has always shown; a
+  ;; practice lesson advertises the keys its own table actually reserves, since
+  ;; q and p have gone back to being buffer keys there.
+  (define tutorial-legend "  [Enter] next   [q] quit   [p] previous")
+  (define practice-legend
+    "  [Enter] next   [Ctrl-P] previous   [Ctrl-R] reset   [Ctrl-D] quit")
+
   ;; The tutorial's render-and-navigate loop, with the key read injected as
   ;; READ-COMMAND -- a thunk answering one of the three navigation commands.
   ;; Holding the terminal at arm's length this way lets the whole loop be driven
   ;; over string ports, and lets run-tutorial choose between a keypress and a
   ;; line without duplicating a line of the rendering below.
-  (define (run-tutorial/reader read-command)
-    (let ([n tutorial-lesson-count])
-      (let lp ([i 0])
-        (when (< i n)
-          (let* ([lesson (vector-ref tutorial-lessons i)]
-                 [title (car lesson)]
-                 [instr (cadr lesson)]
-                 [example (caddr lesson)]
-                 [hint (cadddr lesson)])
-            (when (ansi-ok? (current-output-port))
-              (display "\x1b;[2J\x1b;[H"))  ;; clear screen (only on a capable terminal)
-            (display (bold (cyan (string-append "  Lesson " (number->string (+ i 1))
-                                                "/" (number->string n)
-                                                ": " title))))
-            (newline) (newline)
-            ;; Display instruction with proper indentation
-            (let ([lines (string-split instr #\newline)])
-              (for-each
-                (lambda (line)
-                  (display "  ")
-                  (display line)
-                  (newline))
-                lines))
-            (newline)
-            (when (> (string-length example) 0)
-              (display (dim "  Example: "))
-              (display (green example))
-              (newline))
-            (when (> (string-length hint) 0)
-              (display (dim (string-append "  Hint: " hint)))
-              (newline))
-            (newline)
-            (display (dim "  [Enter] next   [q] quit   [p] previous"))
-            (newline) (newline)
-            (let ([next-i (tutorial-next-index i n (read-command))])
-              (if next-i
-                  (lp next-i)
-                  (begin
-                    (when (ansi-ok? (current-output-port))
-                      (display "\x1b;[2J\x1b;[H"))
-                    (display "  Tutorial ended.\n\n")))))))))
+  ;;
+  ;; The one-argument form is the original contract exactly, with no practice
+  ;; sessions anywhere in it. The two-argument form opens one per lesson that has
+  ;; a seed, when PRACTICE? says the caller can drive it.
+  (define run-tutorial/reader
+    (case-lambda
+      [(read-command) (run-tutorial/reader read-command #f)]
+      [(read-command practice?)
+       (let ([n tutorial-lesson-count])
+         (let lp ([i 0])
+           (when (< i n)
+             (let* ([lesson (vector-ref tutorial-lessons i)]
+                    [title (car lesson)]
+                    [instr (cadr lesson)]
+                    [example (caddr lesson)]
+                    [hint (cadddr lesson)]
+                    [target (tutorial-lesson-target i)]
+                    [solution (tutorial-lesson-solution i)]
+                    ;; Paint one screen for this lesson. SESSION is its live
+                    ;; buffer, or #f for a lesson that has none -- and in that
+                    ;; case not a byte of this differs from what the tutorial has
+                    ;; always printed.
+                    [paint
+                     (lambda (session)
+                       (when (ansi-ok? (current-output-port))
+                         (display "\x1b;[2J\x1b;[H"))  ;; clear screen (only on a capable terminal)
+                       (display (bold (cyan (string-append "  Lesson " (number->string (+ i 1))
+                                                           "/" (number->string n)
+                                                           ": " title))))
+                       (newline) (newline)
+                       ;; Display instruction with proper indentation
+                       (let ([lines (string-split instr #\newline)])
+                         (for-each
+                           (lambda (line)
+                             (display "  ")
+                             (display line)
+                             (newline))
+                           lines))
+                       (newline)
+                       ;; The example is printed only when there is no pane: with
+                       ;; one, the same text is in the frame below, live.
+                       (when (and (not session) (> (string-length example) 0))
+                         (display (dim "  Example: "))
+                         (display (green example))
+                         (newline))
+                       (when (> (string-length hint) 0)
+                         (display (dim (string-append "  Hint: " hint)))
+                         (newline))
+                       (newline)
+                       (when session
+                         (let-values ([(text cursor mode-label)
+                                       ((tutorial-practice-view) session)])
+                           (render-practice-pane text cursor mode-label target solution))
+                         (newline))
+                       (display (dim (if session practice-legend tutorial-legend)))
+                       (newline) (newline))])
+               ;; One lesson, repainted after every keystroke that went to its
+               ;; buffer, and answering the navigation command that finally ends
+               ;; it -- so 'stay and 'reset are settled here and never reach the
+               ;; step below. Recurring from OUTSIDE the parameterize keeps this a
+               ;; tail call: a lesson can be repainted any number of times without
+               ;; piling up dynamic extents.
+               (let ([cmd (let again ([session (and practice? (open-practice-session i))])
+                            (let ([c (parameterize ([tutorial-practice-session session])
+                                       (paint session)
+                                       (read-command))])
+                              (case c
+                                [(stay) (again session)]
+                                [(reset) (again (open-practice-session i))]
+                                [else c])))])
+                 (let ([next-i (tutorial-next-index i n cmd)])
+                   (if next-i
+                       (lp next-i)
+                       (begin
+                         (when (ansi-ok? (current-output-port))
+                           (display "\x1b;[2J\x1b;[H"))
+                         (display "  Tutorial ended.\n\n")))))))))]))
 
   ;; The tutorial proper, gating on whether standard input is a terminal.
   ;;
   ;; On a terminal the legend is taken literally -- one keystroke, one command,
-  ;; no Enter needed. The raw-mode extent is exactly one key read wide rather
-  ;; than wrapping the loop, so every screen above is still painted in cooked
-  ;; mode, where the output flags translate the newlines the display code emits;
-  ;; not a byte of that rendering had to change, and echo is never live while a
-  ;; screen is being drawn. Two attribute changes per lesson at reading pace cost
-  ;; nothing. with-raw-mode* is the single owner of that transition: it winds the
-  ;; cooked baseline back on a normal return, on a raised condition and across a
-  ;; suspend, and it leaves the signal-generating characters enabled, so Ctrl-C
-  ;; keeps its usual disposition and unwinds through that same restore.
+  ;; no Enter needed. The raw-mode extent covers the read AND the handling of
+  ;; what was read, but no more: the editor's own inline reads (a text object's
+  ;; or a surround's follow-up character, a search pattern up to its Enter) pull
+  ;; their remaining bytes from this same port and must find it raw, so handing
+  ;; the key on outside the extent would leave them reading a cooked, line-
+  ;; buffered terminal. Rendering stays outside, in cooked mode, where the output
+  ;; flags still translate the newlines the display code emits; a multi-row pane
+  ;; painted inside a raw extent would staircase down the screen. So: raw mode
+  ;; wraps input, cooked mode wraps output. Two attribute changes per keystroke
+  ;; at reading pace cost nothing. with-raw-mode* is the single owner of that
+  ;; transition: it winds the cooked baseline back on a normal return, on a
+  ;; raised condition and across a suspend, and it leaves the signal-generating
+  ;; characters enabled, so Ctrl-C keeps its usual disposition and unwinds
+  ;; through that same restore.
+  ;;
+  ;; Practice buffers are opened on THIS arm only, and deliberately not on the
+  ;; strength of the seam being filled: the editor is loaded in every real run,
+  ;; so the seam is always filled, and gating on it would open a live pane on the
+  ;; piped path too -- where the whole-line classifier has no edit arm and so
+  ;; could never drive the buffer, leaving a nudge no input could ever clear.
   ;;
   ;; Off a terminal -- piped, redirected, or a dumb TERM -- there are no
   ;; attributes to set and with-raw-mode* would raise, so a scripted run reads
-  ;; whole lines instead: one line, one lesson, a blank line meaning next.
-  ;; Degrading beats erroring.
+  ;; whole lines instead: one line, one lesson, a blank line meaning next, and
+  ;; the slideshow it has always been. Degrading beats erroring.
   ;;
   ;; The gate asks about descriptor 0 by number rather than about a port object,
   ;; because the question is whether this process's standard input is a terminal
   ;; and the shared console port aliases elsewhere.
+  ;;
+  ;; The keystroke-recording tee is held off for the whole run. The decoder copies
+  ;; every character it consumes into it, and a key pressed at a tutorial lesson
+  ;; has no business landing in a half-open recording of a change made at the
+  ;; REPL.
   (define (run-tutorial)
-    (run-tutorial/reader
+    (parameterize ([current-key-recording #f])
       (if (ansi-ok? 0)
-          (lambda ()
-            ;; Push the prompt out before blocking: the read below waits on a
-            ;; person, so anything still buffered would leave them staring at a
-            ;; half-drawn lesson.
-            (flush-output-port (current-output-port))
-            (key->tutorial-command
+          (run-tutorial/reader
+            (lambda ()
+              ;; Push the prompt out before blocking: the read below waits on a
+              ;; person, so anything still buffered would leave them staring at a
+              ;; half-drawn lesson.
+              (flush-output-port (current-output-port))
               (with-raw-mode* 0
-                (lambda () (read-key-event (console-input-port))))))
-          (lambda ()
-            (flush-output-port (current-output-port))
-            (line->tutorial-command (get-line (console-input-port)))))))
+                (lambda ()
+                  (let ([in (console-input-port)])
+                    (tutorial-handle-key (read-key-event in) in
+                                         (tutorial-practice-session))))))
+            #t)
+          (run-tutorial/reader
+            (lambda ()
+              (flush-output-port (current-output-port))
+              (line->tutorial-command (get-line (console-input-port))))))))
 
   ;; Helper: split string on delimiter char
   (define (string-split str delim)

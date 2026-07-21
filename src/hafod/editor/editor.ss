@@ -89,7 +89,9 @@
           (hafod editor render)  ;; render-line, render-line/suggestion, etc.
           (hafod editor history)
           (hafod editor vi)
-          (hafod editor help)
+          ;; The tutorial, with its entry point renamed: this library owns the
+          ;; run-tutorial a caller sees (see below for why) and wraps this one.
+          (rename (hafod editor help) (run-tutorial tutorial-entry-point))
           (hafod fuzzy)
           (hafod tty)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
@@ -3517,6 +3519,24 @@
         )                                ; close let* ([last-nl])
       ]))                                ; close case-lambda + define
 
+  ;; ======================================================================
+  ;; Tutorial entry point
+  ;; ======================================================================
+
+  ;; The tutorial's own procedure, wrapped so that this library owns the binding
+  ;; a caller touches.
+  ;;
+  ;; Chez instantiates a library the first time a variable whose HOME it is gets
+  ;; referenced.  Re-exporting (hafod editor help)'s run-tutorial verbatim would
+  ;; leave help.ss the home of the name reached through the umbrella, so a caller
+  ;; who imported (hafod) and did nothing but run the tutorial would never
+  ;; instantiate this library -- and the practice hooks wired at the foot of it
+  ;; would never be set.  The tutorial would quietly fall back to prose, which is
+  ;; its honest behaviour for a build with no editor, but a plain lie for one that
+  ;; has this library sitting right here.  Owning the entry point makes reaching
+  ;; for it enough.
+  (define (run-tutorial) (tutorial-entry-point))
+
   ;; Bind Tab to completion (must follow cmd-complete definition, placed at end
   ;; of library so all definitions precede expressions as R6RS requires).
   (keymap-bind! editor-insert-keymap
@@ -3542,5 +3562,69 @@
   ;; Dot-repeat: the . arm delegates to this driver, which re-feeds the recorded
   ;; keystrokes of the last change through a synthetic port, count times.
   (vi-replay!-proc dot-replay!)
+
+  ;; Wire up the tutorial's practice-buffer hooks (same reason, same shape as the
+  ;; vi.ss block above).  This library imports (hafod editor help), so the
+  ;; tutorial cannot import back to reach an editor-state, the keymaps or the
+  ;; dispatch; it declares the three procedures a live practice buffer needs and
+  ;; this hands them over at load.
+
+  ;; Open a practice buffer holding SEED with the caret at CURSOR.
+  (tutorial-practice-open
+    (lambda (seed cursor)
+      (let ([gb (make-gap-buffer)])
+        (gap-buffer-insert-string! gb seed)
+        ;; The mover takes a DELTA and an insert leaves the caret at the end, so
+        ;; parking it at an absolute index means stepping back from there.
+        (gap-buffer-move-cursor! gb (- cursor (string-length seed)))
+        ;; Start from a clean vi state, so a lesson never inherits a pending
+        ;; operator, a visual selection or a mark from the lesson before it.
+        (vi-reset-session!)
+        ;; The kill ring is deliberately the shared one: the vi dispatch hands
+        ;; editor-kill-ring to vi-process-key whatever the state record carries,
+        ;; while the emacs kill commands read the record's own -- so a private
+        ;; ring would make yy and Ctrl-Y disagree inside the tutorial.  The cost
+        ;; is that a yank-and-paste lesson leaves an entry in the reader's kill
+        ;; ring.
+        ;;
+        ;; The console output port, because the vi search prompt echoes the
+        ;; pattern as it is typed and a reader working the search lesson has to
+        ;; see what they are typing.  Normal mode, because the lessons teach
+        ;; normal mode and i is how a reader leaves it.
+        (make-editor-state gb editor-kill-ring "" (console-output-port)
+                           0 #f #f 'normal #f))))
+
+  ;; Feed ONE real keystroke to a practice buffer, through the same dispatch the
+  ;; main loop uses.  IN is the port an inline read (a text object's follow-up
+  ;; character, a surround, a search pattern) pulls its remaining bytes from.
+  ;;
+  ;; The history hooks are held at no-ops for the extent of the keystroke.  On the
+  ;; first line of a buffer those navigate HISTORY, and the history handle is
+  ;; opened lazily on first touch -- so j or k in a one-line practice buffer would
+  ;; otherwise open the reader's real history database and replace the seeded
+  ;; lesson text with their last REPL line.  Doing nothing is also the correct vi
+  ;; answer here, there being no line above.
+  ;;
+  ;; dot-repeat-boundary! is deliberately NOT called: the tutorial has no business
+  ;; committing a practice edit into the REPL's dot-repeat state.
+  (tutorial-practice-feed!
+    (lambda (session evt in)
+      (parameterize ([vi-history-prev!-proc (lambda (es) (void))]
+                     [vi-history-next!-proc (lambda (es) (void))])
+        (dot-dispatch-event! session (editor-state-gb session) in
+                             (editor-state-out-port session) evt))))
+
+  ;; What a practice buffer currently reads, where its caret sits, and what to
+  ;; label the mode.  The label is the editor's own indicator string, dashes and
+  ;; all, rather than a second vocabulary for the same states -- so a pending
+  ;; operator or an open visual says in the pane exactly what it says at a prompt.
+  (tutorial-practice-view
+    (lambda (session)
+      (let ([gb (editor-state-gb session)])
+        (values (gap-buffer->string gb)
+                (gap-buffer-cursor-pos gb)
+                (if (eq? (editor-state-mode session) 'insert)
+                    "INSERT"
+                    (or (vi-mode-indicator) "NORMAL"))))))
 
 ) ; end library
