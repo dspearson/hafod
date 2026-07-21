@@ -437,7 +437,7 @@ Internal libraries (not intended for direct use):
 | `(hafod editor render)` | Line editor rendering with syntax colouring and feature toggles |
 | `(hafod editor history)` | SQLite-backed persistent history with mode tracking |
 | `(hafod editor vi)` | Full vim emulation (motions, operators, text objects, visual, search) |
-| `(hafod editor help)` | Keybinding reference and interactive tutorial |
+| `(hafod editor help)` | Keybinding reference and the live-practice tutorial trainer |
 | `(hafod editor editor)` | Gap-buffer line editor with paredit |
 
 ## Examples
@@ -655,8 +655,9 @@ hafod adds several capabilities beyond the original scsh:
   comments, numbers, booleans), smart enter, bracketed paste,
   substring-filtered Up/Down, undo/redo (C-/ and M-/), fish-style
   auto-suggestions, command timing display, terminal-wrap-aware
-  multiline rendering, `(show-keybindings)` reference,
-  `(run-tutorial)` interactive walkthrough
+  multiline rendering, `(show-keybindings)` reference, and the
+  `(run-tutorial)` live practice trainer -- lessons drive a real
+  editor buffer through the actual key dispatch, checked by result
 - **Full vim emulation** -- vi normal mode with motions (w/W/b/B/e/E,
   f/F/t/T, 0/^/$, gg/G, %), operators (d/c/y with text objects),
   visual mode (v/V), search (/pattern, n/N, */#), registers
