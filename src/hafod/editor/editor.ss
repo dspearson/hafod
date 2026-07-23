@@ -26,7 +26,17 @@
           show-mode-indicator?
           ;; Completion helpers (exported for testing)
           word-at-cursor symbol-completions filename-completions
-          longest-common-prefix path-at-cursor
+          longest-common-prefix path-at-cursor completion-normalise
+          ;; The completion sink and a read-only menu-active predicate
+          ;; (white-box: the picker suite drives the divert point directly and
+          ;; reads back whether the inline menu was populated; deliberately NOT
+          ;; re-exported by the (hafod) umbrella)
+          apply-completions! completion-active?
+          ;; The live menu's column/row predictor (white-box: exported so the
+          ;; multi-column suite can read back the grid geometry the drawn menu
+          ;; uses from the state the sink set, at a width it controls.  Leaf --
+          ;; deliberately NOT re-exported by the (hafod) umbrella)
+          completion-grid-dimensions
           ;; Completion menu anchor decision (exported for testing)
           menu-anchor-place
           ;; Auto-suggestion ghost seam (exported for testing)
@@ -66,7 +76,20 @@
           ;; Finder injection (set by umbrella to break circular dependency)
           editor-finder-proc
           ;; Feature toggles
-          fuzzy-finder? tab-completions?
+          fuzzy-finder? tab-completions? completion-picker?
+          ;; Suggest-only command-head correction: command-correction? is the sole
+          ;; user-facing knob (re-exported by the (hafod) umbrella).  The ranking
+          ;; search, the in-memory universe, the pending-hint accessor/reset, the
+          ;; explicit accept command and the Tab command itself are white-box
+          ;; exports the correction suite drives directly, and stay leaf.
+          command-correction?
+          nearest-commands command-universe current-correction clear-correction!
+          cmd-accept-correction cmd-complete
+          ;; Transient prompt: transient-prompt? is the user-facing knob
+          ;; (re-exported by the (hafod) umbrella); when on, a spent prompt
+          ;; collapses to its exit-coloured last-line glyph and the info segments
+          ;; drop from scrollback.
+          transient-prompt?
           ;; History recall search mode: 'substring (default) matches the typed
           ;; needle anywhere in a past line, 'prefix keeps the strict
           ;; head-anchored behaviour.  A user-facing parameter published through
@@ -87,6 +110,13 @@
           (hafod editor input-decode)
           (hafod editor keymap)
           (hafod editor render)  ;; render-line, render-line/suggestion, etc.
+          ;; Pure grouped-completion contract: the sink normalises the flat-vs-
+          ;; grouped shape and infers a candidate's group through these, and the
+          ;; row-plan gives the grid geometry so the menu's height predictor and
+          ;; arrow navigation share the renderer's header-inclusive row layout.
+          (only (hafod editor completion-groups)
+                grouped-completions? infer-group group-order
+                build-row-plan row-plan-rows row-plan-locate row-plan-cell)
           (hafod editor history)
           (hafod editor vi)
           ;; The tutorial, with its entry point renamed: this library owns the
@@ -95,11 +125,25 @@
           (hafod fuzzy)
           (hafod tty)
           (only (hafod terminal-caps) ansi-ok? colour-ok?)
-          (only (hafod shell classifier) path-cache scheme-prefix-chars)
+          (only (hafod shell classifier) path-cache scheme-prefix-chars
+                command-not-found-suppress? alias-names)
+          ;; builtin-names is the command name list; (hafod shell builtins) does not
+          ;; transitively import this library (its visit-db reaches only the leaf
+          ;; (hafod editor sqlite3)), so the import is cycle-free.
+          (only (hafod shell builtins) builtin-names)
+          ;; The transposition-aware bounded distance that ranks a correction; a
+          ;; pure leaf over (chezscheme).  Reused deliberately instead of the
+          ;; subsequence fuzzy engine, which cannot see an adjacent transposition.
+          (only (hafod edit-distance) damerau-levenshtein)
           (only (hafod shell completers)
-                lookup-completer user-completer command-flag-completer)
+                lookup-completer user-completer command-flag-completer
+                dir-only-command? strip-terminal-escapes)
           (only (hafod collect) run/strings*)
-          (only (hafod process) exec-path))
+          (only (hafod process) exec-path)
+          ;; posix-access + X_OK let filename-completions decide a candidate's
+          ;; execute bit in the same survivor pass that already stats it, so the
+          ;; renderer never stats.
+          (only (hafod posix) posix-access X_OK))
 
   ;; ======================================================================
   ;; Terminal size query
@@ -2354,6 +2398,39 @@
   (define tab-completions?
     (make-parameter #t (lambda (v) (and v #t))))
 
+  ;; Toggle for the optional full-screen completion picker.  Default #f: a Tab
+  ;; press with several candidates draws the inline grid exactly as shipped.  When
+  ;; #t (and a finder is installed via editor-finder-proc) a multi-candidate Tab
+  ;; is routed through the fuzzy finder instead -- an fzf-tab-style picker whose
+  ;; selection splices byte-for-byte like the inline path.  A non-boolean is
+  ;; coerced to a strict boolean by the same converter as fuzzy-finder? / tab-
+  ;; completions?, so a stray init value cannot half-enable it.
+  (define completion-picker?
+    (make-parameter #f (lambda (v) (and v #t))))
+
+  ;; Toggle for suggest-only command-head correction.  Default #f: a Tab on an
+  ;; unresolvable command head behaves exactly as the shipped tree.  When #t, that
+  ;; same Tab -- and only when the head resolves to nothing and normal completion
+  ;; finds no candidates -- surfaces the nearest known command as a "did you mean
+  ;; X?" hint.  It is SUGGEST-ONLY: the hint never rewrites the buffer and never
+  ;; runs anything; pressing Enter runs the typed command exactly as typed, and a
+  ;; deliberate second Tab is the only gesture that accepts it.  Coerced to a
+  ;; strict boolean by the same converter as the other editor toggles, so a stray
+  ;; init value cannot half-enable it.
+  (define command-correction?
+    (make-parameter #f (lambda (v) (and v #t))))
+
+  ;; Toggle for the optional transient prompt.  Default #f: a spent prompt stays
+  ;; fully rendered in scrollback exactly as shipped.  When #t, the moment a
+  ;; command is accepted the just-spent prompt collapses to its last line alone --
+  ;; the exit-coloured input glyph the segment model already carries -- with the
+  ;; multi-line info segments (path, git, versions) dropped, keeping scrollback
+  ;; lean while the typed command stays verbatim.  Coerced to a strict boolean by
+  ;; the same converter as the other editor toggles, so a stray init value cannot
+  ;; half-enable it.
+  (define transient-prompt?
+    (make-parameter #f (lambda (v) (and v #t))))
+
   ;; ======================================================================
   ;; Command-head abbreviations (fish-style expand-as-typed)
   ;; ======================================================================
@@ -2409,11 +2486,35 @@
   (define completion-grid-rows 0)
   (define completion-scroll-offset 0)
 
+  ;; Parallel to completion-candidates: each candidate's colour type (a symbol
+  ;; dir/link/exec/file, or #f when the source supplied none) and the menu's
+  ;; group-plan -- a list of (label . count) in draw order where a #f label draws no
+  ;; header.  Both are produced once by completion-normalise at the sink; the grid
+  ;; renderer consumes them.
+  (define completion-types '())
+  (define completion-groups '())
+
+  ;; Descriptions force the single (aligned) column only when they VARY per
+  ;; item.  A uniform value -- the (#f ...) sentinel, cd's "", or a category
+  ;; tag like "branch"/"host" repeated for every candidate -- carries no
+  ;; per-item information and must still tile into the multi-column grid.
+  ;; Genuinely per-item descriptions (kill's process lines, git-subcommand
+  ;; summaries) vary, so they stay single-column.
+  (define (descriptions-vary? descs)
+    (and (pair? descs)
+         (let ([d0 (car descs)])
+           (let loop ([ds (cdr descs)])
+             (cond [(null? ds) #f]
+                   [(not (equal? (car ds) d0)) #t]
+                   [else (loop (cdr ds))])))))
+
   (define (dismiss-completion!)
     (unless (null? completion-candidates)
       (set! completion-candidates '())
       (set! completion-positions '())
       (set! completion-descriptions '())
+      (set! completion-types '())
+      (set! completion-groups '())
       (set! completion-index -1)
       (set! completion-start 0)
       (set! completion-grid-cols 1)
@@ -2427,6 +2528,22 @@
       ;; inside the unless: the plain-submit ghost-clear in finish! runs with no
       ;; active menu, where this branch is skipped anyway.
       (set! suggestion-text "")))
+
+  ;; True when a completion menu is currently showing (candidates populated).
+  ;; A read-only predicate over the menu state -- the picker suite reads it to
+  ;; prove the inline grid ran (toggle off) versus was bypassed (picker on).
+  (define (completion-active?)
+    (not (null? completion-candidates)))
+
+  ;; A pending suggest-only correction: #f, or the nearest known command name to
+  ;; surface as a "did you mean X?" hint.  Set only by a Tab on an unresolvable
+  ;; head with the toggle on; read by the renderer (to draw the hint) and by the
+  ;; accept command.  It NEVER causes the buffer to change on its own -- only the
+  ;; explicit accept gesture rewrites the head -- and it is cleared the instant any
+  ;; non-Tab key arrives (a second Tab is the accept), on submit, and after accept.
+  (define correction-suggestion #f)
+  (define (current-correction) correction-suggestion)
+  (define (clear-correction!) (set! correction-suggestion #f))
 
   ;; ======================================================================
   ;; Completion helpers
@@ -2469,7 +2586,12 @@
       (fuzzy-filter/positions prefix names)))
 
   ;; filename-completions: list directory entries fuzzy-matching path basename.
-  ;; Handles ~ expansion to HOME. Returns list of (fullpath . positions) pairs.
+  ;; Handles ~ expansion to HOME.  Returns a list of (name positions type)
+  ;; triples: type is the candidate's real file kind -- one of dir link exec file
+  ;; -- decided in the survivor pass that already stats each entry, so the sink can
+  ;; group and colour by type and the renderer never has to stat.  A directory is
+  ;; still shown, and inserted, with a trailing "/" exactly as before; only the
+  ;; extra type symbol is new.
   (define (filename-completions prefix)
     (let* ([expanded (if (and (> (string-length prefix) 0)
                               (char=? (string-ref prefix 0) #\~))
@@ -2507,13 +2629,34 @@
                         [positions (cdr pair)]
                         [full-path (string-append dir "/" entry)]
                         [is-dir? (guard (e [#t #f]) (file-directory? full-path))]
+                        ;; The candidate's real type, decided in THIS pass (which
+                        ;; already stats for is-dir?) rather than re-derived from the
+                        ;; name downstream.  A directory is tested first, so a symlink
+                        ;; pointing at one is a directory here too -- matching the
+                        ;; trailing slash it is shown with; file-directory? follows the
+                        ;; link, so a broken or file-pointing symlink falls through to
+                        ;; the symlink test.  An execute bit is only meaningful on a
+                        ;; regular file, so that guard excludes a directory's own
+                        ;; (always-set) execute bit.  Every predicate is wrapped
+                        ;; against a racing unlink so a vanished entry degrades to a
+                        ;; plain file rather than raising.
+                        [file-kind
+                         (cond
+                           [is-dir? 'dir]
+                           [(guard (e [#t #f]) (file-symbolic-link? full-path)) 'link]
+                           [(guard (e [#t #f])
+                              (and (file-regular? full-path)
+                                   (zero? (posix-access full-path X_OK))))
+                            'exec]
+                           [else 'file])]
                         [display-entry (if is-dir?
                                            (string-append entry "/")
                                            entry)])
                    (if dir-prefix
-                       (cons (string-append dir-prefix display-entry)
-                             (map (lambda (p) (+ p dir-prefix-len)) positions))
-                       (cons display-entry positions))))
+                       (list (string-append dir-prefix display-entry)
+                             (map (lambda (p) (+ p dir-prefix-len)) positions)
+                             file-kind)
+                       (list display-entry positions file-kind))))
                sorted)))))
 
   ;; shell-completions: fuzzy-match PATH executable names.
@@ -2524,6 +2667,123 @@
         (let* ([ht (path-cache)]
                [keys (vector->list (hashtable-keys ht))])
           (fuzzy-filter/positions prefix keys))))
+
+  ;; ======================================================================
+  ;; === Suggest-only command-head correction ===
+  ;; ======================================================================
+
+  ;; The command universe a correction ranks against: every command name already
+  ;; resident in memory -- the PATH-cache keys, the shell builtins, and the user's
+  ;; aliases -- unioned and de-duplicated.  No directory is scanned and nothing is
+  ;; spawned: each source is a hashtable/list already built for classification, so
+  ;; assembling the universe is pure in-memory work, run once on a Tab (never on
+  ;; the render hot path).  The PATH keys are read straight off the live cache with
+  ;; the same (hashtable-keys (path-cache)) idiom shell-completions uses.
+  (define (command-universe)
+    (let ([seen (make-hashtable string-hash string=?)])
+      (let loop ([names (append (vector->list (hashtable-keys (path-cache)))
+                                (builtin-names)
+                                (alias-names))]
+                 [out '()])
+        (cond
+          [(null? names) (reverse out)]
+          [(hashtable-ref seen (car names) #f) (loop (cdr names) out)]
+          [else
+           (hashtable-set! seen (car names) #t)
+           (loop (cdr names) (cons (car names) out))]))))
+
+  ;; The distance ceiling for a "did you mean" match.  Two is the conventional
+  ;; ceiling for short command tokens: it catches the common single-slip typos
+  ;; (one transposition/insertion/deletion/substitution, or two on a longer word)
+  ;; without drifting onto unrelated names.
+  (define correction-threshold 2)
+
+  ;; The nearest known commands to HEAD, nearest-first, at most three, all within
+  ;; correction-threshold edits.  A free length pre-filter drops any candidate
+  ;; whose length differs from HEAD by more than the threshold -- it cannot be
+  ;; within that many edits -- so the bounded damerau-levenshtein runs only on
+  ;; plausible survivors.  The distance metric is the transposition-aware one, NOT
+  ;; the subsequence fuzzy engine (which misses an adjacent transposition such as
+  ;; "gti" -> "git").  Chez's list-sort is a stable merge sort, so ties settle in
+  ;; universe order.  Reads the in-memory universe only -- no filesystem, no spawn.
+  (define (nearest-commands head)
+    (let ([hlen (string-length head)])
+      (if (fx= hlen 0)
+          '()
+          (let* ([scored
+                  (fold-left
+                    (lambda (acc cand)
+                      (if (let ([clen (string-length cand)])
+                            (fx> (fx- (fxmax clen hlen) (fxmin clen hlen))
+                                 correction-threshold))
+                          acc                                    ; length pre-filter
+                          (let ([d (damerau-levenshtein head cand correction-threshold)])
+                            (if (fx<= d correction-threshold)
+                                (cons (cons cand d) acc)
+                                acc))))
+                    '()
+                    (command-universe))]
+                 ;; `scored` is in reverse universe order (built by consing); undo
+                 ;; that first so the stable sort settles ties in universe order.
+                 [ordered (list-sort (lambda (a b) (fx< (cdr a) (cdr b)))
+                                     (reverse scored))])
+            (let take ([xs ordered] [n 0] [acc '()])
+              (if (or (null? xs) (fx= n 3))
+                  (reverse acc)
+                  (take (cdr xs) (fx1+ n) (cons (caar xs) acc))))))))
+
+  ;; The span of the command head (the first whitespace-delimited token) in TEXT,
+  ;; as (values start end), or (values #f #f) for a blank line.  The accept command
+  ;; rewrites exactly this span, so a correction only ever touches the head.
+  (define (head-token-span text)
+    (let ([len (string-length text)])
+      (let skip ([i 0])
+        (cond
+          [(fx>= i len) (values #f #f)]
+          [(char-whitespace? (string-ref text i)) (skip (fx1+ i))]
+          [else
+           (let collect ([j i])
+             (cond
+               [(fx>= j len) (values i j)]
+               [(char-whitespace? (string-ref text j)) (values i j)]
+               [else (collect (fx1+ j))]))]))))
+
+  ;; Consider a suggest-only correction for the command head in TEXT.  Fires only
+  ;; when the toggle is on, the head is non-empty AND does not resolve (reusing the
+  ;; classifier's own head-resolves predicate, never a second notion of "known"),
+  ;; and a nearest command exists within the threshold.  On a hit it records the
+  ;; top suggestion and returns #t; it NEVER mutates the buffer.  The caller invokes
+  ;; it only when normal completion produced nothing, so a genuine completion is
+  ;; never pre-empted.
+  (define (maybe-suggest-correction! text)
+    (and (command-correction?)
+         (let ([head (first-token text)])
+           (and (fx> (string-length head) 0)
+                (not (command-not-found-suppress? head))
+                (let ([names (nearest-commands head)])
+                  (and (pair? names)
+                       (begin (set! correction-suggestion (car names)) #t)))))))
+
+  ;; Accept a pending suggest-only correction: replace the command head with the
+  ;; suggested name, folded into one undo step.  This is the ONLY path that mutates
+  ;; the buffer from a correction -- it is reached from the deliberate second Tab on
+  ;; a shown hint, never on Enter and never automatically.  A no-op when nothing is
+  ;; pending.  The suggestion is cleared first so the rewrite (which routes through
+  ;; editor-replace-text!) cannot re-trigger anything.
+  (define (cmd-accept-correction es)
+    (let ([sugg correction-suggestion])
+      (when sugg
+        (set! correction-suggestion #f)
+        (let* ([gb (editor-state-gb es)]
+               [text (gap-buffer->string gb)])
+          (let-values ([(hs he) (head-token-span text)])
+            (when hs
+              (editor-snapshot! gb)
+              (editor-replace-text! gb
+                (string-append (substring text 0 hs)
+                               sugg
+                               (substring text he (string-length text)))
+                (fx+ hs (string-length sugg)))))))))
 
   ;; Detect whether the buffer looks like shell mode (no Scheme prefix characters).
   (define (shell-mode-buffer? text)
@@ -2697,9 +2957,159 @@
           [(char=? (string-ref str i) ch) #t]
           [else (loop (+ i 1))]))))
 
+  ;; ======================================================================
+  ;; === Grouped completion ===
+  ;; ======================================================================
+
+  ;; Tell one completer entry's shape apart.  A typed filename entry is the proper
+  ;; 3-list (name positions type) whose third element is a type symbol; a flat pair
+  ;; (name . positions) carries only integer match positions, so its caddr -- when
+  ;; there is one -- is an integer, never a symbol.  The pair? guards stop a one- or
+  ;; zero-position pair from raising in the cddr/caddr probe.
+  (define (typed-entry? e)
+    (and (pair? e)
+         (pair? (cdr e))
+         (pair? (cddr e))
+         (symbol? (caddr e))))
+
+  (define (entry-name e) (car e))
+  (define (entry-positions e)
+    (if (typed-entry? e) (cadr e) (cdr e)))
+  (define (entry-type e)                    ; explicit type symbol, or #f for a pair
+    (and (typed-entry? e) (caddr e)))
+
+  ;; A candidate's colour type: the source's explicit type if it gave one, else a
+  ;; trailing slash reads as a directory, else a plain file.  This is what the menu
+  ;; colours by; the GROUP a candidate falls in is inferred separately (infer-group)
+  ;; and can differ -- a command or an option still colours as a plain file.
+  (define (colour-type-of name explicit-type)
+    (cond
+      [explicit-type explicit-type]
+      [(let ([n (string-length name)])
+         (and (fx> n 0) (char=? (string-ref name (fx- n 1)) #\/)))
+       'dir]
+      [else 'file]))
+
+  ;; A length-n list of #f -- the shape the no-description path must keep (see
+  ;; completion-normalise) so the live menu's column count stays byte-identical.
+  (define (list-of-false n)
+    (let loop ([i n] [acc '()])
+      (if (fx<= i 0) acc (loop (fx- i 1) (cons #f acc)))))
+
+  ;; Flatten a grouped completer result in its GIVEN order.  Each label is escape-
+  ;; stripped before it can reach the menu and contributes (label . count) to the
+  ;; group-plan; the entries carry no separate descriptions, so descs comes back as
+  ;; a length-total list of #f.
+  (define (normalise-grouped groups)
+    (let loop ([gs groups]
+               [names '()] [positions '()] [types '()]
+               [plan '()] [total 0])
+      (if (null? gs)
+          (values (reverse names)
+                  (reverse positions)
+                  (list-of-false total)
+                  (reverse types)
+                  (reverse plan))
+          (let ([label (strip-terminal-escapes (car (car gs)))]
+                [entries (cdr (car gs))])
+            (let ent ([es entries]
+                      [names names] [positions positions] [types types]
+                      [count 0])
+              (if (null? es)
+                  (loop (cdr gs) names positions types
+                        (cons (cons label count) plan)
+                        (+ total count))
+                  (let ([e (car es)])
+                    (ent (cdr es)
+                         (cons (entry-name e) names)
+                         (cons (entry-positions e) positions)
+                         (cons (colour-type-of (entry-name e) (entry-type e)) types)
+                         (+ count 1)))))))))
+
+  ;; Normalise a flat candidate list: infer each candidate into one of
+  ;; directories/files/commands/options, bucket the candidates in that fixed order
+  ;; (filter is stable, so order within a bucket is the input order), and build the
+  ;; group-plan.  A lone group takes a #f label so the renderer draws no header, and
+  ;; being a stable one-bucket pass it leaves a one-group input in its original order
+  ;; byte-for-byte.  Descriptions ride the parallel descs list and are permuted in
+  ;; lockstep.
+  (define (normalise-flat candidates descs command?)
+    (let* ([n (length candidates)]
+           [descs* (or descs (list-of-false n))]
+           ;; One record per candidate: #(name positions desc colour-type group).
+           [records
+            (map (lambda (e d)
+                   (let* ([name (entry-name e)]
+                          [ctype (colour-type-of name (entry-type e))]
+                          [grp (infer-group name ctype (and (command? name) #t))])
+                     (vector name (entry-positions e) d ctype grp)))
+                 candidates descs*)]
+           ;; Bucket into the fixed group order, dropping the empty groups.
+           [buckets (map (lambda (g)
+                           (filter (lambda (r) (eq? (vector-ref r 4) g)) records))
+                         (group-order))]
+           [nonempty (filter pair? buckets)]
+           [single? (= (length nonempty) 1)]
+           [ordered (apply append nonempty)]
+           [plan (map (lambda (bucket)
+                        (cons (if single?
+                                  #f
+                                  (strip-terminal-escapes
+                                    (symbol->string (vector-ref (car bucket) 4))))
+                              (length bucket)))
+                      nonempty)])
+      (values (map (lambda (r) (vector-ref r 0)) ordered)
+              (map (lambda (r) (vector-ref r 1)) ordered)
+              (map (lambda (r) (vector-ref r 2)) ordered)
+              (map (lambda (r) (vector-ref r 3)) ordered)
+              plan)))
+
+  ;; completion-normalise: the ONE place the flat-vs-grouped completer shape is
+  ;; reconciled, so every menu path stores the same parallel lists + group-plan.
+  ;; CANDIDATES is EITHER a flat list of entries (each a (name . positions) pair or a
+  ;; typed (name positions type) triple) OR a grouped list of (label . entries).
+  ;; DESCS is #f or a list parallel to a FLAT candidate list; COMMAND? answers
+  ;; whether a bare name is a PATH executable.  Returns
+  ;; (values names positions descs types group-plan).  When the DESCS arg is #f the
+  ;; returned descs is a length-n list of #f (NOT '()), mirroring the sink's old
+  ;; behaviour so render-with-menu keeps building triples and has-descs? does not
+  ;; silently flip the live menu's column count.
+  (define (completion-normalise candidates descs command?)
+    (if (grouped-completions? candidates)
+        (normalise-grouped candidates)
+        (normalise-flat candidates descs command?)))
+
+  ;; === Optional full-screen completion picker ===
+  ;; Route a multi-candidate Tab through the injected finder instead of the inline
+  ;; grid.  NAMES are the BARE normalised candidate strings (never a group-annotated
+  ;; label): the finder fuzzy-matches on and returns one of them verbatim, so the
+  ;; returned string is spliced [replace-start,pos) byte-for-byte -- the identical
+  ;; arithmetic to the inline longest-common-prefix and cycle insertions, so a
+  ;; completed name is the same bytes whichever UI chose it.  An annotated label
+  ;; would splice its decoration into the buffer and corrupt the finder's own query,
+  ;; so the names are passed flat.  A cancel (finder returns a non-string) leaves the
+  ;; buffer untouched and sets no menu state.  A terminal escape inside a candidate
+  ;; name is passed through unstripped: these are the user's own filesystem/PATH
+  ;; completions -- the same trust level as the Ctrl-T file picker, which already
+  ;; feeds unstripped names to this finder -- and stripping here would break the
+  ;; byte-exact insertion contract.
+  (define (complete-via-picker! gb text pos replace-start names)
+    (let ([selection ((editor-finder-proc) names "> ")])
+      (if (string? selection)
+          (let* ([len (string-length text)]
+                 [new-text (string-append
+                             (substring text 0 replace-start)
+                             selection
+                             (substring text pos len))]
+                 [new-pos (+ replace-start (string-length selection))])
+            (editor-replace-text! gb new-text new-pos))
+          (dismiss-completion!))))
+
   ;; Helper: apply completions to editor state.
   ;; replace-start is cursor position where the prefix starts.
-  ;; candidates is a list of (name . positions) pairs.
+  ;; candidates is a flat list of (name . positions) pairs or (name positions type)
+  ;; triples, or a grouped list of (label . entries); completion-normalise reconciles
+  ;; the shape at the sink.
   ;; Optional descs is a parallel list of description strings or #f.
   (define apply-completions!
     (case-lambda
@@ -2715,31 +3125,48 @@
        ;; sanitised while what is INSERTED (the single match, the longest common
        ;; prefix, and the completion-candidates that cycle-insert reads back) stays
        ;; exact.
-       (let ([names (map car candidates)])
-         (cond
-           [(null? (cdr candidates))
-            ;; Single match: insert directly
-            (let* ([match (car names)]
-                   [new-text (string-append
-                               (substring text 0 replace-start)
-                               match
-                               (substring text pos (string-length text)))]
-                   [new-pos (+ replace-start (string-length match))])
-              (editor-replace-text! gb new-text new-pos))]
-           [else
-            ;; Multiple matches: insert longest common prefix, populate menu
-            (let* ([lcp (longest-common-prefix names)]
-                   [new-text (string-append
-                               (substring text 0 replace-start)
-                               lcp
-                               (substring text pos (string-length text)))]
-                   [new-pos (+ replace-start (string-length lcp))])
-              (set! completion-candidates names)
-              (set! completion-positions (map cdr candidates))
-              (set! completion-descriptions (or descs (map (lambda (_) #f) candidates)))
-              (set! completion-index -1)
-              (set! completion-start replace-start)
-              (editor-replace-text! gb new-text new-pos))]))]))
+       (cond
+         [(null? (cdr candidates))
+          ;; Single match: insert directly.  The name is the entry's car whether the
+          ;; source handed back a (name . positions) pair or a (name positions type)
+          ;; triple, so no normalisation is needed for a lone insertion.
+          (let* ([match (car (car candidates))]
+                 [new-text (string-append
+                             (substring text 0 replace-start)
+                             match
+                             (substring text pos (string-length text)))]
+                 [new-pos (+ replace-start (string-length match))])
+            (editor-replace-text! gb new-text new-pos))]
+         [else
+          ;; Multiple matches: normalise the flat-or-grouped shape ONCE here -- this
+          ;; is the single menu-state sink -- then insert the longest common prefix
+          ;; and populate the menu from the normalised parallel lists + group-plan.
+          ;; The LCP is order-independent, so grouping the names does not change it.
+          (let-values ([(names positions ndescs types group-plan)
+                        (completion-normalise
+                          candidates descs
+                          (lambda (nm) (and (hashtable-ref (path-cache) nm #f) #t)))])
+            ;; Optional divert: with the picker toggle on and a finder installed,
+            ;; route 2+ candidates through the full-screen finder on the BARE names
+            ;; instead of the inline grid.  Toggle off, no finder, or a lone name
+            ;; falls straight through to the inline path below -- byte-identical to
+            ;; the shipped default.
+            (if (and (completion-picker?) (editor-finder-proc) (> (length names) 1))
+                (complete-via-picker! gb text pos replace-start names)
+                (let* ([lcp (longest-common-prefix names)]
+                       [new-text (string-append
+                                   (substring text 0 replace-start)
+                                   lcp
+                                   (substring text pos (string-length text)))]
+                       [new-pos (+ replace-start (string-length lcp))])
+                  (set! completion-candidates names)
+                  (set! completion-positions positions)
+                  (set! completion-descriptions ndescs)
+                  (set! completion-types types)
+                  (set! completion-groups group-plan)
+                  (set! completion-index -1)
+                  (set! completion-start replace-start)
+                  (editor-replace-text! gb new-text new-pos))))])]))
 
   ;; cmd-complete: Tab completion command.
   (define (cmd-complete es)
@@ -2761,6 +3188,12 @@
                 [new-pos (+ completion-start (string-length candidate))])
            (set! completion-index new-idx)
            (editor-replace-text! gb new-text new-pos))]
+
+        ;; A suggest-only correction is showing (only reachable with the toggle on
+        ;; and no completion menu): a deliberate second Tab is the explicit accept
+        ;; gesture -- it replaces the head, and is the ONLY thing that does.
+        [(current-correction)
+         (cmd-accept-correction es)]
 
         ;; Fresh Tab press: determine context and compute candidates
         [else
@@ -2811,22 +3244,37 @@
                                           [else
                                            (hashtable-set! ht (caar rest) #t)
                                            (lp (cdr rest) (cons (car rest) acc))]))])
-                         (unless (null? deduped)
-                           (apply-completions! gb text pos start deduped)))]
+                         (if (null? deduped)
+                             ;; No completion candidates: fall back to a suggest-only
+                             ;; correction when the head does not resolve and the
+                             ;; toggle is on.  This never mutates the buffer -- it
+                             ;; only records the hint the renderer shows -- so the
+                             ;; shipped no-candidates outcome is unchanged by default.
+                             (maybe-suggest-correction! text)
+                             (apply-completions! gb text pos start deduped)))]
                       ;; Subsequent tokens: check for registered completer
                       [else
                        (let* ([cmd (first-token text)]
                               [completer (lookup-completer cmd)])
                          (if completer
-                             ;; Registered completer returns (name positions desc) triples
-                             (let* ([ctx (list (cons 'args (previous-args text start)))]
+                             ;; Registered completer returns (name positions desc) triples.
+                             ;; The invoking command rides along as 'command so a
+                             ;; command-aware completer (the shared cd/pushd/rmdir
+                             ;; one) can tailor its candidates; completers that do
+                             ;; not need it simply ignore the extra key.
+                             (let* ([ctx (list (cons 'args (previous-args text start))
+                                               (cons 'command cmd))]
                                     [results (guard (e [#t '()])
                                                (completer prefix ctx))])
                                (if (null? results)
-                                   ;; Fall back to filenames
-                                   (let ([fc (filename-completions prefix)])
-                                     (unless (null? fc)
-                                       (apply-completions! gb text pos start fc)))
+                                   ;; Fall back to filenames -- but never for a
+                                   ;; directory-only command (cd/pushd/rmdir),
+                                   ;; whose empty result must show nothing rather
+                                   ;; than leak plain files.
+                                   (unless (dir-only-command? cmd)
+                                     (let ([fc (filename-completions prefix)])
+                                       (unless (null? fc)
+                                         (apply-completions! gb text pos start fc))))
                                    ;; Extract pairs and descriptions from triples
                                    (let ([pairs (map (lambda (e) (cons (car e) (cadr e))) results)]
                                          [descs (map caddr results)])
@@ -2878,22 +3326,49 @@
   (define (cmd-complete-accept es)
     (dismiss-completion!))
 
+  ;; Clamp a column onto row R's last real cell -- used when a vertical step lands
+  ;; on a ragged final row whose cell count is short of the column we came from.
+  ;; R is a candidate row, so col 0 always answers and the search only walks left.
+  (define (row-plan-clamp-col plan r col)
+    (let loop ([c col])
+      (cond
+        [(row-plan-cell plan r c)]
+        [(<= c 0) (row-plan-cell plan r 0)]
+        [else (loop (- c 1))])))
+
+  ;; Move the selection one candidate ROW (STEP is +1 down / -1 up), keeping the
+  ;; column, skipping header rows, and clamping onto a ragged final row's last
+  ;; cell.  Returns CUR unchanged when there is no candidate row that way (the top
+  ;; or bottom of the grid), so an arrow never parks the selection on a header.
+  (define (row-plan-vstep plan cur step)
+    (let-values ([(row col) (row-plan-locate plan cur)])
+      (let ([nrows (row-plan-rows plan)])
+        (let loop ([r (+ row step)])
+          (cond
+            [(or (< r 0) (>= r nrows)) cur]
+            [(row-plan-cell plan r 0)              ; a candidate row (col 0 always set)
+             (or (row-plan-cell plan r col)        ; same column if it holds a cell
+                 (row-plan-clamp-col plan r col))] ; else ragged: its last cell
+            [else (loop (+ r step))])))))          ; a header row: keep stepping
+
   ;; cmd-completion-navigate: arrow key navigation in the grid
   (define (cmd-completion-navigate es direction)
     (let* ([gb (editor-state-gb es)]
            [n (length completion-candidates)]
            [cols completion-grid-cols]
            [cur (if (< completion-index 0) 0 completion-index)]
+           ;; up/down walk the shared row-plan so a header row is stepped over and
+           ;; the drawn grid and the navigation agree; left/right stay a flat step
+           ;; along the candidate order, which a header does not perturb.
+           [plan (build-row-plan completion-groups cols)]
            [new-idx
             (case direction
               [(right) (let ([next (+ cur 1)])
                          (if (>= next n) cur next))]
               [(left)  (let ([prev (- cur 1)])
                          (if (< prev 0) cur prev))]
-              [(down)  (let ([next (+ cur cols)])
-                         (if (>= next n) cur next))]
-              [(up)    (let ([prev (- cur cols)])
-                         (if (< prev 0) cur prev))]
+              [(down)  (row-plan-vstep plan cur 1)]
+              [(up)    (row-plan-vstep plan cur -1)]
               [else cur])]
            [candidate (list-ref completion-candidates new-idx)]
            [text (gap-buffer->string gb)]
@@ -2924,8 +3399,7 @@
   ;; escape-free name, for which this width matches the grid's exactly.  Descriptions
   ;; force a single column exactly as the grid does.
   (define (completion-grid-dimensions term-cols)
-    (let* ([n (length completion-candidates)]
-           [has-descs? (not (null? completion-descriptions))]
+    (let* ([has-descs? (descriptions-vary? completion-descriptions)]
            [max-name-w (fold-left
                          (lambda (mx s) (max mx (ansi-display-width s)))
                          0 completion-candidates)]
@@ -2935,9 +3409,10 @@
            [grid-cols (if has-descs?
                           1
                           (max 1 (quotient term-cols cell-width)))]
-           [grid-rows (let ([q (quotient n grid-cols)]
-                            [r (remainder n grid-cols)])
-                        (if (> r 0) (+ q 1) q))])
+           ;; Header-inclusive row count off the SHARED row-plan -- the same
+           ;; build-row-plan the grid renderer draws with -- so this predictor and
+           ;; the drawn menu height cannot disagree once a header splits a row.
+           [grid-rows (row-plan-rows (build-row-plan completion-groups grid-cols))])
       (values grid-cols grid-rows)))
 
   ;; The height render-completion-grid draws for grid-rows candidate rows under a
@@ -3030,9 +3505,18 @@
                  ;; menu inside the terminal.
                  [rows-below (max 0 (- (- term-rows 1) total-lines))]
                  [room (max 1 (- (- term-rows 1) total-lines))]
-                 [entries (if (null? completion-descriptions)
-                              (map cons completion-candidates completion-positions)
-                              (map list completion-candidates completion-positions completion-descriptions))])
+                 ;; Build description-carrying triples ONLY when the descriptions VARY
+                 ;; per item.  A uniform descriptions list carries no per-candidate
+                 ;; information -- the length-n all-#f sentinel from the normalise sink
+                 ;; (filename/command completion), cd's per-directory "", or a repeated
+                 ;; category tag like "branch"/"host" -- so it builds bare (name .
+                 ;; positions) pairs, whose structural has-descs? in
+                 ;; render-completion-grid is #f, the correct multi-column trigger.
+                 ;; Only genuinely per-item descriptions build triples and force the
+                 ;; single (aligned) column.
+                 [entries (if (descriptions-vary? completion-descriptions)
+                              (map list completion-candidates completion-positions completion-descriptions)
+                              (map cons completion-candidates completion-positions))])
             (let-values ([(grid-cols grid-rows) (completion-grid-dimensions term-cols)])
               (let* ([cap 10]
                      [max-visible (min cap room)]
@@ -3052,7 +3536,8 @@
                         (lambda ()
                           (let-values ([(ml gcols grows soff)
                                         (render-completion-grid port entries
-                                          completion-index term-cols max-visible)])
+                                          completion-index term-cols max-visible
+                                          completion-groups completion-types)])
                             (set! completion-grid-cols gcols)
                             (set! completion-grid-rows grows)
                             (set! completion-scroll-offset soff)
@@ -3069,6 +3554,34 @@
           (begin
             (set! completion-menu-lines 0)
             (set! completion-menu-place 'down)
+            ;; With no completion menu up, draw the suggest-only correction hint (if
+            ;; one is pending) as a dim one-row status line below the edit block.
+            ;; Double-gated: command-correction? is off by default and this arm is
+            ;; ansi-only, so it is dead on the shipped default path and under any
+            ;; non-terminal sink (the correction suite drives state, not pixels).
+            ;; The motion is fully relative and self-reversing -- drop below the
+            ;; (possibly wrapped) buffer, print the dim hint, then climb straight
+            ;; back to the edit cursor -- and the next render-line, which clears
+            ;; from the prompt row down, wipes the hint for free.
+            (when (and ansi? (current-correction))
+              (let* ([before (gap-buffer-before-string gb)]
+                     [text (string-append before (gap-buffer-after-string gb))]
+                     [prompt-width (ansi-display-width prompt)]
+                     [total-lines (count-visual-lines prompt-width text term-cols)]
+                     [cursor-row (cursor-visual-row prompt-width before term-cols)]
+                     [lines-after (- total-lines cursor-row)]
+                     [cursor-col (edit-cursor-column prompt-width before cursor-row)])
+                (when (> lines-after 0)
+                  (display "\x1b;[" port) (display lines-after port) (display "B" port))
+                (display "\r\n" port)
+                (when (colour-ok? port) (display "\x1b;[2m" port))
+                (display "did you mean " port)
+                (display (current-correction) port)
+                (display "?  (Tab again to accept)" port)
+                (when (colour-ok? port) (display "\x1b;[0m" port))
+                (display "\x1b;[" port) (display (+ lines-after 1) port) (display "A" port)
+                (display "\x1b;[" port) (display cursor-col port) (display "G" port)
+                (flush-output-port port)))
             lines))))
 
   ;; ======================================================================
@@ -3340,10 +3853,17 @@
                          ;; ghost or overlay needs no repaint.  The ghost is read
                          ;; before it is dropped, and the selection before the mark
                          ;; is cleared below, so both are still seen here.
-                         (let ([ghost? (> (string-length suggestion-text) 0)])
+                         (let ([ghost? (> (string-length suggestion-text) 0)]
+                               ;; A suggest-only correction hint drawn below the
+                               ;; edit line must also be wiped by the one re-render,
+                               ;; or it would linger under the echoed line.  Read it
+                               ;; before dropping it, exactly like the ghost.
+                               [correction? (and (current-correction) #t)])
                            (set! suggestion-text "")
+                           (clear-correction!)
                            (when (and (ansi-ok? out-port)
                                       (or ghost?
+                                          correction?
                                           (editor-mode-indicator es)
                                           (editor-selection-range es)))
                              (let ([term-cols (editor-query-terminal-cols)])
@@ -3359,6 +3879,41 @@
                          ;; cannot grow a span on the next line.
                          (editor-state-mark-set! es #f)
                          (reset-sexp-stack!)
+                         ;; === Transient prompt (minimal repaint of a spent prompt) ===
+                         ;; With transient-prompt? on, collapse the just-spent
+                         ;; two-line prompt to its last line alone before the result
+                         ;; and the next prompt draw below.  The live prompt is
+                         ;; already split into an info-line prefix (prompt-prefix,
+                         ;; the path/git/version segments) and the last line (prompt,
+                         ;; the exit-coloured input glyph the segment model carries);
+                         ;; climb the FULL visual span -- the buffer's typing rows
+                         ;; PLUS the prefix's rows -- clear it, and redraw ONLY that
+                         ;; last line in the cleared region, so the info segments
+                         ;; drop out of scrollback while the typed command survives
+                         ;; verbatim on the collapsed line.  The glyph keeps whatever
+                         ;; exit colour it already carried (the prior command's
+                         ;; status: the just-submitted command has not run yet),
+                         ;; reusing the shipped last line rather than recomputing any
+                         ;; colour or glyph.  Guarded whole -- with the toggle off,
+                         ;; or a single-line prompt with no info prefix, nothing here
+                         ;; runs and the off path stays byte-identical to before.
+                         (when (and (transient-prompt?)
+                                    (ansi-ok? out-port)
+                                    (> (string-length prompt-prefix) 0))
+                           (let* ([term-cols (editor-query-terminal-cols)]
+                                  [prompt-width (ansi-display-width prompt)]
+                                  [cursor-row (cursor-visual-row prompt-width
+                                                                 (gap-buffer-before-string gb)
+                                                                 term-cols)]
+                                  [prefix-rows (count-visual-lines 0 prompt-prefix term-cols)])
+                             ;; render-line's prev-lines is the number of rows to
+                             ;; climb from the cursor up to the line it repaints;
+                             ;; adding the prefix's rows lands that repaint where the
+                             ;; info line was, and its clear-to-end-of-screen wipes
+                             ;; the old info line and last line together, so only the
+                             ;; redrawn last line survives.
+                             (render-line out-port prompt gb
+                                          (+ cursor-row prefix-rows) term-cols)))
                          ;; Move cursor past all content lines before newline, so the
                          ;; result prints below the full expression -- counting the
                          ;; wrapped rows via the shared geometry helpers, not just
@@ -3451,6 +4006,7 @@
                     [(and (eq? (key-event-type evt) 'special)
                           (eq? (key-event-value evt) 'paste-start))
                      (when compl-active? (dismiss-completion!))
+                     (clear-correction!)
                      (handle-bracketed-paste es in-port)
                      (if (editor-state-done? es)
                          (finish! (editor-state-result es))
@@ -3463,6 +4019,14 @@
                                 (not (and (eq? (key-event-type evt) 'special)
                                           (eq? (key-event-value evt) 'tab))))
                        (dismiss-completion!))
+                     ;; A pending correction hint is stale the moment any non-Tab
+                     ;; key arrives (a second Tab is the accept, handled inside
+                     ;; cmd-complete): clear it so a later Tab cannot accept a
+                     ;; suggestion computed against an edited head.
+                     (when (and (current-correction)
+                                (not (and (eq? (key-event-type evt) 'special)
+                                          (eq? (key-event-value evt) 'tab))))
+                       (clear-correction!))
                      ;; Vi state machine gets first crack in normal mode
                      (if (and (eq? mode 'normal)
                               (vi-process-key es evt in-port out-port

@@ -8,8 +8,10 @@
 ;;; PTY-free (test vterm) oracle: inside a clean repo the left line shows the path
 ;;; and a green branch, a non-zero exit renders a red cross badge on the right,
 ;;; outside a repository the left line carries no branch, and a hook rebound after
-;;; the preset still wins.  render->screen forces the terminal-capability verdict
-;;; on, so the segments' gated 256-colour reaches the cell grid.
+;;; the preset still wins.  The last section proves the per-language version group
+;;; is shown by default and removed by the `version` option.  render->screen forces
+;;; the terminal-capability verdict on, so the segments' gated 256-colour reaches
+;;; the cell grid.
 ;;; Copyright (c) 2026 Dominic Pearson.
 
 (library-directories '(("src" . "src") ("." . ".")))
@@ -24,12 +26,16 @@
               prompt-exit-segment prompt-colour-ok? last-status
               prompt-timing-segment prompt-timing-threshold last-duration
               enable-informative-prompt! repl-prompt-hook repl-right-prompt-hook
-              prompt-path-segment)
+              prompt-path-segment display-right-prompt terminal-width
+              prompt-tools make-prompt-tool parse-version/common
+              prompt-versions? version-probe-count)
         (only (hafod environment) getenv setenv)
+        (only (hafod shell classifier) path-cache)
         (only (hafod fileinfo) create-directory)
         (only (hafod syntax) run run/strings)
         (only (hafod process-state) with-cwd* pid)
-        (only (hafod terminal-caps) assume-terminal-caps))
+        (only (hafod editor input-decode) char-display-width)
+        (only (hafod terminal-caps) assume-terminal-caps glyph-tier))
 
 (test-begin "prompt-preset")
 
@@ -243,6 +249,81 @@
     (test-assert "preset: a right hook rebound after the preset wins"
       (string-index joined "RIGHT-OVERRIDE"))))
 
+;; --- two-line layout: the input glyph on its own row, exit-coloured ---
+;;
+;; The preset composes a `line` segment (the input glyph) after the left info
+;; segments, so the left render is "<info>\n<glyph> ": the path (and any branch)
+;; on grid row 0, the input glyph on the row below.  The glyph is the heavy angle
+;; ❯ under the emoji tier and '>' under the ascii tier, so the cell at (row 1,
+;; column 0) is asserted -- a position that holds whichever glyph this terminal
+;; renders.  render->screen (inside render-left) forces the capability verdict on,
+;; so the glyph's gated colour reaches the cell: green (256 index 2) after a
+;; success, red (index 1) after a failure.  A single-line preset would put the
+;; glyph on row 0 and leave no row 1, failing the row-count and the (1,0) checks.
+(enable-informative-prompt!)
+
+;; The glyph this tier renders -- ❯ (U+276F) under emoji, '>' under ascii -- read
+;; from the live verdict so the exact cell can be asserted on either terminal.
+(define input-glyph (if (eq? (glyph-tier) 'ascii) #\> #\x276f))
+
+(parameterize ([last-status 0] [last-duration 0])
+  (let* ([scr  (render-left 80)]
+         [cell (vterm-cell scr 1 0)])
+    (test-assert "preset: a second row exists for the input glyph"
+      (> (vterm-rows scr) 1))
+    (test-assert "preset: the input glyph sits on the row below the info line"
+      (and cell (char=? (cell-glyph cell) input-glyph)))
+    (test-equal "preset: the input glyph is green (256 index 2) after a success"
+      2 (and cell (cell-fg cell)))))
+
+(parameterize ([last-status 1] [last-duration 0])
+  (let ([cell (vterm-cell (render-left 80) 1 0)])
+    (test-equal "preset: the input glyph is red (256 index 1) after a failure"
+      1 (and cell (cell-fg cell)))))
+
+;; --- right-prompt cell alignment (wcwidth): a width-2 glyph lands flush at the
+;; right edge, not one column past it ---
+;;
+;; display-right-prompt reserves (ansi-visible-length str) cells and jumps the
+;; cursor to (terminal-width - visible-len + 1).  For a width-2 CJK glyph that is
+;; two cells, so on an 80-column screen the glyph starts at column 78 (0-based)
+;; and its SECOND cell is the rightmost (79) -- flush at the edge.  A codepoint-
+;; counting visible length would reserve one cell, place the glyph at column 79,
+;; and the vterm's wcwidth-aware wrap would push it onto the next row at column 0.
+;; Both assertions below therefore fail on that pre-fix behaviour -- non-vacuous.
+
+;; The (row . col) of the first cell carrying glyph CH, or #f -- the suite's
+;; find-cell-by-glyph reports the cell; this reports its position so the column
+;; arithmetic can be checked.
+(define (glyph-cell-rc vt ch)
+  (let ([rows (vterm-rows vt)] [cols (vterm-cols vt)])
+    (let row-lp ([r 0])
+      (and (< r rows)
+           (or (let col-lp ([c 0])
+                 (and (< c cols)
+                      (let ([cell (vterm-cell vt r c)])
+                        (if (and cell (char=? (cell-glyph cell) ch))
+                            (cons r c)
+                            (col-lp (+ c 1))))))
+               (row-lp (+ r 1)))))))
+
+(let ([wide #\x4e16])   ; 世 -- a CJK ideograph, two display cells wide
+  (parameterize ([repl-right-prompt-hook
+                   (lambda () (display (string wide) (current-output-port)))]
+                 [terminal-width 80])
+    (let* ([scr (render->screen 80 (lambda (p) (display-right-prompt p)))]
+           [rc  (glyph-cell-rc scr wide)])
+      (test-assert "preset: the wide right-prompt glyph reaches the grid"
+        (and rc #t))
+      ;; Its last occupied cell (start column + width - 1) is column 79, the right
+      ;; edge of an 80-wide screen: flush, not overflowing past it.
+      (test-equal "preset: a width-2 right prompt lands flush at the right edge"
+        (- 80 1) (+ (cdr rc) (char-display-width wide) -1))
+      ;; And it stays on the drawn row -- the pre-fix over-reservation wraps it to
+      ;; the next row (column 0) instead.
+      (test-equal "preset: the wide right prompt does not overflow onto a new row"
+        0 (car rc)))))
+
 ;; --- git-dependent proofs (temp-repo renders; self-skip when git is absent) ---
 
 ;; A unique temp path under $TMPDIR (or /tmp), keyed by pid and a random suffix so
@@ -331,5 +412,156 @@
           (and (find-text-cell scr "hafod-prompt-preset") #t))
         (test-assert "preset: outside a repo no branch text is shown"
           (not (find-text-cell scr "master")))))))
+
+;; === The per-language version group: shown by default, removed by the option ===
+;;
+;; The preset registers the version group as ONE left segment, so a directory
+;; carrying a toolchain marker shows "via <glyph> vX" on the info line out of the
+;; box, and (enable-informative-prompt! 'version #f) leaves it out.  The proofs
+;; drive a FAKE toolchain -- a real `echo` wrapped in a prompt-tool descriptor,
+;; its marker planted in the rendered directory and its PATH gate seeded -- so no
+;; real toolchain is required and the rendered token is a fixed, unmistakable
+;; string.  Both of the fake's glyphs are ASCII width-1, so nothing the group adds
+;; to the info line is wide.
+
+;; echo resolved to an absolute path where present, else the bare (PATH-resolved)
+;; name -- the idiom the sibling version suite uses for its fake tools.
+(define echo-bin
+  (cond [(file-exists? "/bin/echo") "/bin/echo"]
+        [(file-exists? "/usr/bin/echo") "/usr/bin/echo"]
+        [else "echo"]))
+
+;; The fake toolchain: "vfix.marker" in the rendered directory detects it, echo is
+;; its command, and the echoed banner carries the version the shared parser
+;; extracts -- so the rendered segment is "via T v7.7.7" (or "via t v7.7.7" on the
+;; ascii tier), carrying a token that appears nowhere else on the line.
+(define fake-version-tool
+  (make-prompt-tool "vfix" '(("vfix.marker") . ()) echo-bin
+                    (list echo-bin "Fake 7.7.7") parse-version/common "T" "t" #f))
+
+;; The PATH gate reads the classifier path-cache (decoupled from the OS PATH the
+;; spawn itself resolves against), so seed it for echo.
+(hashtable-set! (path-cache) echo-bin #t)
+
+;; Write CONTENT to PATH (every path below is fresh under a unique temp dir).
+(define (write-file path content)
+  (call-with-output-file path (lambda (p) (put-string p content))))
+
+;; The info line (grid row 0) and the whole screen text of a left render: the
+;; version group belongs on the info line, so presence is asserted on row 0 and
+;; absence across every row.
+(define (info-line scr) (vterm-row-text scr 0))
+(define (screen-text scr) (apply string-append (vterm-lines scr)))
+
+;; The new key is RECOGNISED -- neither rejected as an unknown option nor
+;; swallowed by the odd-length check.  A preset without the option raises here, so
+;; the guard yields #f and the row goes red: non-vacuous.
+(test-assert "version: the version key is a recognised option"
+  (guard (e [#t #f]) (enable-informative-prompt! 'version #t) #t))
+
+;; Presence and gating in a plain (non-repo) temp dir carrying the fake marker.  A
+;; preset that never registered the group fails the first row; one that ignored
+;; the option fails the second -- both non-vacuous.  The path text is asserted
+;; alongside so a leg that lost the whole left line cannot pass silently.
+(with-plain-temp-dir
+  (lambda (dir)
+    (write-file (string-append dir "/vfix.marker") "x")
+    (parameterize ([prompt-tools (list fake-version-tool)])
+      (enable-informative-prompt!)
+      (let ([scr (render-left 160)])
+        (test-assert "version: the default preset shows the version group"
+          (string-index (info-line scr) "v7.7.7"))
+        (test-assert "version: the path text is shown beside it"
+          (string-index (info-line scr) "hafod-prompt-preset")))
+      (enable-informative-prompt! 'version #f)
+      (let ([scr (render-left 160)])
+        (test-assert "version: 'version #f omits the version group entirely"
+          (not (string-index (screen-text scr) "v7.7.7")))
+        (test-assert "version: 'version #f leaves the rest of the left line intact"
+          (string-index (info-line scr) "hafod-prompt-preset")))
+      (enable-informative-prompt!)
+      (let ([scr (render-left 160)])
+        (test-assert "version: a following default call restores the group"
+          (string-index (info-line scr) "v7.7.7"))))))
+
+;; === The version group's own opt-out, without giving up the prompt ===
+;;
+;; Changing into a directory runs every detected toolchain's version command
+;; there, and several marker filenames are the very files a version-manager shim
+;; reads to decide which toolchain to run -- so a cd into an untrusted repository
+;; resolves a repository-chosen version through the user's own shim.  Before this
+;; the only environment-level escape was HAFOD_PROMPT=0, which removes the whole
+;; informative prompt; 'version #f needed an explicit preset call in init.ss.
+;;
+;; Both narrow opt-outs are proved end to end through the default preset, with
+;; the path text asserted alongside so a leg that lost the entire left line
+;; cannot pass by accident.  A preset with no group opt-out shows v7.7.7 in every
+;; one of these renders: non-vacuous.  The opt-out is read ahead of the cache, so
+;; the probe count proves it stopped the work rather than hiding its result.
+(with-plain-temp-dir
+  (lambda (dir)
+    (write-file (string-append dir "/vfix.marker") "x")
+    (parameterize ([prompt-tools (list fake-version-tool)])
+      (enable-informative-prompt!)
+      (setenv "HAFOD_PROMPT_VERSIONS" "0")
+      (version-probe-count 0)
+      (let ([scr (render-left 160)])
+        (test-assert "optout: HAFOD_PROMPT_VERSIONS=0 removes the version group"
+          (not (string-index (screen-text scr) "v7.7.7")))
+        (test-assert "optout: and leaves the rest of the informative prompt intact"
+          (string-index (info-line scr) "hafod-prompt-preset"))
+        (test-equal "optout: the disabled group spawns nothing at all"
+          0 (version-probe-count)))
+      (setenv "HAFOD_PROMPT_VERSIONS" #f)
+      (let ([scr (render-left 160)])
+        (test-assert "optout: clearing the variable brings the group back"
+          (string-index (info-line scr) "v7.7.7")))
+      (parameterize ([prompt-versions? #f])
+        (let ([scr (render-left 160)])
+          (test-assert "optout: (prompt-versions? #f) removes the group too"
+            (not (string-index (screen-text scr) "v7.7.7")))
+          (test-assert "optout: and still leaves the path segment"
+            (string-index (info-line scr) "hafod-prompt-preset")))))))
+
+;; Placement: inside a repository that ALSO carries the fake marker, the info line
+;; reads path, then the branch, then the version group -- the group registered
+;; AFTER git.  The column order on row 0 is the proof: a preset that registered
+;; the group before git would put the version token left of "master" and fail the
+;; ordering row.  The input glyph still sits on the row below, so the group joined
+;; the info line rather than displacing the two-line layout.  Self-skips when git
+;; is absent -- the gating proofs above need no repository.
+(when git-present?
+  (with-temp-git-repo
+    (lambda ()
+      (setup-clean)
+      (write-file "vfix.marker" "x"))
+    (lambda ()
+      (parameterize ([prompt-tools (list fake-version-tool)])
+        (enable-informative-prompt!)
+        (let* ([scr     (render-left 160)]
+               [info    (info-line scr)]
+               [ipath   (string-index info "hafod-prompt-preset")]
+               [ibranch (string-index info "master")]
+               [iver    (string-index info "v7.7.7")])
+          (test-assert "version: the info line carries the path, the branch and the version"
+            (and ipath ibranch iver))
+          (test-assert "version: the version group follows the path segment"
+            (and ipath iver (< ipath iver)))
+          (test-assert "version: the version group follows the git segment"
+            (and ibranch iver (< ibranch iver)))
+          (test-assert "version: the input glyph still sits on the row below the info line"
+            (let ([cell (vterm-cell scr 1 0)])
+              (and cell (char=? (cell-glyph cell) input-glyph)))))
+        ;; The two options are independent: 'git #f drops the branch and the
+        ;; version group closes up directly behind the path.
+        (enable-informative-prompt! 'git #f)
+        (let* ([scr  (render-left 160)]
+               [info (info-line scr)])
+          (test-assert "version: 'git #f drops the branch but keeps the version group"
+            (and (not (string-index info "master"))
+                 (string-index info "v7.7.7")))
+          (test-assert "version: with git off the version group still follows the path"
+            (< (string-index info "hafod-prompt-preset")
+               (string-index info "v7.7.7"))))))))
 
 (test-end)

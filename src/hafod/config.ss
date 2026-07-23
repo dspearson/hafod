@@ -58,8 +58,13 @@
   ;; set-prompt!
   ;; ======================================================================
 
+  ;; Setting repl-prompt-string already trips the pristine-prompt guard through its
+  ;; armed converter; marking prompt-customised? here as well is belt-and-braces, so
+  ;; a user's set-prompt! in init.ss always suppresses the REPL-entry default-on and
+  ;; keeps their own prompt, regardless of the converter path.
   (define (set-prompt! str)
-    (repl-prompt-string str))
+    (repl-prompt-string str)
+    (prompt-customised? #t))
 
   ;; ======================================================================
   ;; plain-shell! -- master switch: a bare interactive surface

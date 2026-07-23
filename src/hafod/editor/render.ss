@@ -40,7 +40,15 @@
           (only (hafod shell classifier)
                 classify-input scheme-prefix-chars command-not-found-suppress?)
           (only (hafod shell completers) strip-terminal-escapes)
-          (only (hafod terminal-caps) ansi-ok? colour-ok?))
+          ;; The pure, header-safe grid geometry: build-row-plan lays out header +
+          ;; candidate rows once and row-plan-locate/row-plan-cell map index<->cell,
+          ;; so the grid draws headers without re-deriving the selection maths.
+          (only (hafod editor completion-groups)
+                build-row-plan row-plan-rows row-plan-locate row-plan-cell)
+          (only (hafod terminal-caps) ansi-ok? colour-ok?)
+          ;; The pure $LS_COLORS type/extension -> validated-SGR lookup.  A leaf:
+          ;; render (and editor) import it, never the reverse, so there is no cycle.
+          (only (hafod editor ls-colors) current-ls-colors candidate-sgr))
 
   ;; ======================================================================
   ;; ANSI display width (unchanged)
@@ -1341,7 +1349,6 @@
   ;; Selection colours (muted indigo background, light text)
   (define sel-bg "\x1b;[48;2;56;62;87m")
   (define sel-fg "\x1b;[38;2;195;202;230m")
-  (define dir-colour '(130 170 255))  ; blue for directories
 
   ;; Truncate string to max display width, appending … if truncated.
   (define (truncate-display str max-w)
@@ -1379,143 +1386,217 @@
                   (if (and d (string? d)) (strip-terminal-escapes d) d)))
           (cons name (cdr e)))))
 
-  ;; Fish-style grid completion renderer.
-  ;; entries: list of (candidate positions [description])
-  ;; Returns (values menu-lines grid-cols grid-rows scroll-offset)
-  (define (render-completion-grid port entries selected-index term-cols max-visible)
-    (let* ([entries (map strip-entry-for-display entries)]
-           [n (length entries)]
-           ;; Extract candidate names and check for descriptions
-           [names (map car entries)]
-           [has-descs? (and (pair? entries)
-                           (pair? (cdr (car entries)))
-                           (pair? (cddr (car entries)))
-                           (list? (cadar entries)))]
-           [descs (if has-descs? (map caddr entries) '())]
-           ;; Compute max candidate display width
-           [max-name-w (fold-left
-                         (lambda (mx s) (max mx (string-display-width s)))
-                         0 names)]
-           ;; Compute max description display width
-           [max-desc-w (if has-descs?
-                          (fold-left
-                            (lambda (mx d)
-                              (if (and d (string? d))
-                                  (max mx (string-display-width d))
-                                  mx))
-                            0 descs)
-                          0)]
-           ;; Column width: 2 indent + name + 2 gap (between cols)
-           ;; With descriptions: single column, name + 2 + desc
-           [cell-width (if has-descs?
-                          term-cols  ; single column when descriptions present
-                          (+ 2 (min max-name-w (quotient term-cols 2)) 2))]
-           ;; Grid columns
-           [grid-cols (if has-descs?
-                         1
-                         (max 1 (quotient term-cols cell-width)))]
-           ;; Grid rows
-           [grid-rows (let ([q (quotient n grid-cols)]
-                            [r (remainder n grid-cols)])
-                        (if (> r 0) (+ q 1) q))]
-           ;; Selected row
-           [sel-row (if (>= selected-index 0)
-                        (quotient selected-index grid-cols)
-                        0)]
-           ;; Scroll offset: keep selected row visible
-           [scroll-off (cond
-                         [(< sel-row max-visible)
-                          0]
-                         [else
-                          (- sel-row (- max-visible 1))])]
-           [vis-rows (min grid-rows max-visible)]
-           [name-col-w (min max-name-w (- (if has-descs?
-                                              (- term-cols 6)
-                                              (quotient term-cols 2))
-                                          0))]
-           ;; Colour the selection, directory names, descriptions and pager on a
-           ;; colour-capable target only; the grid layout always renders.
-           [colour? (colour-ok? port)])
+  ;; ======================================================================
+  ;; === Grouped completion grid ===
+  ;; ======================================================================
 
-      ;; Output the grid
-      (display "\n" port)
-      (let row-loop ([row scroll-off] [lines 0])
+  ;; Screen-row -> header label (a string) or #f, laid out to match the row-plan.
+  ;; The k-th header row in draw order shows the k-th string label of the group-
+  ;; plan, so the labels ride the SAME order build-row-plan placed the header rows
+  ;; in -- the renderer never re-derives the geometry, it reads the header rows
+  ;; back off the shared plan (a col-0 cell of #f marks a header) and pairs each
+  ;; with the next label.  A candidate row carries #f.
+  (define (grid-row-labels plan group-plan)
+    (let ([nrows (row-plan-rows plan)]
+          [labels (filter string? (map car group-plan))]
+          [v (make-vector (row-plan-rows plan) #f)])
+      (let loop ([r 0] [ls labels])
         (cond
-          [(or (>= row (+ scroll-off vis-rows)) (>= row grid-rows))
-           ;; Pager indicator if scrolled
-           (let ([total-lines
-                  (if (> grid-rows vis-rows)
+          [(fx>= r nrows) v]
+          ;; A candidate row: col 0 is always filled, so row-plan-cell answers a
+          ;; flat index (truthy, 0 included); a header row answers #f.
+          [(row-plan-cell plan r 0) (loop (fx+ r 1) ls)]
+          [(pair? ls) (vector-set! v r (car ls)) (loop (fx+ r 1) (cdr ls))]
+          [else (loop (fx+ r 1) ls)]))))
+
+  ;; Fish-style grid completion renderer, now group-aware.
+  ;; entries: list of (candidate positions [description]); GROUP-PLAN (6-arg form)
+  ;; is a list of (label . count) in draw order -- a string label draws a dim
+  ;; header row, a #f label draws none.  The 5-arg form keeps every existing caller
+  ;; and test byte-identical: it delegates with a single unlabelled group, so no
+  ;; header is drawn and the layout is exactly as before.  index<->cell and the row
+  ;; count come from the shared row-plan, so this renderer and its geometry mirrors
+  ;; (grid-dimensions, drawn-rows, navigate) cannot drift once a header splits a row.
+  ;; Returns (values menu-lines grid-cols grid-rows scroll-offset); grid-rows counts
+  ;; header rows so the pager and the caller's geometry stay honest.
+  (define render-completion-grid
+    (case-lambda
+      [(port entries selected-index term-cols max-visible)
+       (render-completion-grid port entries selected-index term-cols max-visible #f #f)]
+      [(port entries selected-index term-cols max-visible group-plan)
+       (render-completion-grid port entries selected-index term-cols max-visible group-plan #f)]
+      [(port entries selected-index term-cols max-visible group-plan types)
+       (let* ([entries (map strip-entry-for-display entries)]
+              ;; === LS_COLORS candidate colouring ===
+              ;; Resolve the type/extension colour table ONCE per render (never per
+              ;; cell) and turn the parallel type list into a vector for O(1) lookup
+              ;; by flat index.  types is #f from the shorter clauses, in which case
+              ;; every candidate resolves as the plain-file colour.  The renderer
+              ;; never stats: the type is the one the completion source threaded.
+              [ls-table (current-ls-colors)]
+              [types-vec (and (list? types) (list->vector types))]
+              [n (length entries)]
+              ;; Extract candidate names and check for descriptions
+              [names (map car entries)]
+              [has-descs? (and (pair? entries)
+                              (pair? (cdr (car entries)))
+                              (pair? (cddr (car entries)))
+                              (list? (cadar entries)))]
+              [descs (if has-descs? (map caddr entries) '())]
+              ;; Compute max candidate display width
+              [max-name-w (fold-left
+                            (lambda (mx s) (max mx (string-display-width s)))
+                            0 names)]
+              ;; Compute max description display width
+              [max-desc-w (if has-descs?
+                             (fold-left
+                               (lambda (mx d)
+                                 (if (and d (string? d))
+                                     (max mx (string-display-width d))
+                                     mx))
+                               0 descs)
+                             0)]
+              ;; Column width: 2 indent + name + 2 gap (between cols)
+              ;; With descriptions: single column, name + 2 + desc
+              [cell-width (if has-descs?
+                             term-cols  ; single column when descriptions present
+                             (+ 2 (min max-name-w (quotient term-cols 2)) 2))]
+              ;; Grid columns
+              [grid-cols (if has-descs?
+                            1
+                            (max 1 (quotient term-cols cell-width)))]
+              ;; The shared row-plan is the ONE geometry authority: header and
+              ;; candidate rows laid out once, so index<->cell is a lookup here and
+              ;; in every mirror.  A #f group-plan is a single unlabelled group --
+              ;; no header, and the layout stays byte-identical to the old grid.
+              [plan (build-row-plan (or group-plan (list (cons #f n))) grid-cols)]
+              [grid-rows (row-plan-rows plan)]           ; header rows INCLUDED
+              [row-labels (grid-row-labels plan (or group-plan (list (cons #f n))))]
+              ;; Selected row: look it up in the plan, never quotient over a
+              ;; header-free grid, so the highlight tracks across a header boundary.
+              [sel-row (if (and (>= selected-index 0) (< selected-index n))
+                           (let-values ([(r c) (row-plan-locate plan selected-index)])
+                             r)
+                           0)]
+              ;; Scroll offset: keep selected row visible
+              [scroll-off (cond
+                            [(< sel-row max-visible)
+                             0]
+                            [else
+                             (- sel-row (- max-visible 1))])]
+              [vis-rows (min grid-rows max-visible)]
+              [name-col-w (min max-name-w (- (if has-descs?
+                                                 (- term-cols 6)
+                                                 (quotient term-cols 2))
+                                             0))]
+              ;; Colour the selection, directory names, descriptions, header and
+              ;; pager on a colour-capable target only; the grid layout -- headers
+              ;; included -- always renders (structure, not decoration).
+              [colour? (colour-ok? port)])
+
+         ;; Output the grid
+         (display "\n" port)
+         (let row-loop ([row scroll-off] [lines 0])
+           (cond
+             [(or (>= row (+ scroll-off vis-rows)) (>= row grid-rows))
+              ;; Pager indicator if scrolled
+              (let ([total-lines
+                     (if (> grid-rows vis-rows)
+                         (begin
+                           (when colour? (display "\x1b;[38;5;240m" port))
+                           (display "  " port)
+                           (display (+ sel-row 1) port)
+                           (display "/" port)
+                           (display grid-rows port)
+                           (display " rows" port)
+                           (when colour? (display "\x1b;[39m" port))
+                           (display "\n" port)
+                           (+ lines 1))
+                         lines)])
+                (values total-lines grid-cols grid-rows scroll-off))]
+             [(vector-ref row-labels row)
+              ;; A header row: a dim, left-aligned label on its own row (no
+              ;; candidate indent, no blank separator), truncated to the terminal
+              ;; width with the ellipsis.  The dim SGR is the only colour; the label
+              ;; glyphs render regardless so the grouping survives NO_COLOR/dumb.
+              ;; The label is re-stripped here -- the single display choke-point --
+              ;; so a crafted label can never repaint the screen even off the sink.
+              => (lambda (label)
+                   (when colour? (display "\x1b;[2m" port))
+                   (display (truncate-display (strip-terminal-escapes label) term-cols)
+                            port)
+                   (when colour? (display "\x1b;[22m" port))
+                   (display "\n" port)
+                   (row-loop (+ row 1) (+ lines 1)))]
+             [else
+              ;; A candidate row: walk its cells off the plan.  row-plan-cell answers
+              ;; #f past the row's last cell, so a ragged final row stops early and a
+              ;; full row stops at grid-cols -- the old (>= col grid-cols)/(>= idx n).
+              (let col-loop ([col 0])
+                (let ([idx (row-plan-cell plan row col)])
+                  (if (not idx)
+                      ;; End of row — newline and proceed to next row
                       (begin
-                        (when colour? (display "\x1b;[38;5;240m" port))
-                        (display "  " port)
-                        (display (+ sel-row 1) port)
-                        (display "/" port)
-                        (display grid-rows port)
-                        (display " rows" port)
-                        (when colour? (display "\x1b;[39m" port))
                         (display "\n" port)
-                        (+ lines 1))
-                      lines)])
-             (values total-lines grid-cols grid-rows scroll-off))]
-          [else
-           ;; Render one row of the grid
-           (let col-loop ([col 0])
-             (let ([idx (+ (* row grid-cols) col)])
-               (if (or (>= col grid-cols) (>= idx n))
-                   ;; End of row — newline and proceed to next row
-                   (begin
-                     (display "\n" port)
-                     (row-loop (+ row 1) (+ lines 1)))
-                   ;; Render one cell
-                   (let* ([entry (list-ref entries idx)]
-                          [candidate (car entry)]
-                          [positions (if (and (pair? (cdr entry))
-                                             (pair? (cddr entry))
-                                             (list? (cadr entry)))
-                                        (cadr entry)
-                                        (cdr entry))]
-                          [description (if (and (pair? (cdr entry))
-                                               (pair? (cddr entry))
-                                               (list? (cadr entry)))
-                                          (caddr entry)
-                                          #f)]
-                          [selected? (= idx selected-index)]
-                          [is-dir? (and (> (string-length candidate) 0)
-                                        (char=? (string-ref candidate
-                                                   (- (string-length candidate) 1))
-                                                #\/))]
-                          [disp-name (truncate-display candidate name-col-w)]
-                          [padded (if has-descs?
-                                     (pad-to-width disp-name (+ name-col-w 2))
-                                     (pad-to-width disp-name (- cell-width 2)))])
-                     ;; Selected background
-                     (when (and colour? selected?)
-                       (display sel-bg port) (display sel-fg port))
-                     ;; Indent
-                     (display "  " port)
-                     ;; Directory colour
-                     (when (and colour? is-dir? (not selected?))
-                       (fg-colour-l port dir-colour))
-                     ;; Candidate with highlights
-                     (display-with-highlights port padded positions colour?)
-                     ;; Reset directory colour
-                     (when (and colour? is-dir? (not selected?))
-                       (display "\x1b;[39m" port))
-                     ;; Description (single-column mode)
-                     (when (and has-descs? description (string? description))
-                       (when colour?
-                         (if selected?
-                             (display "\x1b;[38;2;140;145;170m" port)
-                             (display "\x1b;[38;5;240m" port)))
-                       (display (truncate-display description
-                                  (max 10 (- term-cols name-col-w 6))) port)
-                       (when colour?
-                         (if selected?
-                             (display sel-fg port)
-                             (display "\x1b;[39m" port))))
-                     ;; Reset selection
-                     (when (and colour? selected?) (display "\x1b;[0m" port))
-                     (col-loop (+ col 1))))))]))))
+                        (row-loop (+ row 1) (+ lines 1)))
+                      ;; Render one cell
+                      (let* ([entry (list-ref entries idx)]
+                             [candidate (car entry)]
+                             [positions (if (and (pair? (cdr entry))
+                                                (pair? (cddr entry))
+                                                (list? (cadr entry)))
+                                           (cadr entry)
+                                           (cdr entry))]
+                             [description (if (and (pair? (cdr entry))
+                                                  (pair? (cddr entry))
+                                                  (list? (cadr entry)))
+                                             (caddr entry)
+                                             #f)]
+                             [selected? (= idx selected-index)]
+                             ;; The candidate's colour: its threaded file type plus
+                             ;; its own display name (for the *.ext match), resolved
+                             ;; to a VALIDATED SGR string or #f.  A selected cell keeps
+                             ;; the selection colour and takes none.  candidate-sgr
+                             ;; allow-lists to [0-9;], so a crafted $LS_COLORS value
+                             ;; resolves to #f and paints nothing.
+                             [cand-type (and types-vec (< idx (vector-length types-vec))
+                                             (vector-ref types-vec idx))]
+                             [cand-sgr (and colour? (not selected?)
+                                            (candidate-sgr ls-table candidate cand-type))]
+                             [disp-name (truncate-display candidate name-col-w)]
+                             [padded (if has-descs?
+                                        (pad-to-width disp-name (+ name-col-w 2))
+                                        (pad-to-width disp-name (- cell-width 2)))])
+                        ;; Selected background
+                        (when (and colour? selected?)
+                          (display sel-bg port) (display sel-fg port))
+                        ;; Indent
+                        (display "  " port)
+                        ;; Candidate colour from $LS_COLORS (non-selected cells only):
+                        ;; wrap the name in the VALIDATED param string -- never a raw
+                        ;; env byte -- so a hostile value cannot smuggle an escape.
+                        (when cand-sgr
+                          (display "\x1b;[" port) (display cand-sgr port) (display "m" port))
+                        ;; Candidate with highlights
+                        (display-with-highlights port padded positions colour?)
+                        ;; Reset the candidate colour: a non-selected cell has no other
+                        ;; active attribute, so [0m clears any bold the SGR set.
+                        (when cand-sgr (display "\x1b;[0m" port))
+                        ;; Description (single-column mode)
+                        (when (and has-descs? description (string? description))
+                          (when colour?
+                            (if selected?
+                                (display "\x1b;[38;2;140;145;170m" port)
+                                (display "\x1b;[38;5;240m" port)))
+                          (display (truncate-display description
+                                     (max 10 (- term-cols name-col-w 6))) port)
+                          (when colour?
+                            (if selected?
+                                (display sel-fg port)
+                                (display "\x1b;[39m" port))))
+                        ;; Reset selection
+                        (when (and colour? selected?) (display "\x1b;[0m" port))
+                        (col-loop (+ col 1))))))]))) ]))
 
   ;; ======================================================================
   ;; Reusable terminal-overlay helpers

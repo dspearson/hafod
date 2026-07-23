@@ -8,12 +8,34 @@
           completers-registered? strip-terminal-escapes
           git-completer
           ssh-completer kill-completer make-completer user-completer
+          cd-completer dir-only-command?
           parse-help-output safe-command-name? command-flag-source
           command-flags command-flag-completer)
-  (import (chezscheme)
+  (import (except (chezscheme) getenv)
+          ;; HOME (for a leading "~/" in the directory completer) is read through
+          ;; hafod's cache-aware getenv, so it agrees with the Scheme-side
+          ;; environment the shell mutates rather than Chez's raw view.
+          (only (hafod environment) getenv)
           (only (hafod posix) posix-waitpid posix-getpwent-all
                 passwd-info-name passwd-info-dir)
           (only (hafod shell classifier) path-cache)
+          ;; The cd completer's dash arm sources its -N labels from the directory
+          ;; stack; it also shares the colon splitter and the $CDPATH enumerator
+          ;; with the cd builtin, so the "empty element = cwd" rule lives in one
+          ;; place.  Its ~name/ arm expands a named directory before listing.  All
+          ;; one-way edges -- neither builtins nor parser imports this library --
+          ;; so there is no cycle.
+          (only (hafod shell builtins) dir-stack split-on-colon cdpath-entries)
+          (only (hafod shell parser) named-directory-ref named-directories-list)
+          ;; The git branch listing is collected as a verbatim argument vector:
+          ;; exec-path execs the tool directly and run/strings* captures its stdout
+          ;; lines while reaping the child synchronously.  A joined /bin/sh -c
+          ;; command string cannot be used there because the %(refname:short)
+          ;; format carries parentheses a shell would read as subshell
+          ;; metacharacters.  Both edges run strictly downward -- neither collect
+          ;; nor process imports this library -- so there is no cycle.
+          (only (hafod collect) run/strings*)
+          (only (hafod process) exec-path)
           (hafod fuzzy))
 
   ;; Registry: command-name → completer procedure
@@ -513,17 +535,30 @@
       ("tag" . "manage tags")
       ("worktree" . "manage worktrees")))
 
+  ;; Local branch names for git completion.  The names are collected as a verbatim
+  ;; argument vector -- exec-path execs git directly and run/strings* captures its
+  ;; stdout lines, reaping the child synchronously -- rather than through a joined
+  ;; /bin/sh -c command string, because the %(refname:short) format carries
+  ;; parentheses a shell reads as subshell metacharacters and aborts on, so a
+  ;; shell-joined run yields no branches at all.  The whole body is guarded so a
+  ;; spawn or pipe failure yields an empty list rather than throwing.  On the clean
+  ;; --format output the leading whitespace/asterisk strip is a harmless no-op (git
+  ;; prints bare short names with no marker), kept as a defensive guard.
   (define (git-branches)
-    (let ([lines (command-output "git" "branch" "--list" "--format=%(refname:short)")])
-      (map (lambda (line)
-             ;; strip leading whitespace/asterisk
-             (let loop ([i 0])
-               (if (and (< i (string-length line))
-                        (or (char-whitespace? (string-ref line i))
-                            (char=? (string-ref line i) #\*)))
-                   (loop (+ i 1))
-                   (substring line i (string-length line)))))
-           lines)))
+    (guard (e [#t '()])
+      (let ([lines (run/strings*
+                     (lambda ()
+                       (exec-path "git" "branch" "--list"
+                                  "--format=%(refname:short)")))])
+        (map (lambda (line)
+               ;; strip leading whitespace/asterisk
+               (let loop ([i 0])
+                 (if (and (< i (string-length line))
+                          (or (char-whitespace? (string-ref line i))
+                              (char=? (string-ref line i) #\*)))
+                     (loop (+ i 1))
+                     (substring line i (string-length line)))))
+             lines))))
 
   (define (git-modified-files)
     (let ([lines (command-output "git" "status" "--porcelain")])
@@ -777,17 +812,6 @@
   ;; Tilde-user completer — login names to home directories
   ;; ======================================================================
 
-  ;; Split a string on the colon field separator, returning the fields in order.
-  ;; A passwd line carries no quoting, so a plain left-to-right scan is exact.
-  (define (split-on-colon s)
-    (let ([len (string-length s)])
-      (let loop ([i 0] [start 0] [acc '()])
-        (cond
-          [(>= i len) (reverse (cons (substring s start len) acc))]
-          [(char=? (string-ref s i) #\:)
-           (loop (+ i 1) (+ i 1) (cons (substring s start i) acc))]
-          [else (loop (+ i 1) start acc)]))))
-
   ;; Enumerate login names paired with their home directories, each keyed by the
   ;; login with a leading `~` so the inserted candidate `~alice` is later resolved
   ;; by the tilde expander.  The passwd-database walk is tried first: it is
@@ -833,16 +857,35 @@
                     (begin (hashtable-set! ht (car e) #t) #t)))
               entries)))
 
-  ;; Complete a `~`-prefixed token to a login's home directory.  The prefix
-  ;; carries the leading `~` (so `~al` ranks `~alice`), and the returned candidate
-  ;; keeps that `~` so the editor inserts `~alice`, later expanded by the tilde
-  ;; expander; the home directory rides along as the menu description.  Both the
-  ;; candidate and the description pass through strip-terminal-escapes: a login or
-  ;; home path drawn from the user database must not carry an escape sequence into
-  ;; the rendered menu.  Dispatched by the editor on the token's `~` shape rather
-  ;; than by a command name, so it is deliberately not in the completer registry.
+  ;; The `~<tab>` candidate set: every registered named directory (keyed `~name`
+  ;; with its directory as the description) placed AHEAD of the passwd logins, so a
+  ;; named `~proj` shadows a login `proj`; de-duplicated on the `~name` key keeping
+  ;; the first (named) entry, exactly as user-entries de-duplicates the logins.
+  (define (tilde-entries)
+    (let ([entries (append
+                     (map (lambda (p)
+                            (cons (string-append "~" (car p)) (cdr p)))
+                          (named-directories-list))
+                     (user-entries))]
+          [ht (make-hashtable string-hash string=?)])
+      (filter (lambda (e)
+                (if (hashtable-ref ht (car e) #f)
+                    #f
+                    (begin (hashtable-set! ht (car e) #t) #t)))
+              entries)))
+
+  ;; Complete a `~`-prefixed token to a named directory or a login's home.  The
+  ;; prefix carries the leading `~` (so `~al` ranks `~alice`), and the returned
+  ;; candidate keeps that `~` so the editor inserts `~alice`, later expanded by the
+  ;; tilde expander; the directory rides along as the menu description.  A
+  ;; registered named directory is offered ahead of a same-named login (the
+  ;; tilde-entries merge).  Both the candidate and the description pass through
+  ;; strip-terminal-escapes: a login, a named directory or a home path must not
+  ;; carry an escape sequence into the rendered menu.  Dispatched by the editor on
+  ;; the token's `~` shape rather than by a command name, so it is deliberately not
+  ;; in the completer registry.
   (define (user-completer prefix context)
-    (let* ([entries (user-entries)]
+    (let* ([entries (tilde-entries)]
            [names (map car entries)])
       (map (lambda (m)
              (let ([home (cond [(assoc (car m) entries) => cdr]
@@ -851,6 +894,209 @@
                      (cdr m)
                      (strip-terminal-escapes home))))
            (fuzzy-filter/positions prefix names))))
+
+  ;; ======================================================================
+  ;; Directory-only completion -- cd / pushd / rmdir
+  ;; ======================================================================
+
+  ;; The commands whose operand is always a directory.  Their completion offers
+  ;; directories only, and the editor consults this predicate to suppress its
+  ;; filename fallback for them: when the directory completer yields nothing a
+  ;; no-match cd shows an empty menu rather than leaking plain files.
+  (define (dir-only-command? cmd)
+    (and (member cmd '("cd" "pushd" "rmdir")) #t))
+
+  ;; Resolve a "~name" (NAME without the leading "~") to a directory: a registered
+  ;; named directory wins -- matching the tilde expander's hash -d precedence, so
+  ;; completing a name agrees with where cd navigates -- otherwise the login's
+  ;; passwd home, and #f when the name is neither, so an unknown "~name/" completes
+  ;; to nothing.
+  (define (named-or-user-home name)
+    (or (named-directory-ref name)
+        (let ([key (string-append "~" name)])
+          (cond
+            [(assoc key (user-entries)) => cdr]
+            [else #f]))))
+
+  ;; Expand a leading tilde form to a concrete prefix before the path is split on
+  ;; its last "/", so the directory listing sees a real path:
+  ;;   "~/pr"        -> "$HOME/pr"                (home, read through hafod's getenv)
+  ;;   "~name/rest"  -> "<named-or-home>/rest"    (a registered named directory,
+  ;;                                               else the login's passwd home)
+  ;; A bare "~" or a "~name" WITHOUT a slash is intercepted by the editor's tilde
+  ;; arm (served by user-completer) and never reaches here, so only the with-slash
+  ;; forms expand; an unknown "~name/" (neither a named directory nor a login) is
+  ;; left as typed and simply lists nothing.
+  (define (expand-leading-tilde prefix)
+    (if (and (> (string-length prefix) 0)
+             (char=? (string-ref prefix 0) #\~))
+        (let* ([len (string-length prefix)]
+               [slash (let loop ([i 1])
+                        (cond
+                          [(>= i len) #f]
+                          [(char=? (string-ref prefix i) #\/) i]
+                          [else (loop (+ i 1))]))])
+          (if (not slash)
+              prefix
+              (let ([name (substring prefix 1 slash)]
+                    [rest (substring prefix slash len)])
+                (if (string=? name "")
+                    (string-append (or (getenv "HOME") "") rest)
+                    (let ([home (named-or-user-home name)])
+                      (if home (string-append home rest) prefix))))))
+        prefix))
+
+  ;; The directory-stack completion for a leading "-": a bare "-" whose
+  ;; description is $OLDPWD (the cd - target, useful after a plain cd with no
+  ;; pushd), then "-1", "-2", ... one per directory-stack entry with that entry's
+  ;; directory as the description, so the label "-i" names exactly the directory
+  ;; cd -i enters (the stack is 1-based, top first).  The labels are fuzzy-ranked
+  ;; against the typed prefix so "-2" narrows to the one label, and every label
+  ;; and description is escape-stripped before it reaches the menu.
+  (define (dir-stack-labels prefix)
+    (let* ([old (getenv "OLDPWD")]
+           [entries
+            (append
+              (if old (list (cons "-" old)) '())
+              (let loop ([ds (dir-stack)] [i 1] [acc '()])
+                (if (null? ds)
+                    (reverse acc)
+                    (loop (cdr ds) (+ i 1)
+                          (cons (cons (string-append "-" (number->string i)) (car ds))
+                                acc)))))]
+           [names (map car entries)])
+      (map (lambda (m)
+             (let ([desc (cond [(assoc (car m) entries) => cdr] [else ""])])
+               (list (strip-terminal-escapes (car m))
+                     (cdr m)
+                     (strip-terminal-escapes desc))))
+           (fuzzy-filter/positions prefix names))))
+
+  ;; List the directories directly under DIR whose name fuzzy-matches BASE, each a
+  ;; (name positions description) triple.  Only entries that are directories --
+  ;; followed through a symlink by the one-arg file-directory?, never the nofollow
+  ;; form that would drop a symlink-to-a-directory -- are kept, each given a
+  ;; trailing "/" (and no "@"); smart-hidden offers a dot-entry only when BASE
+  ;; itself begins with a dot (the zsh default).  When DIR-PREFIX is a string it is
+  ;; prepended to each candidate name (and the match positions shifted), so a typed
+  ;; "a/b" completes to "a/bcd/"; when it is #f the bare basename is inserted (a
+  ;; cwd or a $CDPATH candidate).  DESC is the menu description every candidate
+  ;; carries -- the empty string for a cwd listing, the $CDPATH root for a $CDPATH
+  ;; entry.  Fuzzy-filtering first and statting only the survivors bounds the
+  ;; directory probes to the matches, an unreadable DIR yields no candidates rather
+  ;; than an error, and every name and description is escape-stripped.
+  (define (list-dirs-in dir base dir-prefix desc)
+    (let* ([dir-prefix-len (if dir-prefix (string-length dir-prefix) 0)]
+           [want-hidden? (and (> (string-length base) 0)
+                              (char=? (string-ref base 0) #\.))]
+           [entries (guard (e [#t '()]) (directory-list dir))]
+           [visible (filter
+                      (lambda (entry)
+                        (or want-hidden?
+                            (= (string-length entry) 0)
+                            (not (char=? (string-ref entry 0) #\.))))
+                      entries)]
+           [matched (fuzzy-filter/positions base visible)])
+      (fold-right
+        (lambda (pair acc)
+          (let* ([entry (car pair)]
+                 [positions (cdr pair)]
+                 [full (string-append dir "/" entry)]
+                 [is-dir? (guard (e [#t #f]) (file-directory? full))])
+            (if is-dir?
+                (let* ([shown (string-append entry "/")]
+                       [name (if dir-prefix (string-append dir-prefix shown) shown)]
+                       [shifted (if dir-prefix
+                                    (map (lambda (p) (+ p dir-prefix-len)) positions)
+                                    positions)])
+                  (cons (list (strip-terminal-escapes name)
+                              shifted
+                              (strip-terminal-escapes desc))
+                        acc))
+                acc)))
+        '()
+        matched)))
+
+  ;; The non-empty $CDPATH entries, or '() when $CDPATH is unset or empty.  The
+  ;; raw entries (and the "empty element = cwd" rule) come from the cd builtin's
+  ;; shared cdpath-entries; the current directory is already listed directly, so
+  ;; the empty elements that denote it are dropped here.
+  (define (cdpath-roots)
+    (filter (lambda (e) (> (string-length e) 0)) (cdpath-entries)))
+
+  ;; For each non-empty $CDPATH entry, the subdirectories matching BASE offered as
+  ;; BARE basenames (dir-prefix #f) with the entry as the description, so the
+  ;; inserted basename is exactly what builtin-cd resolves back through $CDPATH
+  ;; rather than an absolute path; the entry rides only as the description.
+  (define (cdpath-dirs base)
+    (fold-right
+      (lambda (root acc)
+        (append (list-dirs-in root base #f root) acc))
+      '()
+      (cdpath-roots)))
+
+  ;; Merge the cwd candidates ahead of the $CDPATH candidates, dropping any
+  ;; basename already offered so a directory reachable both locally and via
+  ;; $CDPATH appears once, as the local candidate (cwd first).
+  (define (dedup-candidates cwd cdpath)
+    (let ([seen (make-hashtable string-hash string=?)])
+      (filter (lambda (tr)
+                (if (hashtable-ref seen (car tr) #f)
+                    #f
+                    (begin (hashtable-set! seen (car tr) #t) #t)))
+              (append cwd cdpath))))
+
+  ;; Complete a cd / pushd / rmdir operand.  The completer is COMMAND-AWARE: the
+  ;; $CDPATH union and the cd -N / bare-"-" dash-stack labels are cd-only, because
+  ;; only builtin-cd consults $CDPATH and only cd -N walks the directory stack --
+  ;; pushd and rmdir honour neither, so offering them such a target would propose a
+  ;; candidate the command cannot reach.  The invoking command rides in the context
+  ;; as 'command (threaded by the editor); a caller that omits it gets the
+  ;; conservative dirs-only behaviour.
+  ;;
+  ;; A leading "-" (cd only) lists the directory stack as -N labels plus a bare "-"
+  ;; for $OLDPWD.  Otherwise the typed PREFIX is a path fragment: a leading "~/" or
+  ;; "~name/" is expanded first, then the fragment is split on its last "/" into a
+  ;; directory to list and a base to match, and the directories under it are offered
+  ;; (trailing "/", dirs-only, symlink-followed, smart-hidden, escapes stripped).
+  ;; For cd, when the base is a bare relative name (no "/", not "."/"..", not "~")
+  ;; the cwd listing is unioned with the directories reachable via $CDPATH -- as
+  ;; bare basenames, cwd candidates first, deduped by basename -- so every
+  ;; completable cd target is one builtin-cd can also navigate to.  Filesystem
+  ;; access is guarded, so an unreadable or absent directory yields no candidates.
+  (define (cd-completer prefix context)
+    (guard (e [#t '()])
+      (let ([cd? (equal? (cond [(assq 'command context) => cdr] [else #f]) "cd")])
+        (if (and cd?
+                 (> (string-length prefix) 0)
+                 (char=? (string-ref prefix 0) #\-))
+            (dir-stack-labels prefix)
+            (let* ([expanded (expand-leading-tilde prefix)]
+                   [len (string-length expanded)]
+                   [last-slash (let loop ([i (- len 1)])
+                                 (cond
+                                   [(< i 0) #f]
+                                   [(char=? (string-ref expanded i) #\/) i]
+                                   [else (loop (- i 1))]))]
+                   [dir (if last-slash
+                            (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                            ".")]
+                   [base (if last-slash
+                             (substring expanded (+ last-slash 1) len)
+                             expanded)]
+                   [dir-prefix (if last-slash
+                                   (if (= last-slash 0) "/" (substring expanded 0 (+ last-slash 1)))
+                                   #f)]
+                   [cwd-candidates (list-dirs-in dir base dir-prefix "")]
+                   [use-cdpath? (and cd?
+                                     (not last-slash)
+                                     (> (string-length base) 0)
+                                     (not (char=? (string-ref base 0) #\~))
+                                     (not (string=? base "."))
+                                     (not (string=? base "..")))])
+              (if use-cdpath?
+                  (dedup-candidates cwd-candidates (cdpath-dirs base))
+                  cwd-candidates))))))
 
   ;; ======================================================================
   ;; Register built-in completers (on first lookup, not at instantiation)
@@ -867,6 +1113,9 @@
       (register-completer! "kill" kill-completer)
       (register-completer! "killall" kill-completer)
       (register-completer! "make" make-completer)
-      (register-completer! "gmake" make-completer)))
+      (register-completer! "gmake" make-completer)
+      (register-completer! "cd" cd-completer)
+      (register-completer! "pushd" cd-completer)
+      (register-completer! "rmdir" cd-completer)))
 
 ) ; end library

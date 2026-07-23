@@ -162,6 +162,9 @@
   ;; Each code updates exactly one independent attribute, so 39m resets only the
   ;; foreground (the background survives), 0m resets everything, 22m clears bold
   ;; and dim.  38/48 consume their truecolour (2;r;g;b) or 256 (5;n) arguments.
+  ;; The basic palette folds too: 30-37/90-97 set the foreground to colour index
+  ;; 0-15 and 40-47/100-107 the background, so a candidate coloured by the default
+  ;; $LS_COLORS (e.g. di=01;34 -> bold + fg 4) reads back through cell-fg/cell-bg.
   ;; ====================================================================
   (define (reset-pen! pen)
     (cell-fg-set! pen 'default)
@@ -206,6 +209,13 @@
           [(49) (cell-bg-set! pen 'default)                       (loop (cdr p))]
           [(38) (loop (take-colour! pen 'fg (cdr p)))]
           [(48) (loop (take-colour! pen 'bg (cdr p)))]
+          ;; The basic 16-colour palette: 30-37 fg 0-7, 90-97 fg 8-15 (bright),
+          ;; 40-47 bg 0-7, 100-107 bg 8-15.  Folded so a candidate coloured by the
+          ;; default $LS_COLORS reads its colour index back off the cell.
+          [(30 31 32 33 34 35 36 37)         (cell-fg-set! pen (- (car p) 30))        (loop (cdr p))]
+          [(90 91 92 93 94 95 96 97)         (cell-fg-set! pen (+ 8 (- (car p) 90)))  (loop (cdr p))]
+          [(40 41 42 43 44 45 46 47)         (cell-bg-set! pen (- (car p) 40))        (loop (cdr p))]
+          [(100 101 102 103 104 105 106 107) (cell-bg-set! pen (+ 8 (- (car p) 100))) (loop (cdr p))]
           [else (loop (cdr p))]))))
 
   ;; ====================================================================

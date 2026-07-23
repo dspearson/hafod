@@ -31,6 +31,12 @@
               count-visual-lines cursor-visual-row)
         (only (hafod editor editor)
               read-expression menu-anchor-place)
+        ;; The pure row-plan the grid draws with: the pager/scroll assertions
+        ;; reckon the header-inclusive row count and the selected row with the
+        ;; SAME helpers the renderer uses, so a header miscount cannot hide behind
+        ;; the assertions' own arithmetic.
+        (only (hafod editor completion-groups)
+              build-row-plan row-plan-rows row-plan-locate row-plan-cell)
         (only (hafod environment) with-env* setenv)
         (chezscheme))
 
@@ -153,6 +159,31 @@
 (define overlay-entries (map list overlay-names))
 (define overlay-cols 20)
 (define overlay-max-visible 4)
+
+;; The 0-based folded row whose TRIMMED text is exactly TEXT, or #f.  A header
+;; row is its label alone from column 0, so an exact match also proves the label
+;; is left-aligned with no leading indent.
+(define (row-of-text scr text)
+  (let loop ([lines (vterm-lines scr)] [r 0])
+    (cond
+      [(null? lines) #f]
+      [(string=? (car lines) text) r]
+      [else (loop (cdr lines) (+ r 1))])))
+
+;; Pin $LS_COLORS around a colour-target render so a candidate's colour is a
+;; deterministic palette, never the box's ambient value (set on a dev box, often
+;; unset on CI -- the make-test-invisible env sensitivity this repo has hit).  A
+;; #f pin UNSETS via a setenv save/restore -- routing #f through with-env* would
+;; hand the C setenv a #f value and raise -- so the render reads the built-in
+;; default palette; a string pin installs that exact override through with-env*.
+(define (with-ls-colors pin thunk)
+  (if pin
+      (with-env* (list (cons "LS_COLORS" pin)) thunk)
+      (let ([saved (getenv "LS_COLORS")])
+        (dynamic-wind
+          (lambda () (setenv "LS_COLORS" #f))
+          thunk
+          (lambda () (setenv "LS_COLORS" saved))))))
 
 (test-begin "completion-overlay")
 
@@ -308,11 +339,21 @@
 ;; the grid emits puts grid row 0 on folded row 1, so the selected grid row 2
 ;; lands on folded row 3; the two-space indent puts the candidate's first glyph at
 ;; column 2 (mirrors the per-cell truecolour-background sibling in test-vterm-attrs).
-(let* ([scr (render->screen overlay-cols
-              (lambda (p)
-                (render-completion-grid p overlay-entries 2
-                                        overlay-cols overlay-max-visible)))]
+;; $LS_COLORS is PINNED unset around the whole colour-capable render: the grid now
+;; colours NON-selected candidates from $LS_COLORS, so without the pin a dev box's
+;; palette would repaint candidate 0's foreground and the default-foreground read
+;; below would depend on the ambient value (set on dev, unset on CI).  Pinned unset,
+;; the built-in default palette gives an untyped candidate no colour, and the
+;; selection highlight the other reads assert is a fixed truecolour, independent of
+;; the palette either way.
+(let* ([scr (with-ls-colors #f
+              (lambda ()
+                (render->screen overlay-cols
+                  (lambda (p)
+                    (render-completion-grid p overlay-entries 2
+                                            overlay-cols overlay-max-visible)))))]
        [sel-cell (vterm-cell scr 3 2)]
+       [nonsel-cell (vterm-cell scr 1 2)]
        [blank-cell (vterm-cell scr 0 0)])
   (test-equal "grid: the selected candidate's first glyph lands at row 3 column 2"
     #\c (cell-glyph sel-cell))
@@ -322,6 +363,8 @@
     '(195 202 230) (cell-fg sel-cell))
   (test-equal "grid: a cell outside the selection reads the default background"
     'default (cell-bg blank-cell))
+  (test-equal "grid: a non-selected candidate takes the default foreground under the pinned palette"
+    'default (cell-fg nonsel-cell))
   (test-assert "grid: the height-cap pager row renders in the folded grid"
     (any-line-has? scr " rows")))
 
@@ -409,5 +452,156 @@
       (read-expression "> " (open-input-string cycle-keys) out)))
   (test-assert "cycle on a plain string sink carries zero ESC bytes"
     (not (has-esc? (get-output-string out)))))
+
+;; ======================================================================
+;; (h) Degradation: the category headers are STRUCTURE, colour is DECORATION.
+;; A multi-group grid rendered with colour FORCED on (CLICOLOR_FORCE, so even this
+;; non-tty string sink colours) carries the dim header SGR -- the non-vacuity
+;; anchor that proves colour CAN reach this drive.  Each colour-off verdict then
+;; drops every SGR while the header LABEL glyphs stay in the stream: caps 'off and
+;; NO_COLOR both BEAT CLICOLOR_FORCE in colour-ok?'s locked precedence (steps 1 and
+;; 2), and TERM=dumb renders the structure the same.  Folding the caps-off output
+;; back through the vterm, the header cell keeps its glyph but reads not-dim with
+;; the default foreground -- colour dropped, structure kept.  These drives are all
+;; colour-GATED once off, so no $LS_COLORS pin is needed (no SGR reaches the sink).
+;; ======================================================================
+
+(define deg-group-plan (list (cons "directories" 2) (cons "files" 2)))
+(define deg-entries
+  (list (cons "d1/" '()) (cons "d2/" '())
+        (cons "f1" '()) (cons "f2" '())))
+(define deg-cols 40)
+
+;; Render the multi-group degradation grid to a raw string under the ambient
+;; capability verdict (whatever env/parameter frame the caller has installed).
+(define (deg-raw)
+  (let ([sp (open-output-string)])
+    (render-completion-grid sp deg-entries -1 deg-cols 10 deg-group-plan)
+    (get-output-string sp)))
+
+(let ([forced  (with-env* '(("CLICOLOR_FORCE" . "1")) deg-raw)]
+      [capsoff (with-env* '(("CLICOLOR_FORCE" . "1"))
+                 (lambda ()
+                   (parameterize ([assume-terminal-caps 'off]) (deg-raw))))]
+      [nocolor (with-env* '(("CLICOLOR_FORCE" . "1") ("NO_COLOR" . "1")) deg-raw)]
+      [dumb    (with-env* '(("TERM" . "dumb")) deg-raw)])
+  ;; Non-vacuity anchor: colour forced on, the dim header SGR IS in the stream.
+  (test-assert "degrade: colour forced -> the dim header SGR is emitted (non-vacuity anchor)"
+    (contains-substring? forced "\x1b;[2m"))
+  ;; caps 'off drops every SGR even against CLICOLOR_FORCE; the headers survive.
+  (test-assert "degrade caps-off: no SGR escape survives (colour dropped)"
+    (not (has-esc? capsoff)))
+  (test-assert "degrade caps-off: both category headers still render (structure)"
+    (and (contains-substring? capsoff "directories")
+         (contains-substring? capsoff "files")))
+  ;; NO_COLOR beats CLICOLOR_FORCE; the headers survive.
+  (test-assert "degrade NO_COLOR: no SGR escape survives (colour dropped)"
+    (not (has-esc? nocolor)))
+  (test-assert "degrade NO_COLOR: both category headers still render (structure)"
+    (and (contains-substring? nocolor "directories")
+         (contains-substring? nocolor "files")))
+  ;; TERM=dumb: the headers render the same, still with no SGR.
+  (test-assert "degrade TERM=dumb: the headers render with no SGR escape"
+    (and (not (has-esc? dumb))
+         (contains-substring? dumb "directories")
+         (contains-substring? dumb "files"))))
+
+;; The caps-off header, folded back through the vterm, keeps its glyph but reads
+;; not-dim with the default foreground -- the cell-level "structure, not
+;; decoration" proof.  (A header-blind renderer would drop the label entirely; a
+;; decoration-only degrade would leave the dim SGR on.)
+(let* ([capsoff (with-env* '(("CLICOLOR_FORCE" . "1"))
+                  (lambda ()
+                    (parameterize ([assume-terminal-caps 'off]) (deg-raw))))]
+       [scr (let ([vt (make-vterm deg-cols)]) (vterm-feed! vt capsoff) vt)]
+       [dir-row (row-of-text scr "directories")])
+  (test-assert "degrade caps-off: a header row lands in the fold"
+    dir-row)
+  (test-assert "degrade caps-off: the header keeps its glyph but reads not-dim, default fg"
+    (and dir-row
+         (char=? (cell-glyph (vterm-cell scr dir-row 0)) #\d)
+         (not (cell-dim? (vterm-cell scr dir-row 0)))
+         (eq? (cell-fg (vterm-cell scr dir-row 0)) 'default))))
+
+;; ======================================================================
+;; (i) The pager and scroll arithmetic COUNT the header rows.
+;; A multi-group grid taller than the visible cap draws a pager whose "N/M rows"
+;; denominator M is the header-INCLUSIVE row count (grid-rows == the shared
+;; row-plan's row count), never the candidate-only count a header-blind renderer
+;; would print.  And when the selection sits below a header, the scroll window
+;; still keeps it in view: the offset the grid returns brackets the selected row,
+;; and the folded window actually carries the selected candidate.  At these widths
+;; the grid lays out a single column, so each candidate is its own row and the two
+;; headers push the total to eight -- comfortably past the four-row cap.
+;; ======================================================================
+
+(define pager-group-plan (list (cons "directories" 3) (cons "files" 3)))
+(define pager-entries
+  (list (cons "directory-01/" '()) (cons "directory-02/" '()) (cons "directory-03/" '())
+        (cons "file-alpha-01" '()) (cons "file-beta-02"  '()) (cons "file-gamma-03" '())))
+(define pager-cols 24)
+(define pager-max-visible 4)
+
+;; Denominator counts headers: read grid-rows straight off the render and compare
+;; it to the shared row-plan, then confirm the DRAWN "N/M rows" carries that M.
+(let ([sp (open-output-string)])
+  (let-values ([(ml gc gr so)
+                (render-completion-grid sp pager-entries 0
+                                        pager-cols pager-max-visible pager-group-plan)])
+    (let ([plan (build-row-plan pager-group-plan gc)]
+          [raw (get-output-string sp)])
+      (test-equal "pager: the grid falls to a single column at this narrow width" 1 gc)
+      (test-equal "pager: grid-rows counts both header rows into the total (8)"
+        (row-plan-rows plan) gr)
+      (test-assert "pager: the header-inclusive total exceeds the visible cap (a pager draws)"
+        (> gr pager-max-visible))
+      (test-assert "pager: the drawn 'N/M rows' denominator is the header-inclusive count"
+        (contains-substring? raw
+          (string-append "/" (number->string (row-plan-rows plan)) " rows"))))))
+
+;; Scroll keeps a below-header selection visible: select the last file candidate
+;; (flat index 5, in the second group, below the files header), and confirm the
+;; returned scroll offset brackets its row-plan row and the folded window draws it.
+(let ([sp (open-output-string)])
+  (let-values ([(ml gc gr so)
+                (render-completion-grid sp pager-entries 5
+                                        pager-cols pager-max-visible pager-group-plan)])
+    (let* ([plan (build-row-plan pager-group-plan gc)]
+           [vis (min gr pager-max-visible)]
+           ;; The files header row: the SECOND col-0 cell the row-plan answers #f.
+           [files-header
+            (let loop ([r 0] [seen 0])
+              (cond
+                [(>= r (row-plan-rows plan)) #f]
+                [(not (row-plan-cell plan r 0))
+                 (if (= seen 1) r (loop (+ r 1) (+ seen 1)))]
+                [else (loop (+ r 1) seen)]))])
+      (let-values ([(srow scol) (row-plan-locate plan 5)])
+        (test-assert "pager: the selection sits below the files header"
+          (and files-header (> srow files-header)))
+        (test-assert "pager: a below-header selection forced the window to scroll"
+          (> so 0))
+        (test-assert "pager: yet the scroll window still brackets the selected row"
+          (and (>= srow so) (< srow (+ so vis))))))))
+
+;; End to end through the fold: the scrolled window opens on the files header
+;; (row-plan row 4), so the leading grid newline puts that header on folded row 1
+;; and the selected candidate (row-plan row 7) lands on folded row 4 -- its first
+;; glyph at column 2 (past the two-space indent), carrying the truecolour selection
+;; background.  $LS_COLORS is pinned unset so a dev palette cannot repaint the
+;; window; the selected cell's own background is the fixed highlight regardless.
+(let* ([scr (with-ls-colors #f
+              (lambda ()
+                (render->screen pager-cols
+                  (lambda (p)
+                    (render-completion-grid p pager-entries 5
+                                            pager-cols pager-max-visible pager-group-plan)))))]
+       [sel-cell (vterm-cell scr 4 2)])
+  (test-assert "pager: the scrolled window opens on the files header row"
+    (equal? "files" (vterm-row-text scr 1)))
+  (test-equal "pager: the selected below-header candidate is drawn in the visible window"
+    #\f (cell-glyph sel-cell))
+  (test-equal "pager: and the selected cell carries the truecolour selection background"
+    '(56 62 87) (cell-bg sel-cell)))
 
 (test-end)

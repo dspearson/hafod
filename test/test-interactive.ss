@@ -292,6 +292,18 @@
 (test-assert "REPL-06b: ansi-visible-length non-CSI escapes (ESC 7 / ESC 8)"
   (= (ansi-visible-length "\x1b;7\x1b;8") 0))
 
+;; A wide/CJK glyph is two display CELLS, not one codepoint: two CJK characters
+;; measure four cells.  A codepoint-counting implementation returns 2 here and
+;; fails -- the point of routing the visible length through the wcwidth oracle so
+;; the right prompt's column maths reserves the true rendered width.
+(test-assert "REPL-06b: ansi-visible-length counts wide-glyph cells not codepoints"
+  (= (ansi-visible-length "\x4e16;\x754c;") 4))
+
+;; A CJK-plus-ASCII mix sums the per-glyph cells (2 + 1 + 2 + 1 = 6), proving the
+;; else-arm adds each character's width rather than a flat one.
+(test-assert "REPL-06b: ansi-visible-length sums mixed wide and narrow cells"
+  (= (ansi-visible-length "\x4e16;a\x754c;b") 6))
+
 ;; === REPL-06c: Right prompt output contains ANSI save/restore cursor ===
 
 (test-assert "REPL-06c: right prompt to a non-TTY is plain text with no cursor escapes"

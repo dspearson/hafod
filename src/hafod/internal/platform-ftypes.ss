@@ -23,7 +23,7 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod internal platform-ftypes)
-  (export timespec stat-t dirent-t termios-t winsize-t)
+  (export timespec stat-t dirent-t termios-t winsize-t pollfd-t)
   (import (chezscheme))
 
   ;; struct timespec -- { time_t tv_sec; long tv_nsec; }; 16 bytes on every
@@ -123,4 +123,12 @@
   ;; four fields are present so `ftype-sizeof` equals SIZEOF-WINSZ (8).
   (define-ftype winsize-t
     (struct [ws_row unsigned-16] [ws_col unsigned-16]
-            [ws_xpixel unsigned-16] [ws_ypixel unsigned-16])))
+            [ws_xpixel unsigned-16] [ws_ypixel unsigned-16]))
+
+  ;; struct pollfd -- { int fd; short events; short revents; }, the descriptor
+  ;; array element poll(2) reads. ABI-identical on every supported platform (a
+  ;; plain int + two shorts, no padding quirks), so like winsize it needs no
+  ;; meta-cond. All three fields are present so `ftype-sizeof` is a full 8 bytes
+  ;; and Chez lands events/revents at offsets 4 and 6 with no hand arithmetic.
+  (define-ftype pollfd-t
+    (struct [fd integer-32] [events integer-16] [revents integer-16])))

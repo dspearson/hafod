@@ -58,7 +58,7 @@ seasonal shell.
   SRFIs that scsh bundled via Scheme 48 are available as
   `(import (hafod srfi-N))`
 - **Full scsh compatibility** -- 1:1 coverage of the scsh public API
-  (1,370 exported symbols); `(import (scsh))` works as an alias for
+  (1,388 exported symbols); `(import (scsh))` works as an alias for
   `(import (hafod))`; all scsh accessor names, predicates, char-sets,
   file-options, RE ADT layer, and version aliases
 
@@ -158,8 +158,8 @@ resolves the version from `git describe --tags`, falling back to the tracked
 To cut a release:
 
 ```sh
-git tag v1.9.2               # what `hafod --version` and the man page report
-printf '1.9.2\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
+git tag v1.12               # what `hafod --version` and the man page report
+printf '1.12\n' >| VERSION  # keep the fallback in step (>| ignores set -o noclobber)
 ```
 
 ## Installation
@@ -237,6 +237,11 @@ Any definitions or side effects take effect before the first REPL prompt:
 (fuzzy-finder? #f)         ; disable Ctrl-R/Ctrl-T/Alt-C fzf pickers
 (tab-completions? #f)      ; disable tab completion (Tab inserts literal tab)
 (history-expansion? #f)    ; disable !! !$ !n history expansion
+
+;; Opt-in interactive extras (default #f — set #t to enable)
+(completion-picker? #t)    ; route Tab through the full-screen fuzzy picker
+(command-correction? #t)   ; suggest "did you mean X?" for an unknown command head
+(transient-prompt? #t)     ; collapse a spent prompt to its exit-coloured ❯
 ```
 
 Pass `--no-config` (or `--norc`) to skip config loading.
@@ -473,8 +478,8 @@ hafod -s examples/01-system-info.ss
 
 ## Tests
 
-The test suite comprises 122 Scheme test suites (3,800+ assertions) and a
-108-test shell-based launcher test:
+The test suite comprises 211 Scheme test suites (5,700+ assertions) and a
+shell-based launcher test:
 
 ```sh
 make test                       # run all Scheme tests + launcher + umbrella
@@ -674,11 +679,14 @@ hafod adds several capabilities beyond the original scsh:
   - Alt-C: directory picker with `cd` on selection
   - Extended search syntax: `!negation`, `^prefix`, `.suffix`,
     `'exact`, terms separated by spaces (AND)
-- **Fish-style tab completion** -- multi-column grid layout with
-  arrow key navigation, coloured directories (blue with `/`),
-  muted indigo selection highlight, scrolling pager with row
-  indicator; falls back to single-column when descriptions are
-  present
+- **Fish-style tab completion** -- a multi-column grid with
+  arrow-key navigation, candidates grouped under category headers
+  (directories / files / commands / options) and coloured by type
+  from `LS_COLORS` (with a built-in default when unset), smart-case
+  and substring matching, a muted selection highlight, and a
+  scrolling pager with a row indicator; the grid drops to a single
+  aligned column only when a completer attaches per-item descriptions
+  (e.g. `kill` process lines)
 - **Fuzzy matching** -- Smith-Waterman DP scoring for completions
   and search, extended search syntax (`!prefix` negation, `^exact`
   anchoring, `.suffix`), Unicode normalisation (é→e, ñ→n),
@@ -690,12 +698,20 @@ hafod adds several capabilities beyond the original scsh:
   from any command's `--help`/man output (cached per command), and
   `~user` home-directory completion, with aligned description display
   in the completion menu; user-extensible via `register-completer!`
-- **Informative prompt** -- a one-call `enable-informative-prompt!`
-  preset composing a home-relative, fish-truncated path, a git segment
-  (branch, dirty/staged markers, ahead/behind counts), and a
-  right-hand prompt carrying a red exit-code badge and a command-timing
-  readout; every segment is overridable and 256-colour output is gated
-  on terminal capability
+- **Informative prompt (on by default)** -- a starship-style prompt
+  on a pluggable segment model (`register-prompt-segment!`, with
+  left / right / multi-line placement): a home-relative, fish-truncated
+  path, a git segment (branch, dirty/staged markers, ahead/behind),
+  per-language version segments (`via 🐍 v3.13` for ~10 toolchains,
+  detected from the cwd and extensible via `register-prompt-tool!`),
+  a command-timing readout, and an exit-code-coloured `❯` on its own
+  line (green on success, red on failure). Segment computation is
+  cached per-cwd (marker-file mtime keyed) and spawn-timeout-bounded,
+  so the prompt stays responsive; glyphs default to emoji with an
+  automatic ASCII fallback (a Nerd Font is never assumed). It is
+  enabled by default in the interactive REPL, gated so it never
+  clobbers a custom `set-prompt!` and never fires in a pipe or script;
+  `plain-shell!` or your own prompt turns it off
 - **Aliases & abbreviations** -- `alias`/`unalias` builtins (and the
   same forms from `init.ss`) that expand on execution, plus fish-style
   command-head abbreviations that expand as you type (Space/Enter) as a
@@ -703,6 +719,11 @@ hafod adds several capabilities beyond the original scsh:
 - **Auto-cd** -- typing a bare existing directory at the shell prompt
   changes into it, gated to shell mode and real directories (a command,
   builtin, alias, or binding always wins)
+- **Directory navigation** -- `cd <tab>` completes directories only
+  (following symlinks, not files), `cd ..`/`cd ../..` navigate to the
+  resolved parent, `cd -` and `cd -N` walk the directory stack, and
+  named directories (`~name`, via `register-named-directory!`) and
+  `$CDPATH` targets are reachable and tab-completable
 - **Directory frecency** -- `z`/`zi` for a zoxide-style jump to a
   frequently/recently visited directory, ranked by a frecency score
   over a persistent, owner-only SQLite visit database updated on `cd`
@@ -757,8 +778,8 @@ To port a scsh script to hafod:
 3. `|` works as-is in scripts run via `hafod -s`; use `pipe` only if
    loading as an R6RS library in bare Chez
 4. Change error handlers: `with-handler` → `guard`
-5. Most scripts work unchanged -- 1,370 scsh-compatible symbols are
-   exported, including SRFI-1 and SRFI-13 at the top level
+5. Most scripts work unchanged -- 1,388 symbols are exported,
+   including SRFI-1 and SRFI-13 at the top level
 
 ## Performance
 

@@ -85,6 +85,9 @@
     ;; fcntl
     posix-fcntl
 
+    ;; poll(2) readiness deadline
+    fd-wait-readable
+
     ;; Supplementary groups
     posix-getgroups
 

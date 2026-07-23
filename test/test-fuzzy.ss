@@ -321,4 +321,48 @@
     ;; "ab" should come first (shorter)
     (string=? (car result) "ab")))
 
+;; ======================================================================
+;; Smart case, both directions -- each pins a direction a naive matcher breaks
+;; ======================================================================
+;; These are discriminating by construction: no single wrong matcher passes
+;; them all.  An all-lowercase query matches case-insensitively (a
+;; case-sensitive-always matcher returns #f); a query carrying any uppercase
+;; letter matches case-sensitively (a case-insensitive-always matcher returns a
+;; number where these expect #f).
+
+;; Lowercase query, uppercase candidate: matches.  Fails case-sensitive-always.
+(test-assert "smart case: a lowercase query matches an uppercase candidate"
+  (number? (fuzzy-score "read" "READLINE")))
+
+;; All-uppercase query, lowercase candidate: no match.  Fails
+;; case-insensitive-always.
+(test-assert "smart case: an all-caps query rejects a lowercase candidate"
+  (not (fuzzy-score "READ" "readline")))
+
+;; A single uppercase letter is enough to make the whole query case-sensitive.
+(test-assert "smart case: one uppercase letter makes the query case-sensitive"
+  (not (fuzzy-score "Read" "readline")))
+
+;; Substring / partial word: a lowercase infix matches inside a longer word.
+(test-assert "smart case: a lowercase infix query matches a longer candidate"
+  (number? (fuzzy-score "line" "readline")))
+
+;; ======================================================================
+;; Ranking: an exact prefix outranks a mid-word match
+;; ======================================================================
+;; "foobar" is a prefix match; "xfoo" is mid-word and STRICTLY SHORTER, yet the
+;; prefix ranks first.  A length-only or an input-order tiebreak would put the
+;; shorter, earlier "xfoo" ahead -- this pins that ranking cannot regress to
+;; either.
+(test-equal "ranking: an exact prefix outranks a shorter mid-word match"
+  '("foobar" "xfoo")
+  (map car (fuzzy-filter/positions "foo" '("xfoo" "foobar"))))
+
+;; The raw scores back the ordering: the prefix scores strictly above the
+;; mid-word candidate.
+(test-assert "ranking: a prefix scores strictly higher than a mid-word match"
+  (let ([prefix (fuzzy-score "foo" "foobar")]
+        [mid-word (fuzzy-score "foo" "xfoo")])
+    (and prefix mid-word (> prefix mid-word))))
+
 (test-end)

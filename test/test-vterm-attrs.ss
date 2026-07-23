@@ -42,6 +42,9 @@
               render-line render-line/selection render-completion-grid)
         (only (hafod editor editor) read-expression)
         (hafod editor gap-buffer)
+        ;; Pin $LS_COLORS around the colour-target grid drive so a non-selected
+        ;; candidate's colour is deterministic (dev box vs CI).
+        (only (hafod environment) with-env* setenv)
         (chezscheme))
 
 ;; ======================================================================
@@ -81,6 +84,22 @@
       [(null? lines) #f]
       [(contains-substring? (car lines) needle) #t]
       [else (loop (cdr lines))])))
+
+;; Pin $LS_COLORS around a colour-target grid drive so a candidate's colour is
+;; the palette under test, never the box's ambient value.  A #f pin UNSETS via
+;; setenv (the built-in default palette resolves) -- NOT a with-env* #f delta,
+;; which would route the unset through the C setenv, whose string arg cannot take
+;; #f.  A string pin installs an override.  The ambient value is restored either
+;; way.  The grid here passes no threaded type, so the pin only neutralises the
+;; ambient value: the selected cell takes the selection colour regardless.
+(define (with-ls-colors pin thunk)
+  (if pin
+      (with-env* (list (cons "LS_COLORS" pin)) thunk)
+      (let ([saved (getenv "LS_COLORS")])
+        (dynamic-wind
+          (lambda () (setenv "LS_COLORS" #f))
+          thunk
+          (lambda () (setenv "LS_COLORS" saved))))))
 
 (test-begin "vterm-attrs")
 
@@ -134,9 +153,11 @@
 
 ;; Two candidates, the first selected: its cell gets sel-bg/sel-fg.  "foo"
 ;; truncates to "fo…" after a two-space indent, so the "f" lands at column 2.
-(let* ([scr (render->screen 40
-              (lambda (p)
-                (render-completion-grid p '(("foo" ()) ("bar" ())) 0 40 10)))]
+(let* ([scr (with-ls-colors #f
+              (lambda ()
+                (render->screen 40
+                  (lambda (p)
+                    (render-completion-grid p '(("foo" ()) ("bar" ())) 0 40 10)))))]
        [sel-cell (vterm-cell scr 1 2)]
        [blank-cell (vterm-cell scr 0 0)])
   (test-equal "background: the selected candidate glyph is f"

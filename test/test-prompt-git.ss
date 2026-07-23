@@ -11,7 +11,11 @@
         (test runner)
         (only (hafod interactive)
               parse-git-porcelain-v2 prompt-git-segment prompt-colour-ok?
-              sanitize-control)
+              sanitize-control
+              ;; The CACHED, spawn-timeout-bounded segment -- the one the default
+              ;; prompt actually draws -- plus the collector behind it and its
+              ;; deadline knob, for the large-working-tree proof at the end.
+              cached-git-segment with-spawn-timeout prompt-spawn-timeout-ms)
         (only (hafod environment) getenv setenv)
         (only (hafod fileinfo) create-directory)
         (only (hafod syntax) run run/strings)
@@ -326,5 +330,53 @@
               (test-equal "segment: outside a repo is empty"
                 "" (prompt-git-segment))))))
       (lambda () (run (rm "-rf" ,dir))))))
+
+;; === A large working tree still renders its branch (the cached, bounded path) ===
+;;
+;; The default prompt draws cached-git-segment, which renders `git status
+;; --porcelain=v2 --branch` through the bounded collector, maps a cut-short read
+;; to "", and then CACHES that "" against the HEAD/index stamp -- so the segment
+;; stays gone until the stamp moves.  A byte ceiling applied inside the collector
+;; and reported as a timeout therefore deleted the segment outright on any tree
+;; with a few hundred changed or untracked entries: porcelain v2 costs roughly
+;; 150 bytes apiece, so an ordinary bulk reformat, a vendored drop or an
+;; unignored build directory clears 64 KB.  The branch header the renderer needs
+;; sits at the very front of the capture, so nothing about the answer was
+;; actually missing.
+;;
+;; The fixture plants 340 untracked files with 200-character names -- some 70 KB
+;; of porcelain, asserted here so the proof cannot quietly go vacuous if the
+;; padding or the format changes.  The deadline is raised well clear of the
+;; default 150 ms so the wall clock cannot be what cuts the read short: the only
+;; thing on trial is the byte count.
+(when git-present?
+  (with-temp-git-repo
+    (lambda ()
+      (setup-clean)
+      ;; One shell loop and one long name prefix: 340 x ~205 bytes of `? <path>`.
+      (let ([pad (make-string 200 #\u)])
+        (run (sh "-c" ,(string-append "i=0; while [ $i -lt 340 ]; do : > \""
+                                      pad "$i\"; i=$((i+1)); done")))))
+    (lambda ()
+      (let ([old-pwd (getenv "PWD")])
+        (dynamic-wind
+          ;; cached-git-segment keys on the LOGICAL cwd; with PWD unset that is
+          ;; the real one, which with-temp-git-repo has already made the fixture.
+          (lambda () (setenv "PWD" #f))
+          (lambda ()
+            (parameterize ([assume-terminal-caps 'off]
+                           [prompt-spawn-timeout-ms 10000])
+              (let-values ([(out timed-out?)
+                            (with-spawn-timeout
+                              "git"
+                              '("git" "status" "--porcelain=v2" "--branch")
+                              10000)])
+                (test-assert "fixture: the porcelain payload really exceeds 64 KB"
+                  (> (string-length out) 65536))
+                (test-assert "collector: a large porcelain read is not a timeout"
+                  (not timed-out?)))
+              (test-assert "segment: a large working tree still shows its branch"
+                (string-contains? (cached-git-segment) "master"))))
+          (lambda () (setenv "PWD" old-pwd)))))))
 
 (test-end)

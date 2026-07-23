@@ -423,6 +423,24 @@
     ;; unexported here -- a test reaches them via (only (hafod interactive) ...).
     enable-informative-prompt! prompt-git-segment prompt-path-segment prompt-exit-segment
     prompt-timing-segment prompt-colour-ok? prompt-timing-threshold
+    ;; Pluggable prompt segment model: the ordered segment list, register / clear,
+    ;; the informative-prompt opt-out, and the spawn deadline -- the public knobs an
+    ;; init.ss composes a prompt from.  The leaf renderers, ctx builder, cache, guard
+    ;; (prompt-customised?, should-install-default-prompt?) and white-box seams stay
+    ;; unexported here -- a test reaches them via (only (hafod interactive) ...).
+    prompt-segments register-prompt-segment! clear-prompt-segments!
+    informative-prompt? prompt-spawn-timeout-ms
+    ;; Per-language version tools: the ordered tool registry, the positional entry
+    ;; point an init.ss calls to add a language version segment, its named removal
+    ;; counterpart, the whole-registry clear, the one accessor that makes the
+    ;; exported list readable, and the Nerd-Font opt-in the tool comments tell a
+    ;; user to set.  The prompt-tool constructor and its other field accessors stay
+    ;; leaf -- a test reaches them via (only (hafod interactive) ...).
+    ;; prompt-versions? is the group's own opt-out (mirrored by a falsy
+    ;; HAFOD_PROMPT_VERSIONS), so a user can stop a cd into an untrusted
+    ;; repository running its toolchains without giving up the whole prompt.
+    register-prompt-tool! unregister-prompt-tool! prompt-tools
+    clear-prompt-tools! prompt-tool-name nerd-glyphs? prompt-versions?
     ;; Shell mode re-exports from interactive
     rebuild-path-cache! classify-input
     ;; Feature toggles from interactive
@@ -432,13 +450,16 @@
     default-aliases?
 
     ;; === (hafod terminal-caps) ===
-    ansi-ok? colour-ok?
+    ;; colour-depth / glyph-tier: the capability-tier verdicts a prompt or version
+    ;; segment consults to pick colours (truecolor / 256 / 16 / mono) and glyphs
+    ;; (emoji / ascii).  glyph-tier-override stays a leaf-only test/opt-out seam.
+    ansi-ok? colour-ok? colour-depth glyph-tier
 
     ;; === (hafod shell classifier) ===
     path-cache scheme-prefix-chars
 
     ;; === (hafod shell parser) ===
-    parse-shell-command
+    parse-shell-command register-named-directory!
 
     ;; === (hafod shell history-expand) ===
     history-expand
@@ -518,7 +539,8 @@
     editor-history-entries
     editor-finder-proc
     ;; Feature toggles from editor
-    fuzzy-finder? tab-completions? abbr-expand? history-search-mode
+    fuzzy-finder? tab-completions? completion-picker? abbr-expand? history-search-mode
+    command-correction? transient-prompt?
 
     ;; === (hafod config) ===
     xdg-config-home hafod-config-dir hafod-init-file

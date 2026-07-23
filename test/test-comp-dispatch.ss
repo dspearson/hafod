@@ -12,10 +12,13 @@
 (library-directories '(("src" . "src") ("." . ".")))
 (import (test runner)
         (test vterm)
-        (only (hafod editor editor) read-expression)
+        (only (hafod editor editor) read-expression completion-normalise)
         (only (hafod terminal-caps) assume-terminal-caps)
         (only (hafod shell completers) command-flag-source register-completer!)
         (only (hafod posix) posix-getpwuid posix-getuid passwd-info-name)
+        (only (hafod process-state) pid)
+        (only (hafod fileinfo) create-directory)
+        (only (hafod syntax) run)
         (chezscheme))
 
 (test-begin "comp-dispatch")
@@ -174,5 +177,188 @@
          (contains-substring? result (string #\Q #\x09 #\W #\e #\n #\d))))
   (test-assert "dispatch: the same candidate is shown in the menu with the byte stripped"
     (contains-substring? captured "QWen")))
+
+;; ======================================================================
+;; (e) A dir-only command never leaks a file on an empty completer result.
+;; cd / pushd / rmdir complete directories only, so when the directory completer
+;; finds no match the editor must show nothing rather than fall through to the
+;; filename list.  The fixture holds a file whose name the typed prefix
+;; fuzzy-matches but no matching directory: a pre-guard tree falls back and
+;; inserts the file (the submitted line grows), while the guarded editor leaves
+;; the typed text byte-for-byte -- so the assertion is non-vacuous.  Absolute
+;; paths in the key string keep the drive independent of the process cwd.
+;; ======================================================================
+
+(define (dispatch-temp-root tag)
+  (string-append (or (getenv "TMPDIR") "/tmp")
+                 "/hafod-comp-dispatch-" tag "-"
+                 (number->string (pid)) "-"
+                 (number->string (random 1000000))))
+
+(let ([root (dispatch-temp-root "dironly")])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (run (sh "-c" ,(string-append "echo hi > " root "/widget")))
+      (let-values ([(captured result)
+                    (drive-capture+result
+                      (string-append "cd " root "/widge" TAB))])
+        (test-assert "dispatch: cd with only a file match inserts nothing"
+          (and (string? result)
+               (string=? result (string-append "cd " root "/widge"))))
+        (test-assert "dispatch: the unmatched filename never reaches the menu"
+          (not (contains-substring? captured "widget")))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; A real directory still completes through the same guarded path, so the guard
+;; suppresses only the empty-result file fallback and not directory completion.
+(let ([root (dispatch-temp-root "dirmatch")])
+  (create-directory root)
+  (create-directory (string-append root "/subdir"))
+  (dynamic-wind
+    void
+    (lambda ()
+      (let-values ([(captured result)
+                    (drive-capture+result
+                      (string-append "cd " root "/sub" TAB))])
+        (test-assert "dispatch: cd still completes a real directory (trailing slash)"
+          (and (string? result)
+               (contains-substring? result "subdir/")))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; ======================================================================
+;; (f) The sink normalises the flat-vs-grouped completer shape ONCE.
+;; completion-normalise is the single point every menu path funnels through: it
+;; infers an untagged candidate's group in a fixed order, threads each candidate's
+;; file type, flattens an explicit grouping in its given order with every label
+;; escape-stripped, and keeps the no-description path a length-n list of #f so the
+;; live menu's column count cannot silently flip.  These are direct calls -- no
+;; terminal, no drive.  A pre-normalise tree lacks the export, so the whole suite
+;; fails to load -- the additions are non-vacuous, and the reorder assertions below
+;; would also fail any flat pass-through.
+;; ======================================================================
+
+;; A fake PATH set: only these bare names read as commands.
+(define (stub-command? nm) (and (member nm '("grepcmd" "gzipcmd")) #t))
+
+;; Flat mixed input, deliberately given in a NON-grouped order (command, file,
+;; directory): the sink must regroup it into the fixed directories < files <
+;; commands order, threading each candidate's colour type in lockstep.
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (cons "grepcmd" '(0))          ; command -- a bare pair
+                      (list "notes.txt" '(0) 'file)  ; file -- a typed triple
+                      (list "src/" '(0) 'dir))       ; directory -- a typed triple
+                #f stub-command?)])
+  (test-equal "sink: flat candidates regroup into directories < files < commands"
+    '("src/" "notes.txt" "grepcmd") names)
+  (test-equal "sink: the group-plan headers follow that fixed order"
+    '(("directories" . 1) ("files" . 1) ("commands" . 1)) plan)
+  (test-equal "sink: each candidate's colour type rides through in group order"
+    '(dir file file) types))
+
+;; An explicit grouping flattens in the completer's GIVEN order, each group keeping
+;; its label and count.
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (cons "git branches" (list (cons "main" '(0)) (cons "dev" '(0))))
+                      (cons "tags" (list (cons "v1" '(0)))))
+                #f stub-command?)])
+  (test-equal "sink: an explicit grouping flattens in the completer's given order"
+    '("main" "dev" "v1") names)
+  (test-equal "sink: each labelled group keeps its label and count, in order"
+    '(("git branches" . 2) ("tags" . 1)) plan))
+
+;; A lone inferred group draws no header (a #f label) and preserves input order.
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (cons "gzipcmd" '(0)) (cons "grepcmd" '(0)))
+                #f stub-command?)])
+  (test-equal "sink: a lone inferred group takes a #f label (no header)"
+    '((#f . 2)) plan)
+  (test-equal "sink: a one-group flat result preserves input order byte-for-byte"
+    '("gzipcmd" "grepcmd") names))
+
+;; A group label carrying a control byte is escape-stripped in the group-plan
+;; before it can reach the menu.
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (cons (string #\r #\e #\m #\x07 #\o #\t #\e)
+                            (list (cons "origin" '(0)))))
+                #f stub-command?)])
+  (test-equal "sink: a group label carrying a control byte is escape-stripped"
+    '(("remote" . 1)) plan))
+
+;; The no-description path returns descs as a length-n list of #f, NEVER '() -- one
+;; slot per candidate is the sink's parallel-list contract.  The list being all #f
+;; is precisely what marks a completion as carrying no REAL description, so the menu
+;; tiles its candidates multi-column (see (g)); only a real description string forces
+;; the aligned single-column layout.
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (list "a.txt" '(0) 'file) (list "b.txt" '(0) 'file))
+                #f stub-command?)])
+  (test-equal "sink: the no-description path returns a length-n list of #f (not '())"
+    '(#f #f) descs))
+
+;; With descriptions present, they permute into the group sort in lockstep with the
+;; candidates (here a directory is pulled ahead of a file).
+(let-values ([(names positions descs types plan)
+              (completion-normalise
+                (list (list "zzz.txt" '(0) 'file) (list "adir/" '(0) 'dir))
+                (list "file-desc" "dir-desc")
+                stub-command?)])
+  (test-equal "sink: candidates sort directories before files"
+    '("adir/" "zzz.txt") names)
+  (test-equal "sink: descriptions permute in lockstep with the group sort"
+    '("dir-desc" "file-desc") descs))
+
+;; ======================================================================
+;; (g) The live apply-completions! -> render-with-menu -> grid path tiles a
+;; no-description completion across the row.  Every other suite drives
+;; render-completion-grid directly, so this seam is otherwise unpinned.  Two plain
+;; files (both file type -> one header-free files group, no descriptions) are
+;; completed through the real read-expression, and with no real description the
+;; folded menu packs BOTH candidates onto one row -- the fish/zsh-style multi-column
+;; layout.  The sink's all-#f description list is NOT a description signal: only a
+;; real description string collapses the grid to a single aligned column.
+;;
+;; The two candidates share the prefix "alp" but diverge after it, and the grid
+;; always ellipsis-truncates its longest name, so the count -- not the full name --
+;; is the reliable signal: a menu row is one holding "alp" but not the "xyzzy" of
+;; the edit line, and the tiled layout yields exactly ONE such row.  The drive runs
+;; with the temp dir as the working directory so the candidates are short relative
+;; names the grid never has to truncate near the marker; the directory is restored
+;; immediately afterwards.
+;; ======================================================================
+
+(let ([root (dispatch-temp-root "cols")]
+      [saved (current-directory)])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (run (sh "-c" ,(string-append "touch " root "/alpha " root "/alpine")))
+      (let* ([captured
+              (dynamic-wind
+                (lambda () (current-directory root))
+                (lambda () (drive-capture (string-append "xyzzy alp" TAB)))
+                (lambda () (current-directory saved)))]
+             [vt (make-vterm 80)]
+             [_ (vterm-feed! vt captured)]
+             [menu-row?
+              (lambda (r)
+                (let ([t (vterm-row-text vt r)])
+                  (and (contains-substring? t "alp")
+                       (not (contains-substring? t "xyzzy")))))]
+             [menu-rows
+              (let loop ([r 0] [acc '()])
+                (if (>= r (vterm-rows vt))
+                    (reverse acc)
+                    (loop (+ r 1) (if (menu-row? r) (cons r acc) acc))))])
+        (test-equal "sink: a no-description completion tiles multi-column (both files on one row)"
+          1 (length menu-rows))))
+    (lambda () (run (rm "-rf" ,root)))))
 
 (test-end)

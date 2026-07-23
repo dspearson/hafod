@@ -22,7 +22,8 @@
 ;;; Copyright (c) 2026, hafod contributors.
 
 (library (hafod terminal-caps)
-  (export assume-terminal-caps ansi-ok? colour-ok? colour-override)
+  (export assume-terminal-caps ansi-ok? colour-ok? colour-override
+          colour-depth glyph-tier glyph-tier-override)
 
   ;; Exclude Chez's getenv so the environment one -- which is presence-aware and
   ;; tracks the Scheme-side environment -- is used for the TERM/NO_COLOR reads.
@@ -130,5 +131,76 @@
             [(getenv "NO_COLOR") #f]      ; (2) presence beats CLICOLOR_FORCE
             [(clicolor-force?)   #t]      ; (3) CLICOLOR_FORCE forces (value-checked)
             [else (ansi-ok? target)])])])); (4) byte-identical auto path
+
+  ;; ======================================================================
+  ;; Capability tiers: how rich is this terminal?
+  ;;
+  ;; A prompt segment (the exit-coloured input glyph, a per-language version
+  ;; segment) consults these verdicts to pick colours and glyphs, so the prompt
+  ;; degrades cleanly on a weak terminal without each segment re-deriving the
+  ;; COLORTERM/TERM parsing.
+  ;; ======================================================================
+
+  ;; Does term carry the literal substring "256color"?  A tiny self-contained
+  ;; scan -- terminal-caps deliberately imports next to nothing, so we do not
+  ;; pull in a whole string library for one lookup.
+  (define (has-256color? term)
+    (let* ([needle "256color"]
+           [m (string-length needle)]
+           [n (string-length term)])
+      (and (>= n m)
+           (let scan ([i 0])
+             (and (<= (+ i m) n)
+                  (or (let match ([j 0])
+                        (or (= j m)
+                            (and (char=? (string-ref term (+ i j))
+                                         (string-ref needle j))
+                                 (match (+ j 1)))))
+                      (scan (+ i 1))))))))
+
+  ;; colour-depth: the colour tier of target -- 'truecolor / '256 / '16 / 'mono.
+  ;; It DEFERS to colour-ok? first, so 'mono falls out of the LOCKED precedence
+  ;; for free: a non-tty, NO_COLOR, colour-override 'never, or assume-terminal-caps
+  ;; 'off all fold to 'mono without this procedure re-deriving any of that.  Only
+  ;; once colour is allowed does it read COLORTERM/TERM for the depth:
+  ;;   COLORTERM "truecolor"/"24bit" -> 'truecolor (the 24-bit signal);
+  ;;   a *256color* TERM             -> '256;
+  ;;   any other colour-capable TERM -> '16 (also the no-signal fallback).
+  ;; This is a tier for CONSUMERS to pick colours from; it never downgrades the
+  ;; existing segments, which keep emitting their 256-colour SGR -- a subset
+  ;; every non-mono terminal renders.
+  (define (colour-depth target)
+    (if (not (colour-ok? target))
+        'mono
+        (let ([ct (getenv "COLORTERM")]
+              [term (or (getenv "TERM") "")])
+          (cond
+            [(and ct (or (string=? ct "truecolor") (string=? ct "24bit"))) 'truecolor]
+            [(has-256color? term) '256]
+            [else '16]))))
+
+  ;; glyph-tier-override: a default-off seam a test or an opt-out flips to
+  ;; 'ascii to force the ascii glyph tier PTY-free -- the same class of override
+  ;; as assume-terminal-caps / colour-override, and, like them, NOT an umbrella
+  ;; member (a test/opt-out knob, not a public verdict).
+  (define glyph-tier-override (make-parameter #f))
+
+  ;; glyph-tier: the glyph tier of the terminal -- 'emoji (the default) or
+  ;; 'ascii.  Emoji support CANNOT be probed from an escape or an env var, so
+  ;; the default is 'emoji and 'ascii is ONLY ever the fallback on a terminal
+  ;; known to render emoji poorly (TERM=linux -- the Linux console -- or
+  ;; TERM=dumb) or an explicit opt-out (the glyph-tier-override seam, or a set
+  ;; HAFOD_ASCII env var, presence-checked).  A Nerd Font is NEVER assumed here:
+  ;; richer glyphs are an explicit opt-in, never a default.  Unlike colour-depth
+  ;; this is a verdict about the terminal, not a specific port, so it takes no
+  ;; target -- and it is INDEPENDENT of colour-depth (a colour tty need not be a
+  ;; glyph tty; TERM=linux is 16-colour yet ascii-glyph).
+  (define (glyph-tier)
+    (let ([term (or (getenv "TERM") "")])
+      (cond
+        [(eq? (glyph-tier-override) 'ascii) 'ascii]
+        [(getenv "HAFOD_ASCII") 'ascii]
+        [(or (string=? term "linux") (string=? term "dumb")) 'ascii]
+        [else 'emoji])))
 
   ) ; end library

@@ -409,4 +409,96 @@
       (render-line sp "> " (buffer-from "(+ 1 2)") 0 80)
       (has-csi? (get-output-string sp)))))
 
+;; ======================================================================
+;; colour-depth: the truecolor / 256 / 16 / mono capability tier a prompt
+;; segment (the exit-coloured input glyph, a per-language version segment)
+;; reads to pick its SGR.  It DEFERS to colour-ok? first, so the mono verdict
+;; inherits the locked NO_COLOR / colour-override / assume-terminal-caps
+;; precedence rather than re-deriving it; only when colour is allowed does it
+;; read COLORTERM / TERM for the depth.  A fresh unset baseline for every
+;; variable it reads (setenv #f, never a with-env* #f delta); colour is forced
+;; on for the non-mono rows with CLICOLOR_FORCE=1 so the depth is provable
+;; PTY-free (no real tty on fd 1 needed).
+;; ======================================================================
+
+(setenv "TERM" #f)
+(setenv "COLORTERM" #f)
+(setenv "NO_COLOR" #f)
+(setenv "CLICOLOR_FORCE" #f)
+
+;; truecolor: COLORTERM=truecolor and =24bit are the 24-bit signal.  The
+;; TERM=xterm-256color alongside proves COLORTERM is read FIRST -- a
+;; COLORTERM-blind verdict would mis-report '256 here.
+(test-assert "colour-depth: COLORTERM=truecolor -> 'truecolor (COLORTERM beats a 256 TERM)"
+  (with-env* '(("CLICOLOR_FORCE" . "1") ("COLORTERM" . "truecolor") ("TERM" . "xterm-256color"))
+    (lambda () (eq? 'truecolor (colour-depth 1)))))
+(test-assert "colour-depth: COLORTERM=24bit -> 'truecolor"
+  (with-env* '(("CLICOLOR_FORCE" . "1") ("COLORTERM" . "24bit"))
+    (lambda () (eq? 'truecolor (colour-depth 1)))))
+
+;; 256: a *256color* TERM with no COLORTERM.
+(test-assert "colour-depth: TERM=xterm-256color (no COLORTERM) -> '256"
+  (with-env* '(("CLICOLOR_FORCE" . "1") ("TERM" . "xterm-256color"))
+    (lambda () (eq? '256 (colour-depth 1)))))
+
+;; 16: a plain colour TERM, no COLORTERM, not a 256 TERM.
+(test-assert "colour-depth: TERM=xterm (plain colour) -> '16"
+  (with-env* '(("CLICOLOR_FORCE" . "1") ("TERM" . "xterm"))
+    (lambda () (eq? '16 (colour-depth 1)))))
+
+;; 16 fallback: colour allowed (assume-terminal-caps 'on) but NO depth signal
+;; at all -> the conservative colour tier, never mono.
+(test-assert "colour-depth: assume 'on, no COLORTERM/TERM -> '16 (colour allowed, no depth signal)"
+  (parameterize ([assume-terminal-caps 'on])
+    (eq? '16 (colour-depth 1))))
+
+;; mono via the locked precedence -- each proves colour-depth reuses colour-ok?
+;; rather than reading COLORTERM directly (a truecolor COLORTERM is present but
+;; ignored because colour is not allowed; a colour-ok?-blind verdict fails).
+(test-assert "colour-depth: NO_COLOR present -> 'mono (beats a truecolor COLORTERM)"
+  (with-env* '(("NO_COLOR" . "1") ("COLORTERM" . "truecolor"))
+    (lambda () (eq? 'mono (colour-depth 1)))))
+(test-assert "colour-depth: assume-terminal-caps 'off -> 'mono (beats CLICOLOR_FORCE + COLORTERM)"
+  (parameterize ([assume-terminal-caps 'off])
+    (with-env* '(("CLICOLOR_FORCE" . "1") ("COLORTERM" . "truecolor"))
+      (lambda () (eq? 'mono (colour-depth 1))))))
+(test-assert "colour-depth: colour-override 'never -> 'mono (beats CLICOLOR_FORCE + COLORTERM)"
+  (parameterize ([colour-override 'never])
+    (with-env* '(("CLICOLOR_FORCE" . "1") ("COLORTERM" . "truecolor"))
+      (lambda () (eq? 'mono (colour-depth 1))))))
+
+;; ======================================================================
+;; glyph-tier: the emoji / ascii verdict a segment reads to pick its glyph.
+;; Emoji support CANNOT be probed, so the default is 'emoji and 'ascii is only
+;; ever the fallback on a known-poor glyph terminal (TERM=linux/dumb) or an
+;; explicit opt-out (the HAFOD_ASCII env var, or the glyph-tier-override seam)
+;; -- a Nerd Font is NEVER assumed.  It is INDEPENDENT of colour-depth: a
+;; colour tty is not necessarily a glyph tty (TERM=linux is 16-colour but a
+;; tofu-prone glyph tty).  A fresh unset baseline for the variables it reads.
+;; ======================================================================
+
+(setenv "TERM" #f)
+(setenv "HAFOD_ASCII" #f)
+
+(test-assert "glyph-tier: TERM=xterm-256color -> 'emoji (the default; emoji cannot be probed)"
+  (with-env* '(("TERM" . "xterm-256color")) (lambda () (eq? 'emoji (glyph-tier)))))
+(test-assert "glyph-tier: TERM=linux -> 'ascii (a known-poor glyph tty)"
+  (with-env* '(("TERM" . "linux")) (lambda () (eq? 'ascii (glyph-tier)))))
+(test-assert "glyph-tier: TERM=dumb -> 'ascii"
+  (with-env* '(("TERM" . "dumb")) (lambda () (eq? 'ascii (glyph-tier)))))
+(test-assert "glyph-tier: HAFOD_ASCII set -> 'ascii (explicit opt-out, even under a capable TERM)"
+  (with-env* '(("TERM" . "xterm-256color") ("HAFOD_ASCII" . "1"))
+    (lambda () (eq? 'ascii (glyph-tier)))))
+(test-assert "glyph-tier: glyph-tier-override 'ascii forces 'ascii (the PTY-free opt-out/test seam)"
+  (with-env* '(("TERM" . "xterm-256color"))
+    (lambda () (parameterize ([glyph-tier-override 'ascii]) (eq? 'ascii (glyph-tier))))))
+
+;; Independence: TERM=linux is a 16-colour tty but a poor glyph tty -- the two
+;; tiers are decided separately, so a glyph verdict that leaned on colour-depth
+;; would wrongly agree here.  Colour forced on so colour-depth reads TERM=linux
+;; as '16 rather than folding to 'mono on a non-tty fd 1.
+(test-assert "glyph-tier independent of colour-depth: TERM=linux -> colour '16 but glyph 'ascii"
+  (with-env* '(("CLICOLOR_FORCE" . "1") ("TERM" . "linux"))
+    (lambda () (and (eq? '16 (colour-depth 1)) (eq? 'ascii (glyph-tier))))))
+
 (test-end)

@@ -6,7 +6,14 @@
         ;; runner, mirroring the prompt-git integration harness.
         (only (hafod syntax) run run/strings)
         (only (hafod process-state) with-cwd* pid)
-        (only (hafod fileinfo) create-directory))
+        (only (hafod fileinfo) create-directory create-symlink)
+        ;; The dash-arm and named-directory / $CDPATH oracles drive the navigation
+        ;; seam the completion pairs with: run-builtin! grows the directory stack
+        ;; via pushd, register-named-directory! populates the named-directory table,
+        ;; and setenv points $CDPATH at a throwaway base.
+        (only (hafod shell builtins) run-builtin! dir-stack)
+        (only (hafod shell parser) register-named-directory!)
+        (only (hafod environment) setenv))
 
 (test-begin "Shell Completers")
 
@@ -179,6 +186,44 @@
           (exists (lambda (r) (string-contains? (car r) "stash@{")) stashes))
         (test-assert "git stash triple has a string description"
           (and (pair? stashes) (string? (caddr (car stashes)))))))))
+
+;; === Branch names offered by the branch-taking subcommands (git-presence gated) ===
+
+;; A repo carrying two extra local branches must offer every local branch --
+;; including the current one -- after each branch-taking subcommand.  This block
+;; is non-vacuous against the shipped pre-fix tree: there git-branches ran the
+;; %(refname:short) format through /bin/sh -c, whose unquoted parentheses abort
+;; with a syntax error, so the branch list came back empty and every assertion
+;; below failed on that tree.  Gated on a usable git so a git-less leg still
+;; passes, exactly as the git-object block above.
+(when git-present?
+  (with-temp-git-repo
+    (lambda ()
+      (setup-clean)
+      (run (git "branch" "feature-alpha"))
+      (run (git "branch" "release-beta")))
+    (lambda ()
+      (let ([checkout (git-completer "" '((args "checkout")))]
+            [sw (git-completer "" '((args "switch")))]
+            [merge (git-completer "" '((args "merge")))])
+        ;; Each result is a (name positions desc) triple, so assoc matches on the
+        ;; candidate branch name.
+        (test-assert "git checkout completion includes a created branch"
+          (assoc "feature-alpha" checkout))
+        (test-assert "git checkout completion includes a second created branch"
+          (assoc "release-beta" checkout))
+        ;; Every local branch is offered, the current one included.
+        (test-assert "git checkout completion includes the current branch"
+          (assoc "master" checkout))
+        ;; switch and merge take branches on the same arm.
+        (test-assert "git switch completion offers a branch"
+          (assoc "feature-alpha" sw))
+        (test-assert "git merge completion offers a branch"
+          (assoc "release-beta" merge))
+        ;; The branch triple's description tag is the literal "branch".
+        (test-assert "a branch triple carries the branch description tag"
+          (let ([t (assoc "feature-alpha" checkout)])
+            (and t (string=? (caddr t) "branch"))))))))
 
 ;; === ~user login -> home completer (unconditional) ===
 
@@ -379,5 +424,409 @@
       (let ([hit (exists (lambda (tr) (and (string=? (car tr) "--all") tr))
                          triples)])
         (and hit (string=? (caddr hit) "list all"))))))
+
+;; === Directory-only completion: cd / pushd / rmdir ===
+
+;; cd / pushd / rmdir share a directory-only completer registered through the
+;; same seam as git / ssh, so a directory operand completes to directories (and
+;; symlinks-to-directories) only, never plain files.
+
+(test-assert "cd completer registered"
+  (procedure? (lookup-completer "cd")))
+(test-assert "pushd completer registered"
+  (procedure? (lookup-completer "pushd")))
+(test-assert "rmdir completer registered"
+  (procedure? (lookup-completer "rmdir")))
+
+(test-assert "dir-only-command? holds for cd/pushd/rmdir and not for git"
+  (and (dir-only-command? "cd")
+       (dir-only-command? "pushd")
+       (dir-only-command? "rmdir")
+       (not (dir-only-command? "git"))))
+
+;; True when some triple in RESULTS carries NAME as its candidate name.
+(define (offers? results name)
+  (exists (lambda (r) (string=? (car r) name)) results))
+
+;; Build a throwaway tree with BUILDER (handed the absolute root), run THUNK with
+;; that tree as the working directory, then remove the tree.  BUILDER runs before
+;; the cwd switch, so it populates the tree through absolute paths.
+(define (with-dir-fixture tag builder thunk)
+  (let ([dir (temp-dir-name tag)])
+    (create-directory dir)
+    (dynamic-wind
+      void
+      (lambda () (builder dir) (with-cwd* dir thunk))
+      (lambda () (run (rm "-rf" ,dir))))))
+
+;; A tree holding a real subdirectory, a symlink to that directory, a plain file
+;; and a symlink to that file.  The completer offers the directory and the
+;; symlink-to-directory -- each with a trailing "/" and no "@" -- and never the
+;; plain file nor the symlink-to-file.  A files-included implementation fails on
+;; the plain file; an lstat/nofollow implementation fails on the symlink-to-dir.
+(with-dir-fixture "dirs"
+  (lambda (root)
+    (create-directory (string-append root "/sub"))
+    (run (sh "-c" ,(string-append "echo hi > " root "/f")))
+    (create-symlink "sub" (string-append root "/dlink"))
+    (create-symlink "f" (string-append root "/flink")))
+  (lambda ()
+    (let ([results (cd-completer "" '((args)))])
+      (test-assert "cd offers a real subdirectory with a trailing slash"
+        (offers? results "sub/"))
+      (test-assert "cd follows a symlink-to-directory (trailing slash)"
+        (offers? results "dlink/"))
+      (test-assert "cd never offers a plain file"
+        (not (offers? results "f")))
+      (test-assert "cd never offers a symlink-to-file"
+        (not (offers? results "flink")))
+      (test-assert "a completed directory carries a trailing slash, not a bare name"
+        (not (offers? results "sub")))
+      (test-assert "a symlink-to-directory carries a slash, not an @ marker"
+        (and (not (offers? results "dlink"))
+             (not (offers? results "dlink@"))))
+      (test-assert "every cd candidate is a (name positions desc) triple"
+        (for-all (lambda (r)
+                   (and (list? r) (= (length r) 3)
+                        (string? (car r)) (list? (cadr r))
+                        (string? (caddr r))))
+                 results)))))
+
+;; Smart-hidden: a dot-directory is offered only when the typed base begins with
+;; a dot, matching the zsh default.
+(with-dir-fixture "hidden"
+  (lambda (root)
+    (create-directory (string-append root "/.hidden"))
+    (create-directory (string-append root "/shown")))
+  (lambda ()
+    (test-assert "cd omits a dot-directory for a non-dot prefix"
+      (not (offers? (cd-completer "" '((args))) ".hidden/")))
+    (test-assert "cd offers a visible directory for the empty prefix"
+      (offers? (cd-completer "" '((args))) "shown/"))
+    (test-assert "cd offers a dot-directory when the prefix starts with a dot"
+      (offers? (cd-completer "." '((args))) ".hidden/"))))
+
+;; No-match on a files-only tree: the completer itself contributes nothing (the
+;; editor guard then renders no menu rather than falling back to files).
+(with-dir-fixture "filesonly"
+  (lambda (root)
+    (run (sh "-c" ,(string-append "echo hi > " root "/widget")))
+    (run (sh "-c" ,(string-append "echo hi > " root "/gadget"))))
+  (lambda ()
+    (test-assert "cd yields nothing when only a file matches the prefix"
+      (null? (cd-completer "widge" '((args)))))
+    (test-assert "cd yields nothing for a wholly non-matching prefix"
+      (null? (cd-completer "zzznomatch" '((args)))))))
+
+;; === Navigation niceties: cd -<tab>, ~name/ and $CDPATH completion ===
+
+;; The first triple in RESULTS whose candidate name is NAME, or #f.
+(define (triple results name)
+  (let loop ([rs results])
+    (cond
+      [(null? rs) #f]
+      [(string=? (car (car rs)) name) (car rs)]
+      [else (loop (cdr rs))])))
+
+;; The 0-based index of the first triple named NAME in RESULTS, or #f when absent.
+(define (name-index results name)
+  (let loop ([rs results] [i 0])
+    (cond
+      [(null? rs) #f]
+      [(string=? (car (car rs)) name) i]
+      [else (loop (cdr rs) (+ i 1))])))
+
+;; cd -<tab> lists the directory stack as -N labels (each described by the entry's
+;; directory, so -N names exactly the directory cd -N navigates) plus a bare "-"
+;; for $OLDPWD.  The stack is grown with real pushd calls -- the very navigation
+;; the labels pair with -- and the numbering is 1-based, top of the stack first.
+(let ([root (temp-dir-name "dashstack")])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (create-directory (string-append root "/a"))
+      (create-directory (string-append root "/b"))
+      (with-cwd* root
+        (lambda ()
+          ;; pushd a, then pushd b: the stack becomes (root/a root), $OLDPWD is
+          ;; root/a; both pushes travel the same seam cd -N navigates.
+          (run-builtin! (string-append "pushd " root "/a"))
+          (run-builtin! (string-append "pushd " root "/b"))
+          (let ([results (cd-completer "-" (list (cons 'args '()) (cons 'command "cd")))]
+                [stack (dir-stack)])
+            (test-assert "cd -<tab> offers a -1 label described by the top stack entry"
+              (let ([t (triple results "-1")])
+                (and t (pair? stack) (string=? (caddr t) (list-ref stack 0)))))
+            (test-assert "cd -<tab> offers a -2 label described by the second stack entry"
+              (let ([t (triple results "-2")])
+                (and t (>= (length stack) 2) (string=? (caddr t) (list-ref stack 1)))))
+            (test-assert "cd -<tab> also offers a bare - label for $OLDPWD"
+              (and (triple results "-") #t))
+            (test-assert "every dash label is a (name positions desc) triple"
+              (for-all (lambda (r)
+                         (and (list? r) (= (length r) 3)
+                              (string? (car r)) (list? (cadr r)) (string? (caddr r))))
+                       results))
+            (test-assert "the -2 prefix narrows to the -2 label alone"
+              (let ([narrowed (cd-completer "-2" (list (cons 'args '()) (cons 'command "cd")))])
+                (and (offers? narrowed "-2")
+                     (not (offers? narrowed "-1"))
+                     (not (offers? narrowed "-")))))
+            ;; The dash-stack labels are a cd nicety: pushd shares this completer
+            ;; but its +N/-N stack semantics differ and were not implemented, so
+            ;; pushd -<tab> must not be offered the cd -N labels (nor the bare -).
+            (test-assert "pushd -<tab> is not offered the cd -N stack labels"
+              (let ([for-pushd (cd-completer "-" (list (cons 'args '()) (cons 'command "pushd")))])
+                (and (not (offers? for-pushd "-1"))
+                     (not (offers? for-pushd "-"))))))
+          ;; restore the stack so it does not leak into the later suites
+          (run-builtin! "popd")
+          (run-builtin! "popd"))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; ~name/ path completion: a leading "~name/" expands the registered named
+;; directory before listing, so cd ~proj/<tab> offers the directories under proj,
+;; coherent with cd ~proj navigating there.  The inserted candidate carries the
+;; expanded path (matching the shipped "~/"-expansion).
+(let ([root (temp-dir-name "namedir")])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (create-directory (string-append root "/np"))
+      (create-directory (string-append root "/np/inner"))
+      (register-named-directory! "proj" (string-append root "/np"))
+      (let ([results (cd-completer "~proj/" '((args)))])
+        (test-assert "cd ~proj/<tab> lists a directory under the named directory"
+          (offers? results (string-append root "/np/inner/")))
+        (test-assert "the ~name/ expansion yields (name positions desc) triples"
+          (for-all (lambda (r)
+                     (and (list? r) (= (length r) 3)
+                          (string? (car r)) (list? (cadr r)) (string? (caddr r))))
+                   results))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; $CDPATH completion: a base directory on $CDPATH holds "proj"; the cwd holds a
+;; distinct "prcwd" (so both fuzzy-match "pr") and no local "proj".  cd pr<tab>
+;; then offers the local "prcwd/" AND the $CDPATH "proj/" as a BARE basename (so
+;; builtin-cd resolves it back through $CDPATH), the cwd candidate first, the
+;; $CDPATH candidate carrying its root as the description.
+(let ([root (temp-dir-name "cdpath")]
+      [orig-cdpath (getenv "CDPATH")])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (create-directory (string-append root "/prcwd"))
+      (create-directory (string-append root "/base"))
+      (create-directory (string-append root "/base/proj"))
+      (with-cwd* root
+        (lambda ()
+          (dynamic-wind
+            (lambda () (setenv "CDPATH" (string-append root "/base")))
+            (lambda ()
+              (let ([results (cd-completer "pr" (list (cons 'args '()) (cons 'command "cd")))]
+                    [base-root (string-append root "/base")])
+                (test-assert "cd <tab> offers a local directory matching the base"
+                  (offers? results "prcwd/"))
+                (test-assert "cd <tab> offers a $CDPATH-reachable directory as a bare basename"
+                  (offers? results "proj/"))
+                (test-assert "the $CDPATH candidate is the bare basename, not the root-prefixed path"
+                  (not (offers? results (string-append base-root "/proj/"))))
+                (test-assert "the $CDPATH candidate carries its root as the description"
+                  (let ([t (triple results "proj/")])
+                    (and t (string=? (caddr t) base-root))))
+                (test-assert "cwd candidates are ordered before $CDPATH candidates"
+                  (let ([i-cwd (name-index results "prcwd/")]
+                        [i-cd (name-index results "proj/")])
+                    (and i-cwd i-cd (< i-cwd i-cd))))))
+            (lambda () (setenv "CDPATH" orig-cdpath))))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; The completer is command-aware: only cd honours $CDPATH, so only cd is offered
+;; the $CDPATH basenames.  pushd and rmdir share the completer but consult neither
+;; $CDPATH nor the cd -N stack, so a directory reachable ONLY through $CDPATH --
+;; which they could not navigate to -- must not be proposed for them; the same
+;; base still offers it for cd.  The cwd holds no matching directory, so the
+;; $CDPATH candidate is the sole discriminator.
+(let ([root (temp-dir-name "cmdaware")]
+      [orig-cdpath (getenv "CDPATH")])
+  (create-directory root)
+  (dynamic-wind
+    void
+    (lambda ()
+      (create-directory (string-append root "/base"))
+      (create-directory (string-append root "/base/proj"))
+      (create-directory (string-append root "/start"))
+      (with-cwd* (string-append root "/start")
+        (lambda ()
+          (dynamic-wind
+            (lambda () (setenv "CDPATH" (string-append root "/base")))
+            (lambda ()
+              (let ([for-cd (cd-completer "pr" (list (cons 'args '()) (cons 'command "cd")))]
+                    [for-pushd (cd-completer "pr" (list (cons 'args '()) (cons 'command "pushd")))]
+                    [for-rmdir (cd-completer "pr" (list (cons 'args '()) (cons 'command "rmdir")))])
+                (test-assert "cd offers a $CDPATH-only directory as a bare basename"
+                  (offers? for-cd "proj/"))
+                (test-assert "pushd is not offered a $CDPATH-only directory"
+                  (not (offers? for-pushd "proj/")))
+                (test-assert "rmdir is not offered a $CDPATH-only directory"
+                  (not (offers? for-rmdir "proj/")))))
+            (lambda () (setenv "CDPATH" (or orig-cdpath "")))))))
+    (lambda () (run (rm "-rf" ,root)))))
+
+;; === ~<tab>: named directories merged ahead of passwd logins ===
+
+;; The count of triples in RESULTS whose candidate name is exactly NAME.
+(define (count-named results name)
+  (fold-left (lambda (acc r) (if (string=? (car r) name) (+ acc 1) acc)) 0 results))
+
+;; A registered named directory is offered by user-completer, carries its
+;; directory as the description, and -- a clean prefix match where a login could
+;; only be a scattered one -- ranks ahead of the passwd logins.
+(register-named-directory! "zznameddir" "/tmp/zz-named-dir")
+
+(test-assert "user-completer offers a registered named directory with its directory as the description"
+  (let ([t (triple (user-completer "~zzname" '()) "~zznameddir")])
+    (and t (string=? (caddr t) "/tmp/zz-named-dir"))))
+
+(test-assert "the named directory is the top-ranked ~-completion for its prefix"
+  (let ([results (user-completer "~zzname" '())])
+    (and (pair? results) (string=? (car (car results)) "~zznameddir"))))
+
+;; A named directory whose name equals an existing login (root exists on every
+;; POSIX system) shadows the login: the ~root entry carries the NAMED directory as
+;; its description, not root's passwd home, and appears exactly once -- the named
+;; entry wins the dedup on the ~name key.
+(register-named-directory! "root" "/tmp/zz-root-override")
+
+(let ([results (user-completer "~root" '())])
+  (test-assert "a named directory shadows a same-named login (named description wins)"
+    (let ([t (triple results "~root")])
+      (and t (string=? (caddr t) "/tmp/zz-root-override"))))
+  (test-assert "the shadowed name appears exactly once (deduped on the ~name key)"
+    (= 1 (count-named results "~root"))))
+
+;; The merge keeps the passwd logins too: ~<tab> still surfaces at least one login
+;; alongside the named directories.
+(let ([all (user-completer "~" '())])
+  (test-assert "both named directories and passwd logins are offered on ~<tab>"
+    (and (exists (lambda (r) (string=? (car r) "~zznameddir")) all)
+         (exists (lambda (r)
+                   (and (not (string=? (car r) "~zznameddir"))
+                        (not (string=? (car r) "~proj"))
+                        (not (string=? (car r) "~root"))))
+                 all))))
+
+;; === Smart case is uniform across the registered completers ===
+
+;; Every registered completer routes its matching through the one shared
+;; matcher (fuzzy-filter/positions), so each inherits its smart-case rule: a
+;; lowercase query matches a capitalised candidate case-insensitively, while a
+;; query carrying an uppercase letter matches case-sensitively.  Each block
+;; below feeds a completer a fixture holding a capitalised name and asserts both
+;; directions -- an ad-hoc case-insensitive-always matcher fails the exclusion,
+;; an ad-hoc case-sensitive-always matcher fails the inclusion.
+
+;; git: an object-taking subcommand (here `tag`) filters object names through the
+;; shared matcher.  Two tags -- one capitalised, one lowercase -- drive both
+;; directions.  Gated on a usable git, like the git-object block above.
+(when git-present?
+  (with-temp-git-repo
+    (lambda ()
+      (setup-clean)
+      (run (git "tag" "Feature"))
+      (run (git "tag" "hotfix")))
+    (lambda ()
+      (let ([lower (git-completer "feature" '((args "tag")))]
+            [upper (git-completer "HOTFIX" '((args "tag")))])
+        (test-assert "git: a lowercase query matches a capitalised tag"
+          (offers? lower "Feature"))
+        (test-assert "git: an all-caps query rejects a lowercase tag"
+          (not (offers? upper "hotfix")))))))
+
+;; ssh: hostnames are read from $HOME/.ssh/config; a throwaway HOME holding a
+;; capitalised and a lowercase Host drives both directions.  HOME is restored on
+;; the way out so the override cannot leak into a later block.
+(let ([home-dir (temp-dir-name "sshhome")]
+      [orig-home (getenv "HOME")])
+  (create-directory home-dir)
+  (create-directory (string-append home-dir "/.ssh"))
+  (run (sh "-c" ,(string-append "printf 'Host DevBox\\nHost prod\\n' > "
+                                home-dir "/.ssh/config")))
+  (dynamic-wind
+    (lambda () (setenv "HOME" home-dir))
+    (lambda ()
+      (let ([lower (ssh-completer "devbox" '((args)))]
+            [upper (ssh-completer "PROD" '((args)))])
+        (test-assert "ssh: a lowercase query matches a capitalised host"
+          (offers? lower "DevBox"))
+        (test-assert "ssh: an all-caps query rejects a lowercase host"
+          (not (offers? upper "prod")))))
+    (lambda ()
+      (setenv "HOME" (or orig-home ""))
+      (run (rm "-rf" ,home-dir)))))
+
+;; make: targets are read from a file named Makefile in the working directory; a
+;; throwaway Makefile with a capitalised and a lowercase target drives both
+;; directions.
+(let ([mk-dir (temp-dir-name "mkcase")])
+  (create-directory mk-dir)
+  (dynamic-wind
+    void
+    (lambda ()
+      (run (sh "-c" ,(string-append
+                      "printf 'Build:\\n\\techo x\\nclean:\\n\\techo x\\n' > "
+                      mk-dir "/Makefile")))
+      (with-cwd* mk-dir
+        (lambda ()
+          (let ([lower (make-completer "build" '((args)))]
+                [upper (make-completer "CLEAN" '((args)))])
+            (test-assert "make: a lowercase query matches a capitalised target"
+              (offers? lower "Build"))
+            (test-assert "make: an all-caps query rejects a lowercase target"
+              (not (offers? upper "clean")))))))
+    (lambda () (run (rm "-rf" ,mk-dir)))))
+
+;; user: the ~<tab> set includes registered named directories; a capitalised and
+;; a lowercase named directory drive both directions.  The exclusion names the
+;; lowercase entry directly, so it is unaffected by any other ~-candidate.
+(register-named-directory! "SmartUpper" "/tmp/zz-smart-upper")
+(register-named-directory! "smartlower" "/tmp/zz-smart-lower")
+(let ([lower (user-completer "~smartupper" '())]
+      [upper (user-completer "~SMARTLOWER" '())])
+  (test-assert "user: a lowercase query matches a capitalised named directory"
+    (offers? lower "~SmartUpper"))
+  (test-assert "user: an all-caps query rejects a lowercase named directory"
+    (not (offers? upper "~smartlower"))))
+
+;; kill: PIDs are numeric, so the case dimension does not apply to a PID.  kill's
+;; use of the shared matcher is instead pinned by a fuzzy (subsequence) match
+;; that a bare prefix filter would miss; composed with the smart-case pins on
+;; fuzzy-filter/positions, this shows kill inherits smart case through the shared
+;; matcher.  A live PID whose first two digits differ yields a tail that is a
+;; subsequence but not a prefix; this process's own PID is preferred so the probe
+;; stays alive across both listings.
+(let* ([mypid (number->string (pid))]
+       [pids (map car (kill-completer "" '((args))))]
+       [qualifies? (lambda (p)
+                     (and (>= (string-length p) 2)
+                          (not (char=? (string-ref p 0) (string-ref p 1)))))]
+       [probe (cond
+                [(and (member mypid pids) (qualifies? mypid)) mypid]
+                [else (let loop ([ps pids])
+                        (cond
+                          [(null? ps) #f]
+                          [(qualifies? (car ps)) (car ps)]
+                          [else (loop (cdr ps))]))])])
+  (test-assert "kill: the empty prefix returns the whole process list"
+    (pair? pids))
+  (test-assert "kill: a multi-digit PID with distinct leading digits exists"
+    (and probe #t))
+  (when probe
+    (let ([tail (substring probe 1 (string-length probe))])
+      (test-assert "kill: a non-prefix subsequence still matches (fuzzy routing)"
+        (offers? (kill-completer tail '((args))) probe)))))
 
 (test-end)

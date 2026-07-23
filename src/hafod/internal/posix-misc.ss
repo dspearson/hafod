@@ -6,6 +6,7 @@
   (export
     posix-opendir posix-readdir posix-closedir
     posix-fcntl
+    fd-wait-readable
     posix-getgroups
     read-environ
     posix-mkstemp
@@ -18,12 +19,13 @@
     ;; live by the wrappers below, default inert, and deliberately NOT named in
     ;; the (hafod posix) facade nor the (hafod) umbrella (leaf-only test seams).
     readdir-fault-after
+    fcntl-fault
     glob-fault glob-release)
 
   (import (chezscheme) (hafod internal errno) (hafod internal posix-constants)
           (hafod internal platform-constants) (hafod internal posix-core)
           (hafod internal platform)
-          (only (hafod internal platform-ftypes) dirent-t))
+          (only (hafod internal platform-ftypes) dirent-t pollfd-t))
 
   ;; ======================================================================
   ;; Directory iteration
@@ -93,12 +95,83 @@
   (define c-fcntl
     (foreign-procedure (__varargs_after 2) "fcntl" (int int int) int))
 
+  ;; A settable fcntl fault hook for the resource-lifetime proof.  When it holds a
+  ;; thunk, posix-fcntl runs it first -- a truthy thunk raises -- so a caller that
+  ;; sets a descriptor non-blocking right after a spawn can be driven down its
+  ;; setup-raise path with the child and its pipe already live, proving the read fd
+  ;; is still closed on that unwind.  Default #f leaves the call path byte-identical.
+  (define fcntl-fault (make-parameter #f))
+
   ;; posix-fcntl: file descriptor control.
   ;; (posix-fcntl fd cmd) or (posix-fcntl fd cmd arg)
   (define (posix-fcntl fd cmd . args)
+    (let ([f (fcntl-fault)]) (when f (f)))
     (if (null? args)
         (posix-call fcntl (c-fcntl fd cmd 0))
         (posix-call fcntl (c-fcntl fd cmd (car args)))))
+
+  ;; ======================================================================
+  ;; poll(2) readiness -- a deadline-bounded "is this fd readable yet?"
+  ;; ======================================================================
+
+  ;; Why poll-with-a-deadline rather than a blocking read guarded by SIGALRM:
+  ;; hafod's green threads run on one OS thread, so a blocking child read cannot
+  ;; yield, and a signal around it would need a handler that races the
+  ;; job-control SIGCHLD path. A non-blocking descriptor plus a bounded poll is
+  ;; instead a plain synchronous loop -- no handler, no reentrancy -- with a
+  ;; deterministic kill/reap tail. Blocking the thread for up to the deadline is
+  ;; intended: the user is waiting to type, so we bound the synchronous wait
+  ;; rather than leaving it unbounded.
+  ;;
+  ;; int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms). nfds is fixed at
+  ;; 1 here (a single descriptor), passed as the unsigned-long nfds_t. POLLIN
+  ;; (0x0001, universal) is the "data to read" event we wait on.
+  (define c-poll (foreign-procedure "poll" (void* unsigned-long int) int))
+  ;; POLLIN (0x001) is the "data to read" event; POLLHUP (0x010) is the peer-hangup
+  ;; the kernel reports in revents (it is never requested in events).  Both are the
+  ;; historical System V values, identical on Linux, macOS and the BSDs.  The error
+  ;; revents -- POLLERR (0x008) / POLLNVAL (0x020) -- are deliberately not named:
+  ;; revents carrying neither POLLIN nor POLLHUP is treated uniformly as a bail.
+  (define POLLIN 1)
+  (define POLLHUP 16)
+
+  ;; fd-wait-readable: wait up to timeout-ms for FD to have bytes to read.
+  ;; Returns 'ready (there is data to read, POLLIN, OR the peer hung up with no more
+  ;; data, POLLHUP -- both let the caller's next read return that data or a clean
+  ;; EOF), 'timeout (the deadline elapsed with no event, OR the fd carries an error
+  ;; condition -- POLLERR / POLLNVAL -- with neither data nor a hangup: the caller
+  ;; bails and reaps rather than re-polling the same persistent error to the
+  ;; deadline, which a blind r>0 -> 'ready would busy-spin, since the caller's
+  ;; guarded read collapses the raise back into a re-poll), or 'interrupted (poll
+  ;; returned -1, e.g. EINTR from a resize or child-exit signal -- the caller
+  ;; recomputes its remaining deadline and re-polls, never treating it as a real
+  ;; timeout). The pollfd scratch is sized from `ftype-sizeof` and its fields set and
+  ;; read through a pollfd-t pointer, so Chez owns every offset -- no hand-written
+  ;; byte positions. A non-positive deadline is clamped to 0 so it returns at once:
+  ;; poll treats a negative timeout as "wait forever", which must never wedge the
+  ;; single OS thread.
+  (define (fd-wait-readable fd timeout-ms)
+    (with-foreign-buffer ([buf (ftype-sizeof pollfd-t)])
+      (let ([pfd (make-ftype-pointer pollfd-t buf)])
+        (ftype-set! pollfd-t (fd) pfd fd)
+        (ftype-set! pollfd-t (events) pfd POLLIN)
+        (ftype-set! pollfd-t (revents) pfd 0)
+        (let ([r (c-poll buf 1 (if (< timeout-ms 0) 0 timeout-ms))])
+          (cond
+            [(< r 0) 'interrupted]
+            [(= r 0) 'timeout]
+            [else
+             ;; poll reports r>0 for ANY revents bit, so inspect them rather than
+             ;; mapping every r>0 to 'ready: POLLIN is data to read; POLLHUP with no
+             ;; data yields a clean EOF on the next read -- both route through 'ready.
+             ;; Anything else (POLLERR / POLLNVAL) is a finished or invalid fd with
+             ;; nothing to read, so bail via 'timeout instead of re-polling the same
+             ;; error to the deadline.
+             (let ([revents (ftype-ref pollfd-t (revents) pfd)])
+               (cond
+                 [(not (zero? (bitwise-and revents POLLIN)))  'ready]
+                 [(not (zero? (bitwise-and revents POLLHUP))) 'ready]
+                 [else 'timeout]))])))))
 
   ;; ======================================================================
   ;; Supplementary groups

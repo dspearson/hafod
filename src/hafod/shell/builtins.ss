@@ -4,10 +4,12 @@
 
 (library (hafod shell builtins)
   (export builtin? run-builtin! builtin-names dir-stack builtin-cd-path
-          nav-finder-proc)
+          nav-finder-proc split-on-colon cdpath-entries)
   (import (except (chezscheme) getenv)
-          (only (hafod process-state) chdir cwd)
+          (only (hafod process-state) chdir cwd process-cwd)
           (only (hafod environment) getenv setenv)
+          (only (hafod fname)
+                split-file-name file-name-absolute? file-name-as-directory)
           (only (hafod user-group) home-directory)
           (only (hafod process) init-exec-path-list)
           (only (hafod shell parser) parse-command-words)
@@ -35,13 +37,43 @@
   (define (builtin? name)
     (and (member name builtin-name-list) #t))
 
+  ;; --- logical path normalisation ---
+  ;; Collapse an ABSOLUTE path lexically: drop "." and empty ("//") segments and
+  ;; pop each ".." against the segment to its left, never past the root.  This is
+  ;; a purely LEXICAL rewrite -- a "symlink/.." resolves to the symlink's lexical
+  ;; parent, matching zsh/bash without -P -- so it never calls realpath and never
+  ;; touches the filesystem.  simplify-file-name (in (hafod fname)) deliberately
+  ;; keeps "..", so the pop is done here.  The result is rebuilt from OUT, which
+  ;; holds the kept segments deepest-first, so each fold step wraps the growing
+  ;; tail with its parent and the original order is restored.  A no-op on an
+  ;; already-clean path, which keeps every existing cd/pushd/auto-cd/z result
+  ;; byte-for-byte unchanged.
+  (define (normalise-logical abs)
+    (let loop ([segs (split-file-name abs)] [out '()])
+      (cond
+        [(null? segs)
+         (if (null? out)
+             "/"
+             (fold-left (lambda (acc s) (string-append "/" s acc)) "" out))]
+        [(or (string=? (car segs) "") (string=? (car segs) "."))
+         (loop (cdr segs) out)]
+        [(string=? (car segs) "..")
+         (loop (cdr segs) (if (null? out) out (cdr out)))]
+        [else (loop (cdr segs) (cons (car segs) out))])))
+
   ;; --- cd ---
   ;; The single directory-change seam.  Every route into a new directory -- cd,
   ;; pushd, popd, auto-cd and the z jump -- passes through here, so the visit is
   ;; recorded in exactly one place and a change is never counted twice.  TARGET is
   ;; entered verbatim: the caller has already resolved any shortcut (empty ->
-  ;; home, "-" -> $OLDPWD), so this seam interprets nothing further, which is what
-  ;; lets builtin-cd-path reach chdir literally.
+  ;; home, "-" -> $OLDPWD, a $CDPATH or ~name target), so this seam interprets
+  ;; nothing further, which is what lets builtin-cd-path reach chdir literally.
+  ;;
+  ;; The target is first resolved to an ABSOLUTE path and lexically collapsed
+  ;; (normalise-logical), and it is that clean absolute path that reaches chdir --
+  ;; process-state's chdir stores an absolute argument verbatim, so %cwd (and
+  ;; hence (cwd), $PWD and the prompt) carries no literal "..".  Doing the collapse
+  ;; here means a "cd ..", a pushd or an auto-cd all land a clean logical path.
   ;;
   ;; Returns #t when the directory actually changed and #f when the chdir failed,
   ;; so a caller (pushd/popd) can gate its own bookkeeping on the move having
@@ -54,7 +86,20 @@
   ;; and the handle opens only while visit recording is switched on (it is off for
   ;; a non-interactive run, which then never touches the database at all).
   (define (cd-to! target)
-    (let ([old (cwd)])
+    (let* ([old (cwd)]
+           [abs (if (file-name-absolute? target)
+                    target
+                    (string-append (file-name-as-directory old) target))]
+           ;; An empty operand is NOT the filesystem root.  file-name-absolute?
+           ;; reports "" as absolute and normalise-logical would collapse it to
+           ;; "/", so an un-guarded `cd ""` -- and `cd "$UNSET"`, whose empty
+           ;; expansion reaches here the same way -- would silently jump to /.
+           ;; Keep an empty target verbatim so chdir raises ENOENT and the cd:
+           ;; diagnostic fires without moving, as it did before the logical
+           ;; collapse was introduced.
+           [resolved (if (string=? target "")
+                         target
+                         (normalise-logical abs))])
       (guard (e [#t (display
                       (format "cd: ~a: ~a\n"
                               target
@@ -63,7 +108,15 @@
                                   e))
                       (console-error-port))
                     #f])
-        (chdir target)
+        ;; Enter the collapsed absolute path so %cwd carries no literal "..";
+        ;; should that path prove unenterable -- a broken link somewhere in the
+        ;; lexical chain -- fall back to the raw target before surfacing the error.
+        ;; The fallback enters a relative target, so %cwd would otherwise carry
+        ;; whatever literal ".." it held; re-anchor to the physical directory
+        ;; actually reached so (cwd)/$PWD stay clean.  Only the fallback re-anchors
+        ;; -- the primary path keeps its logical, symlink-preserving result.
+        (guard (inner [#t (chdir target) (chdir (process-cwd))])
+          (chdir resolved))
         (setenv "OLDPWD" old)
         (setenv "PWD" (cwd))
         (guard (e [#t #f])
@@ -71,17 +124,120 @@
             (when vdb (visit-record! vdb (cwd) ((visit-now))))))
         #t)))
 
+  ;; --- cd - / cd -N / $CDPATH resolution ---
+
+  ;; Echo the directory just entered, as POSIX cd does after resolving a
+  ;; non-literal operand (cd -, cd -N, or a jump taken through a non-cwd $CDPATH
+  ;; entry) -- so the user sees where an operand that was not typed verbatim
+  ;; landed.  Ordinary output, so it goes to the current output port, not stderr.
+  (define (cd-echo dir)
+    (display dir)
+    (newline))
+
+  ;; A `cd -N` operand: a leading '-' followed by one or more digits and nothing
+  ;; else, yielding N.  Bare "-" (no digits) is NOT a -N form -- it is the $OLDPWD
+  ;; shortcut, handled separately -- so it returns #f here.
+  (define (cd-stack-index arg)
+    (and (> (string-length arg) 1)
+         (char=? (string-ref arg 0) #\-)
+         (let loop ([i 1])
+           (cond
+             [(>= i (string-length arg))
+              (string->number (substring arg 1 (string-length arg)))]
+             [(char<=? #\0 (string-ref arg i) #\9) (loop (+ i 1))]
+             [else #f]))))
+
+  ;; Split S on ':' into its elements, keeping empty elements.  Shared with the
+  ;; completer (which imports it) for both the $CDPATH split -- where an empty
+  ;; element denotes the current directory, per POSIX -- and its colon-separated
+  ;; /etc/passwd parse, so the two never drift.
+  (define (split-on-colon s)
+    (let ([len (string-length s)])
+      (let loop ([start 0] [acc '()])
+        (if (> start len)
+            (reverse acc)
+            (let ([colon (let scan ([i start])
+                           (cond
+                             [(>= i len) #f]
+                             [(char=? (string-ref s i) #\:) i]
+                             [else (scan (+ i 1))]))])
+              (if colon
+                  (loop (+ colon 1) (cons (substring s start colon) acc))
+                  (loop (+ len 1) (cons (substring s start len) acc))))))))
+
+  ;; The $CDPATH entries, or '() when it is unset or empty -- so an absent-CDPATH
+  ;; run takes no CDPATH branch at all and stays byte-for-byte as before.
+  (define (cdpath-entries)
+    (let ([cp (getenv "CDPATH")])
+      (if (or (not cp) (string=? cp ""))
+          '()
+          (split-on-colon cp))))
+
+  ;; $CDPATH is consulted only for a RELATIVE operand whose first path component
+  ;; is neither "." nor ".." (POSIX): an absolute path, or one beginning "./" or
+  ;; "../" (or bare "."/".."), bypasses the search and is entered as given.  A
+  ;; ~name operand has already expanded to an absolute path upstream, so it too
+  ;; bypasses this naturally.
+  (define (cdpath-eligible? operand)
+    (and (> (string-length operand) 0)
+         (not (char=? (string-ref operand 0) #\/))
+         (let ([fc (let scan ([i 0])
+                     (cond
+                       [(>= i (string-length operand)) operand]
+                       [(char=? (string-ref operand i) #\/)
+                        (substring operand 0 i)]
+                       [else (scan (+ i 1))]))])
+           (not (or (string=? fc ".") (string=? fc ".."))))))
+
+  ;; Resolve a CDPATH-eligible OPERAND: try the current directory first, then each
+  ;; non-empty $CDPATH entry in turn, taking the first whose join is an existing
+  ;; directory.  Returns two values -- the concrete path to hand cd-to! and whether
+  ;; the hit came from a NON-cwd entry (so builtin-cd knows to echo the resolved
+  ;; directory, as POSIX requires for a CDPATH-sourced jump).  Falls back to the
+  ;; bare operand (today's behaviour) when CDPATH is unset or nothing matches.
+  (define (resolve-via-cdpath operand)
+    (let ([entries (cdpath-entries)])
+      (cond
+        [(null? entries) (values operand #f)]            ; no CDPATH -> unchanged
+        [(file-directory? operand) (values operand #f)]  ; cwd first, no echo
+        [else
+         (let loop ([es entries])
+           (cond
+             [(null? es) (values operand #f)]            ; nothing matched
+             [(string=? (car es) "") (loop (cdr es))]    ; empty = cwd, already tried
+             [else
+              (let ([candidate (string-append
+                                 (file-name-as-directory (car es)) operand)])
+                (if (file-directory? candidate)
+                    (values candidate #t)                ; non-cwd hit -> echo
+                    (loop (cdr es))))]))])))
+
+  ;; The cd builtin.  Beyond a plain path it handles: no operand -> home; "-" ->
+  ;; $OLDPWD (echoed); "-N" -> the Nth directory-stack entry (echoed); and a bare
+  ;; relative operand searched along $CDPATH (echoed on a non-cwd hit).  Every move
+  ;; still funnels through cd-to!, so the resolved path reaches chdir verbatim
+  ;; (injection-safe) and picks up the logical .. collapse uniformly.
   (define (builtin-cd args)
-    (let ([target (cond
-                    [(null? args) (home-directory)]
-                    [(string=? (car args) "-")
-                     (or (getenv "OLDPWD")
-                         (begin
-                           (display "cd: OLDPWD not set\n" (console-error-port))
-                           #f))]
-                    [else (car args)])])
-      (when target
-        (cd-to! target))))
+    (cond
+      [(null? args) (cd-to! (home-directory))]
+      [(string=? (car args) "-")
+       (let ([dst (getenv "OLDPWD")])
+         (if dst
+             (when (cd-to! dst) (cd-echo (cwd)))
+             (display "cd: OLDPWD not set\n" (console-error-port))))]
+      [(cd-stack-index (car args)) =>
+       (lambda (n)
+         (let ([stack (dir-stack)])
+           (if (and (>= n 1) (<= n (length stack)))
+               (when (cd-to! (list-ref stack (- n 1))) (cd-echo (cwd)))
+               (display
+                 (format "cd: -~a: no such entry in the directory stack\n" n)
+                 (console-error-port)))))]
+      [(cdpath-eligible? (car args))
+       (let-values ([(target echo?) (resolve-via-cdpath (car args))])
+         (when (and (cd-to! target) echo?)
+           (cd-echo (cwd))))]
+      [else (cd-to! (car args))]))
 
   ;; --- cd to a single literal path ---
   ;; Change directory to exactly PATH, with NO argument interpretation.  Unlike

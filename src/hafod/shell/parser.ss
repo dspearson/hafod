@@ -5,7 +5,9 @@
 ;;; glob expansion, and brace expansion.
 
 (library (hafod shell parser)
-  (export parse-shell-command parse-command-words)
+  (export parse-shell-command parse-command-words
+          ;; named directories
+          register-named-directory! named-directory-ref named-directories-list)
 
   (import (except (chezscheme) getenv)
           (only (hafod glob) glob)
@@ -90,6 +92,31 @@
     (or (getenv name) ""))
 
   ;; ======================================================================
+  ;; Named directories
+  ;; ======================================================================
+
+  ;; A user-populated table of `~name` -> directory mappings, in the spirit of
+  ;; zsh's `hash -d`. An init.ss registers entries with register-named-directory!;
+  ;; the tilde expander below consults this table before the passwd database, so
+  ;; a named directory takes precedence over a same-named login. The stored value
+  ;; is the concrete directory, returned verbatim by the expander (never
+  ;; re-tokenised into a command line), so a name carrying shell metacharacters
+  ;; has no side effect at the downstream chdir seam.
+  (define named-directories (make-hashtable string-hash string=?))
+
+  (define (register-named-directory! name dir)
+    (hashtable-set! named-directories name dir))
+
+  (define (named-directory-ref name)
+    (hashtable-ref named-directories name #f))
+
+  ;; Enumerate the table as a list of (name . dir) pairs -- fresh pairs, so the
+  ;; internal store is never handed out; consumed by the `~<tab>` completer.
+  (define (named-directories-list)
+    (map (lambda (name) (cons name (hashtable-ref named-directories name #f)))
+         (vector->list (hashtable-keys named-directories))))
+
+  ;; ======================================================================
   ;; Tilde expansion
   ;; ======================================================================
 
@@ -104,11 +131,14 @@
         (char=? c #\-)
         (char=? c #\.)))
 
-  ;; Look up ~name's home directory, leaving the literal ~name unchanged when
-  ;; the user is unknown (name->user-info raises for an absent passwd entry).
+  ;; Look up ~name's directory: a registered named directory wins (zsh `hash -d`
+  ;; precedence), otherwise fall back to the passwd home, leaving the literal
+  ;; ~name unchanged when the user is unknown (name->user-info raises for an
+  ;; absent passwd entry).
   (define (tilde-user-home name)
-    (guard (e [#t (string-append "~" name)])
-      (user-info:home-dir (name->user-info name))))
+    (or (named-directory-ref name)
+        (guard (e [#t (string-append "~" name)])
+          (user-info:home-dir (name->user-info name)))))
 
   ;; Expand a tilde-prefix beginning just after `~` (at pos). Reads the login
   ;; name run: an empty run (`~` or `~/...`) yields $HOME (literal `~` when HOME
