@@ -888,9 +888,20 @@
     (let* ([entries (tilde-entries)]
            [names (map car entries)])
       (map (lambda (m)
-             (let ([home (cond [(assoc (car m) entries) => cdr]
-                               [else ""])])
-               (list (strip-terminal-escapes (car m))
+             ;; A named directory shadows a same-named login: resolve its home
+             ;; from the named-directory table FIRST -- exactly as the tilde
+             ;; expander does -- so the named entry wins the description even
+             ;; where the merged passwd enumeration and the named entry disagree
+             ;; (the merge order is not authoritative across every libc).
+             (let* ([name (car m)]
+                    [named (and (fx> (string-length name) 1)
+                                (char=? (string-ref name 0) #\~)
+                                (named-directory-ref
+                                  (substring name 1 (string-length name))))]
+                    [home (or named
+                              (cond [(assoc name entries) => cdr]
+                                    [else ""]))])
+               (list (strip-terminal-escapes name)
                      (cdr m)
                      (strip-terminal-escapes home))))
            (fuzzy-filter/positions prefix names))))
