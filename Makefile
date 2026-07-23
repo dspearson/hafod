@@ -120,9 +120,17 @@ platform-constants: tools/gen-platform-constants.c
 	sh tools/platform-fingerprint.sh > $(PLATFORM_STAMP)
 	@echo "platform-constants: $(PLATFORM_TAG)"
 
-# Regenerate if the stamp is missing or no longer matches the ABI fingerprint
-$(PLATFORM_STAMP):
-	@$(MAKE) platform-constants
+# Regenerate the constants when the stamp is missing OR its recorded ABI
+# fingerprint no longer matches this host -- a compiler/arch swap, or a tree
+# synced from another platform. Phony so the fingerprint is re-checked every
+# build: a bare file target only fires when the stamp is absent, which misses
+# drift and can silently ship a stale platform-constants.ss on a non-Linux host.
+.PHONY: platform-constants-current
+platform-constants-current:
+	@if [ ! -f $(PLATFORM_STAMP) ] || \
+	    [ "$$(cat $(PLATFORM_STAMP) 2>/dev/null)" != "$$(sh tools/platform-fingerprint.sh)" ]; then \
+	  $(MAKE) --no-print-directory platform-constants; \
+	fi
 
 # Authoritative drift gate: prove the committed platform-constants.ss still
 # matches what this toolchain and ABI would generate. Refuses a Rosetta/cross
@@ -233,7 +241,7 @@ doc/hafod.1: doc/hafod.1.in VERSION
 # This is the body that used to live in `compile`; it is factored out so it can
 # be both a normal prerequisite of `compile` and the order-only prerequisite of
 # the bin/hafod.so launcher target.
-compile-libs: $(PLATFORM_STAMP) version-source chez-version-source
+compile-libs: platform-constants-current version-source chez-version-source
 	@fp=$$(sh tools/platform-fingerprint.sh); \
 	if [ -f "$(PLATFORM_STAMP)" ] && [ "$$(cat $(PLATFORM_STAMP))" != "$$fp" ]; then \
 		$(MAKE) platform-constants; \
